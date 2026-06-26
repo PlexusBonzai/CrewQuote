@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { Fragment, useState, useEffect, useMemo, useCallback } from "react";
 import {
   Clock, Receipt, Settings, Film, Plus, ChevronLeft, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
@@ -255,7 +255,6 @@ const entryDefaults = (profile: Profile, prev?: TimesheetEntry, prodName?: strin
 /** Duplicate previous day (keep rates/location, clear times/notes) */
 const duplicateEntry = (prev: TimesheetEntry, currentDate: string): Omit<TimesheetEntry, "id"> => ({
   ...prev,
-  id:               "",
   date:             currentDate,
   callTime:         "08:00",
   wrapTime:         "18:00",
@@ -756,7 +755,7 @@ function WeeklyView({ timesheet, profile, onDeleteEntry }: { timesheet: Timeshee
           </thead>
           <tbody>
             {rows.map(({ e, c, tr, trWarn }, i) => (
-              <React.Fragment key={e.id || `row-${i}`}>
+              <Fragment key={e.id || `row-${i}`}>
                 {/* Turnaround warning row */}
                 {tr !== null && (
                   <tr className={trWarn ? "bg-amber-50" : "bg-green-50"}>
@@ -788,7 +787,7 @@ function WeeklyView({ timesheet, profile, onDeleteEntry }: { timesheet: Timeshee
                     <button onClick={() => { if (confirm("Remove this day?")) onDeleteEntry(e.id); }} className="p-1 text-gray-300 hover:text-red-500 rounded transition-colors"><Trash2 size={13}/></button>
                   </td>
                 </tr>
-              </React.Fragment>
+              </Fragment>
             ))}
           </tbody>
           <tfoot className="border-t-2 border-gray-900">

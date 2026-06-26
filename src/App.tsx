@@ -2,7 +2,7 @@ import { Fragment, useState, useEffect, useMemo, useCallback } from "react";
 import {
   Clock, Receipt, Settings, Film, Plus, ChevronLeft, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
-  Save, Zap, Copy, FileText, Info
+  Save, Zap, Copy, FileText, Info, Users, Building2, Pencil
 } from "lucide-react";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -12,8 +12,21 @@ import {
 type OTRuleId        = "sa-film" | "sa-bcea" | "custom";
 type TurnaroundMode  = "warning" | "penalty" | "manual";
 type ToastType       = "success" | "error" | "info";
+type InvoiceDetailMode = "summary" | "detailed";
 
 interface ToastMsg { id: string; msg: string; type: ToastType; }
+
+interface Client {
+  id: string;
+  companyName: string;
+  contactPerson: string;
+  email: string;
+  phone: string;
+  billingAddress: string;
+  vatNumber: string;
+  defaultPaymentTerms: string;
+  notes: string;
+}
 
 interface TimesheetEntry {
   id: string;
@@ -46,12 +59,32 @@ interface Timesheet {
   id: string;
   timesheetNumber: string;
   productionName: string;
+  clientId?: string;
+  clientName?: string;
+  clientIncomplete?: boolean;
   crewName: string;
   role: string;
+  startDate?: string;
+  notes?: string;
   currency: string;
   vat: number;
   status: "open" | "submitted" | "invoiced";
   entries: TimesheetEntry[];
+  paymentTerms?: string;
+  defaultDayRate?: number;
+  defaultIncludedHours?: number;
+  defaultEquipmentRental?: number;
+  defaultPerDiem?: number;
+  defaultOvertimeRule?: OTRuleId;
+  defaultOtBand1Hours?: number;
+  defaultOtBand1Mult?: number;
+  defaultOtBand2Mult?: number;
+  defaultMinTurnaround?: number;
+  defaultTurnaroundMode?: TurnaroundMode;
+  defaultTurnaroundPenMult?: number;
+  mealBreaksDeducted?: boolean;
+  travelTimePaid?: boolean;
+  equipmentRentalDaily?: boolean;
   invoiceId?: string;
   createdAt: string;
 }
@@ -63,6 +96,8 @@ interface InvoiceLine {
   unitPrice: number;
   amount: number;
   isExtra?: boolean;
+  taxable?: boolean;
+  category?: "day-rate" | "overtime" | "equipment" | "travel" | "expenses" | "turnaround" | "additional";
 }
 
 interface Invoice {
@@ -70,11 +105,16 @@ interface Invoice {
   invoiceNumber: string;
   issueDate: string;
   dueDate: string;
+  clientId?: string;
   clientName: string;
+  client?: Client;
   crewName: string;
   role: string;
   companyName: string;
+  productionName?: string;
   timesheetNumber: string;
+  timesheetDates?: string;
+  detailMode?: InvoiceDetailMode;
   lineItems: InvoiceLine[];
   subtotal: number;
   vat: number;
@@ -83,7 +123,9 @@ interface Invoice {
   currency: string;
   status: "draft" | "unpaid" | "paid";
   banking: Record<string, string>;
+  paymentTerms?: string;
   paymentNotes: string;
+  notes?: string;
   fromTimesheetId: string;
   createdAt: string;
 }
@@ -110,6 +152,7 @@ function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; b
 
 const DEFAULT_PROFILE = {
   fullName: "", role: "", companyName: "", email: "", phone: "", address: "", vatNumber: "",
+  paymentTerms:           "Payment due within 30 days",
   defaultCurrency:          "ZAR",
   defaultDayRate:           0,
   defaultIncludedHours:     10,
@@ -137,11 +180,23 @@ type Profile = typeof DEFAULT_PROFILE;
 
 const Store = {
   async get(k: string) {
-    try { const r = await (window as any).storage.get(k); return r?.value ? JSON.parse(r.value) : null; }
-    catch { return null; }
+    try {
+      const raw = window.localStorage?.getItem(k);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    try {
+      const r = await (window as any).storage?.get?.(k);
+      if (r?.value) {
+        try { window.localStorage?.setItem(k, r.value); } catch {}
+        return JSON.parse(r.value);
+      }
+    } catch {}
+    return null;
   },
   async set(k: string, v: unknown) {
-    try { await (window as any).storage.set(k, JSON.stringify(v)); } catch {}
+    const raw = JSON.stringify(v);
+    try { window.localStorage?.setItem(k, raw); } catch {}
+    try { await (window as any).storage?.set?.(k, raw); } catch {}
   },
 };
 
@@ -168,6 +223,124 @@ const calcTurnaround = (prevWrap: string, nextCall: string) => {
   if (n <= w) n += 1440;
   return (n - w) / 60;
 };
+
+const blankClient = (overrides: Partial<Client> = {}): Client => ({
+  id: uid(),
+  companyName: "",
+  contactPerson: "",
+  email: "",
+  phone: "",
+  billingAddress: "",
+  vatNumber: "",
+  defaultPaymentTerms: "",
+  notes: "",
+  ...overrides,
+});
+
+const normalizeClient = (c: Partial<Client>): Client => blankClient({ ...c, id: c.id || uid() });
+const clientName = (c?: Partial<Client> | null) => c?.companyName || c?.contactPerson || "";
+const clientBillingComplete = (c?: Partial<Client> | null) => Boolean((c?.companyName || "").trim() && (c?.billingAddress || "").trim());
+const getTimesheetClient = (ts: Partial<Timesheet>, clients: Client[]) => clients.find(c => c.id === ts.clientId) || null;
+const invoiceClient = (inv: Invoice): Client | null => inv.client || (inv.clientName ? blankClient({ companyName: inv.clientName, id: inv.clientId || uid() }) : null);
+
+function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile {
+  if (!ts) return profile;
+  return {
+    ...profile,
+    defaultCurrency:          ts.currency || profile.defaultCurrency,
+    defaultDayRate:           safe(ts.defaultDayRate, profile.defaultDayRate),
+    defaultIncludedHours:     safe(ts.defaultIncludedHours, profile.defaultIncludedHours),
+    defaultEquipmentRental:   safe(ts.defaultEquipmentRental, profile.defaultEquipmentRental),
+    defaultPerDiem:           safe(ts.defaultPerDiem, profile.defaultPerDiem),
+    defaultVat:               safe(ts.vat, profile.defaultVat),
+    defaultOvertimeRule:      (ts.defaultOvertimeRule || profile.defaultOvertimeRule) as OTRuleId,
+    defaultOtBand1Hours:      safe(ts.defaultOtBand1Hours, profile.defaultOtBand1Hours),
+    defaultOtBand1Mult:       safe(ts.defaultOtBand1Mult, profile.defaultOtBand1Mult),
+    defaultOtBand2Mult:       safe(ts.defaultOtBand2Mult, profile.defaultOtBand2Mult),
+    defaultMinTurnaround:     safe(ts.defaultMinTurnaround, profile.defaultMinTurnaround),
+    defaultTurnaroundMode:    (ts.defaultTurnaroundMode || profile.defaultTurnaroundMode) as TurnaroundMode,
+    defaultTurnaroundPenMult: safe(ts.defaultTurnaroundPenMult, profile.defaultTurnaroundPenMult),
+    mealBreaksDeducted:       ts.mealBreaksDeducted ?? profile.mealBreaksDeducted,
+    travelTimePaid:           ts.travelTimePaid ?? profile.travelTimePaid,
+    equipmentRentalDaily:     ts.equipmentRentalDaily ?? profile.equipmentRentalDaily,
+  };
+}
+
+function timesheetDateRange(ts: Timesheet): string {
+  const dates = (ts.entries || []).map(e => e.date).filter(Boolean).sort();
+  if (!dates.length) return ts.startDate ? fmtDate(ts.startDate) : "Not set";
+  const first = fmtDate(dates[0]);
+  const last = fmtDate(dates[dates.length - 1]);
+  return first === last ? first : `${first} - ${last}`;
+}
+
+function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
+  return {
+    id: t.id || uid(),
+    timesheetNumber: t.timesheetNumber || "T-Not set",
+    productionName: t.productionName || "",
+    clientId: t.clientId,
+    clientName: t.clientName || "",
+    clientIncomplete: t.clientIncomplete ?? !t.clientId,
+    crewName: t.crewName || "",
+    role: t.role || "",
+    startDate: t.startDate || t.createdAt?.slice(0, 10) || todayStr(),
+    notes: t.notes || "",
+    currency: t.currency || "ZAR",
+    vat: safe(t.vat, 0),
+    status: t.status || "open",
+    entries: Array.isArray(t.entries) ? t.entries : [],
+    paymentTerms: t.paymentTerms || "",
+    defaultDayRate: t.defaultDayRate,
+    defaultIncludedHours: t.defaultIncludedHours,
+    defaultEquipmentRental: t.defaultEquipmentRental,
+    defaultPerDiem: t.defaultPerDiem,
+    defaultOvertimeRule: t.defaultOvertimeRule,
+    defaultOtBand1Hours: t.defaultOtBand1Hours,
+    defaultOtBand1Mult: t.defaultOtBand1Mult,
+    defaultOtBand2Mult: t.defaultOtBand2Mult,
+    defaultMinTurnaround: t.defaultMinTurnaround,
+    defaultTurnaroundMode: t.defaultTurnaroundMode,
+    defaultTurnaroundPenMult: t.defaultTurnaroundPenMult,
+    mealBreaksDeducted: t.mealBreaksDeducted,
+    travelTimePaid: t.travelTimePaid,
+    equipmentRentalDaily: t.equipmentRentalDaily,
+    invoiceId: t.invoiceId,
+    createdAt: t.createdAt || new Date().toISOString(),
+  };
+}
+
+function normalizeInvoice(i: Partial<Invoice>): Invoice {
+  return {
+    id: i.id || uid(),
+    invoiceNumber: i.invoiceNumber || "I-Not set",
+    issueDate: i.issueDate || todayStr(),
+    dueDate: i.dueDate || "",
+    clientId: i.clientId,
+    clientName: i.clientName || "",
+    client: i.client,
+    crewName: i.crewName || "",
+    role: i.role || "",
+    companyName: i.companyName || "",
+    productionName: i.productionName || "",
+    timesheetNumber: i.timesheetNumber || "",
+    timesheetDates: i.timesheetDates || "",
+    detailMode: i.detailMode || "summary",
+    lineItems: Array.isArray(i.lineItems) ? i.lineItems : [],
+    subtotal: safe(i.subtotal, 0),
+    vat: safe(i.vat, 0),
+    vatAmount: safe(i.vatAmount, 0),
+    total: safe(i.total, 0),
+    currency: i.currency || "ZAR",
+    status: i.status || "draft",
+    banking: i.banking || {},
+    paymentTerms: i.paymentTerms || i.paymentNotes || "",
+    paymentNotes: i.paymentNotes || "",
+    notes: i.notes || "",
+    fromTimesheetId: i.fromTimesheetId || "",
+    createdAt: i.createdAt || new Date().toISOString(),
+  };
+}
 
 /** Core per-day calculation — FULLY DEFENSIVE, never throws */
 function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
@@ -205,7 +378,17 @@ function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
 }
 
 function calcSummary(entries: TimesheetEntry[], profile: Profile) {
-  const calcs        = (entries || []).map(e => ({ entry: e, c: calcDay(e, profile) }));
+  const minTR        = profile.defaultMinTurnaround || 10;
+  const calcs        = (entries || []).map((e, i) => {
+    const c = calcDay(e, profile);
+    const prev = i > 0 ? entries[i - 1] : undefined;
+    const turnaround = prev ? calcTurnaround(prev.wrapTime || "", e.callTime || "") : null;
+    const shortfall = turnaround !== null ? Math.max(minTR - turnaround, 0) : 0;
+    const turnaroundPenalty = profile.defaultTurnaroundMode === "penalty"
+      ? shortfall * (c.baseHourly || 0) * (profile.defaultTurnaroundPenMult || 1)
+      : 0;
+    return { entry: e, c: { ...c, turnaround, turnaroundPenalty, totalWithPenalty: c.total + turnaroundPenalty } };
+  });
   const totalDays    = calcs.length;
   const totalDayRates = calcs.reduce((s, { c }) => s + (c.dayRate    || 0), 0);
   const totalOtCost  = calcs.reduce((s, { c }) => s + (c.totalOtCost || 0), 0);
@@ -213,13 +396,14 @@ function calcSummary(entries: TimesheetEntry[], profile: Profile) {
   const totalEquip   = calcs.reduce((s, { c }) => s + (c.equip       || 0), 0);
   const totalPerDiem = calcs.reduce((s, { c }) => s + (c.perDiem     || 0), 0);
   const totalExp     = calcs.reduce((s, { c }) => s + (c.expenses    || 0), 0);
+  const totalTurnaroundPenalty = calcs.reduce((s, { c }) => s + (c.turnaroundPenalty || 0), 0);
   const totalPaidH   = calcs.reduce((s, { c }) => s + (c.paidH       || 0), 0);
   const totalTravH   = calcs.reduce((s, { c }) => s + (c.travH       || 0), 0);
-  const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp;
+  const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp + totalTurnaroundPenalty;
   const vatPct       = safe(profile.defaultVat);
   const vatAmt       = subtotal * (vatPct / 100);
   const grandTotal   = subtotal + vatAmt;
-  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalPaidH, totalTravH, subtotal, vatPct, vatAmt, grandTotal };
+  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, vatAmt, grandTotal };
 }
 
 const genTSNum  = (list: Timesheet[]) => { const yr = new Date().getFullYear(); return `T-${yr}-${String((list || []).filter(t => t?.timesheetNumber?.startsWith(`T-${yr}`)).length + 1).padStart(4, "0")}`; };
@@ -361,12 +545,12 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
   const save = () => { onSave(f); setSaved(true); setTimeout(() => setSaved(false), 2500); };
   const sym  = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[f.defaultCurrency] || "R";
   const isCustom = f.defaultOvertimeRule === "custom";
-  const TABS = [["profile", "Your Profile"], ["rates", "Default Rates"], ["overtime", "Overtime & Turnaround"], ["timesheet", "Timesheet"], ["banking", "Banking"]];
+  const TABS = [["profile", "My Business Details"], ["rates", "Default Rates"], ["overtime", "Overtime & Turnaround"], ["timesheet", "Timesheet"], ["banking", "Banking"]];
 
   return (
     <div className="max-w-2xl space-y-5">
       <div className="flex items-start justify-between">
-        <div><h1 className="text-xl font-bold text-gray-900">Settings</h1><p className="text-sm text-gray-500 mt-0.5">Set your details once — they auto-fill every timesheet.</p></div>
+        <div><h1 className="text-xl font-bold text-gray-900">Settings</h1><p className="text-sm text-gray-500 mt-0.5">Set your business details once so timesheets and invoices fill themselves in.</p></div>
         {saved ? <span className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-50 text-green-700 text-sm font-medium rounded-lg border border-green-200"><CheckCircle size={14} /> Saved</span>
                : <Btn onClick={save}><Save size={14} /> Save Settings</Btn>}
       </div>
@@ -383,10 +567,11 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
       <Card className="p-5">
         {tab === "profile" && (
           <div className="space-y-4">
+            <AlertBox type="info">These seller details appear on every invoice you create.</AlertBox>
             <Inp label="Full Name"             value={f.fullName}    onChange={set("fullName")}    placeholder="Your full name" />
             <div className="grid grid-cols-2 gap-4">
               <Inp label="Role"                 value={f.role}        onChange={set("role")}        placeholder="e.g. Sound Mixer" />
-              <Inp label="Company / Trading Name" value={f.companyName} onChange={set("companyName")} />
+              <Inp label="Trading / Company Name" value={f.companyName} onChange={set("companyName")} />
             </div>
             <div className="grid grid-cols-2 gap-4">
               <Inp label="Email" type="email"   value={f.email}       onChange={set("email")} />
@@ -394,6 +579,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
             </div>
             <TxInp label="Address"             value={f.address}     onChange={set("address")} rows={2} placeholder="Street, city, postal code" />
             <Inp label="VAT / Tax Number"       value={f.vatNumber}   onChange={set("vatNumber")} placeholder="Your VAT registration number" />
+            <TxInp label="Payment Terms"         value={f.paymentTerms} onChange={set("paymentTerms")} rows={2} placeholder="e.g. Payment due within 30 days" />
           </div>
         )}
 
@@ -416,7 +602,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
               <Inp label={`Equipment / day (${sym})`} type="number" value={f.defaultEquipmentRental || ""} onChange={setN("defaultEquipmentRental")} placeholder="0.00" min="0" />
               <Inp label={`Per Diem (${sym})`}        type="number" value={f.defaultPerDiem        || ""} onChange={setN("defaultPerDiem")}        placeholder="0.00" min="0" />
             </div>
-            <Inp label="Invoice VAT %"               type="number" value={f.defaultVat           || ""} onChange={setN("defaultVat")}            placeholder="0"    min="0" max="100" />
+            <Inp label="Default VAT %"               type="number" value={f.defaultVat           || ""} onChange={setN("defaultVat")}            placeholder="0"    min="0" max="100" />
           </div>
         )}
 
@@ -480,7 +666,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
         {tab === "banking" && (
           <div className="space-y-4">
             <AlertBox type="info">These details appear on every invoice you generate.</AlertBox>
-            <Inp label="Account Name"        value={f.bankAccountName}   onChange={set("bankAccountName")} />
+            <Inp label="Account Holder"      value={f.bankAccountName}   onChange={set("bankAccountName")} />
             <div className="grid grid-cols-2 gap-4">
               <Inp label="Bank Name"          value={f.bankName}          onChange={set("bankName")} />
               <Inp label="Account Number"     value={f.bankAccountNumber} onChange={set("bankAccountNumber")} />
@@ -497,6 +683,124 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
         )}
       </Card>
       <div className="flex justify-end"><Btn onClick={save} size="lg"><Save size={15} /> Save Settings</Btn></div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLIENTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+function ClientFields({ client, onChange }: { client: Client; onChange: (c: Client) => void }) {
+  const set = (k: keyof Client) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange({ ...client, [k]: e.target.value });
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        <Inp label="Company / Client Name" value={client.companyName} onChange={set("companyName")} placeholder="e.g. Homebrew Films" />
+        <Inp label="Contact Person" value={client.contactPerson} onChange={set("contactPerson")} placeholder="Accounts or producer" />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <Inp label="Email" type="email" value={client.email} onChange={set("email")} />
+        <Inp label="Phone" type="tel" value={client.phone} onChange={set("phone")} />
+      </div>
+      <TxInp label="Billing Address" value={client.billingAddress} onChange={set("billingAddress")} rows={2} placeholder="Registered billing address" />
+      <div className="grid grid-cols-2 gap-4">
+        <Inp label="VAT Number" value={client.vatNumber} onChange={set("vatNumber")} placeholder="Optional" />
+        <Inp label="Default Payment Terms" value={client.defaultPaymentTerms} onChange={set("defaultPaymentTerms")} placeholder="Optional" />
+      </div>
+      <TxInp label="Notes" value={client.notes} onChange={set("notes")} rows={2} placeholder="Internal notes" />
+    </div>
+  );
+}
+
+function ClientsPage({ clients, onSave, onShowToast }: {
+  clients: Client[]; onSave: (clients: Client[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+}) {
+  const [draft, setDraft] = useState<Client | null>(null);
+
+  const startAdd = () => setDraft(blankClient());
+  const startEdit = (client: Client) => setDraft({ ...client });
+  const cancel = () => setDraft(null);
+
+  const saveClient = () => {
+    if (!draft) return;
+    if (!draft.companyName.trim()) { onShowToast("Client company name is required", "error"); return; }
+    const client = normalizeClient(draft);
+    const exists = clients.some(c => c.id === client.id);
+    onSave(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    setDraft(null);
+    onShowToast(`${client.companyName} saved`);
+  };
+
+  const deleteClient = (id: string) => {
+    const client = clients.find(c => c.id === id);
+    if (!confirm(`Delete ${clientName(client) || "this client"}? Existing timesheets and invoices will keep their saved text.`)) return;
+    onSave(clients.filter(c => c.id !== id));
+    onShowToast("Client deleted", "info");
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-start justify-between">
+        <div><h1 className="text-xl font-bold text-gray-900">Clients</h1><p className="text-sm text-gray-500 mt-0.5">Saved bill-to companies and people for invoices.</p></div>
+        <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
+      </div>
+
+      {draft && (
+        <Card className="p-5 max-w-3xl">
+          <div className="flex items-start justify-between mb-4">
+            <div>
+              <p className="text-sm font-bold text-gray-900">{clients.some(c => c.id === draft.id) ? "Edit Client" : "Add Client"}</p>
+              <p className="text-xs text-gray-400 mt-0.5">Client records are for invoice recipients only.</p>
+            </div>
+            <div className="flex gap-2">
+              <Btn variant="secondary" size="sm" onClick={cancel}>Cancel</Btn>
+              <Btn size="sm" onClick={saveClient}><Save size={13}/> Save Client</Btn>
+            </div>
+          </div>
+          <ClientFields client={draft} onChange={setDraft} />
+        </Card>
+      )}
+
+      <Card>
+        {clients.length === 0 ? (
+          <div className="py-16 text-center">
+            <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Building2 size={24} className="text-gray-300"/></div>
+            <h3 className="text-base font-semibold text-gray-900 mb-1">No clients saved yet</h3>
+            <p className="text-sm text-gray-400 mb-5 max-w-xs mx-auto">Add your invoice recipients here, or create one when you start a timesheet.</p>
+            <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead><tr className="border-b border-gray-200">{["Client","Contact","Email","Billing",""].map((h,i) => <th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i === 4 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
+              <tbody className="divide-y divide-gray-50">
+                {[...clients].sort((a,b) => clientName(a).localeCompare(clientName(b))).map(client => {
+                  const complete = clientBillingComplete(client);
+                  return (
+                    <tr key={client.id} className="hover:bg-gray-50 transition-colors">
+                      <td className="px-4 py-3.5">
+                        <div className="flex items-center gap-2">
+                          <button onClick={() => startEdit(client)} className="text-sm font-semibold text-blue-600 hover:text-blue-800">{client.companyName || "Unnamed client"}</button>
+                          {!complete && <Badge color="amber">Incomplete</Badge>}
+                        </div>
+                        {client.vatNumber && <p className="text-xs text-gray-400 mt-0.5">VAT: {client.vatNumber}</p>}
+                      </td>
+                      <td className="px-4 py-3.5 text-sm text-gray-600">{client.contactPerson || "—"}{client.phone && <p className="text-xs text-gray-400 mt-0.5">{client.phone}</p>}</td>
+                      <td className="px-4 py-3.5 text-sm text-gray-500">{client.email || "—"}</td>
+                      <td className="px-4 py-3.5 text-sm text-gray-500 max-w-xs truncate">{client.billingAddress || "Not set"}</td>
+                      <td className="px-4 py-3.5 text-right">
+                        <button onClick={() => startEdit(client)} className="p-1.5 rounded text-gray-300 hover:text-blue-600 transition-colors"><Pencil size={13}/></button>
+                        <button onClick={() => deleteClient(client.id)} className="p-1.5 rounded text-gray-300 hover:text-red-500 transition-colors"><Trash2 size={13}/></button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
     </div>
   );
 }
@@ -842,6 +1146,7 @@ function SummaryView({ timesheet, profile, onStartInvoice }: { timesheet: Timesh
             {sum.totalEquip   > 0 && <SRow label="Equipment rental" value={fmtMoney(sum.totalEquip,   cur)} />}
             {sum.totalPerDiem > 0 && <SRow label="Per diem"         value={fmtMoney(sum.totalPerDiem, cur)} />}
             {sum.totalExp     > 0 && <SRow label="Expenses"         value={fmtMoney(sum.totalExp,     cur)} />}
+            {sum.totalTurnaroundPenalty > 0 && <SRow label="Turnaround penalties" value={fmtMoney(sum.totalTurnaroundPenalty, cur)} amber />}
             <div className="border-t border-gray-200 pt-2 mt-1"><SRow label="Subtotal" value={fmtMoney(sum.subtotal, cur)} /></div>
             {sum.vatPct > 0 && <SRow label={`VAT (${sum.vatPct}%)`} value={fmtMoney(sum.vatAmt, cur)} />}
             <div className="border-t-2 border-gray-900 pt-2 mt-1 flex justify-between">
@@ -862,74 +1167,151 @@ function SummaryView({ timesheet, profile, onStartInvoice }: { timesheet: Timesh
 // INVOICE REVIEW SCREEN
 // ═══════════════════════════════════════════════════════════════════════════
 
-function buildTimesheetLines(sum: ReturnType<typeof calcSummary>, cur: string): InvoiceLine[] {
+function buildSummaryTimesheetLines(sum: ReturnType<typeof calcSummary>): InvoiceLine[] {
   const lines: InvoiceLine[] = [];
-  if (sum.totalDayRates > 0) lines.push({ id: uid(), description: `Day Rates — ${sum.totalDays} day${sum.totalDays !== 1 ? "s" : ""}`, quantity: sum.totalDays, unitPrice: sum.totalDayRates / Math.max(sum.totalDays, 1), amount: sum.totalDayRates });
-  if (sum.totalOtCost  > 0) lines.push({ id: uid(), description: `Overtime — ${hoursToHM(sum.totalOtH)}`, quantity: 1, unitPrice: sum.totalOtCost, amount: sum.totalOtCost });
-  if (sum.totalEquip   > 0) lines.push({ id: uid(), description: "Equipment Rental", quantity: 1, unitPrice: sum.totalEquip, amount: sum.totalEquip });
-  if (sum.totalPerDiem > 0) lines.push({ id: uid(), description: "Per Diem", quantity: 1, unitPrice: sum.totalPerDiem, amount: sum.totalPerDiem });
-  if (sum.totalExp     > 0) lines.push({ id: uid(), description: "Expenses", quantity: 1, unitPrice: sum.totalExp, amount: sum.totalExp });
+  if (sum.totalDayRates > 0) lines.push({ id: uid(), description: `Day Rates — ${sum.totalDays} day${sum.totalDays !== 1 ? "s" : ""}`, quantity: sum.totalDays, unitPrice: sum.totalDayRates / Math.max(sum.totalDays, 1), amount: sum.totalDayRates, taxable: true, category: "day-rate" });
+  if (sum.totalOtCost  > 0) lines.push({ id: uid(), description: `Overtime — ${hoursToHM(sum.totalOtH)}`, quantity: 1, unitPrice: sum.totalOtCost, amount: sum.totalOtCost, taxable: true, category: "overtime" });
+  if (sum.totalEquip   > 0) lines.push({ id: uid(), description: `Equipment Rental — ${sum.totalDays} day${sum.totalDays !== 1 ? "s" : ""}`, quantity: sum.totalDays, unitPrice: sum.totalEquip / Math.max(sum.totalDays, 1), amount: sum.totalEquip, taxable: true, category: "equipment" });
+  if (sum.totalTravH   > 0) lines.push({ id: uid(), description: `Travel — ${hoursToHM(sum.totalTravH)}`, quantity: 1, unitPrice: 0, amount: 0, taxable: false, category: "travel" });
+  if (sum.totalPerDiem + sum.totalExp > 0) lines.push({ id: uid(), description: "Expenses", quantity: 1, unitPrice: sum.totalPerDiem + sum.totalExp, amount: sum.totalPerDiem + sum.totalExp, taxable: true, category: "expenses" });
+  if (sum.totalTurnaroundPenalty > 0) lines.push({ id: uid(), description: "Turnaround Penalties", quantity: 1, unitPrice: sum.totalTurnaroundPenalty, amount: sum.totalTurnaroundPenalty, taxable: true, category: "turnaround" });
   return lines;
 }
 
-function InvoiceReviewScreen({ timesheet, profile, invoices, onSave, onBack, onShowToast }: {
-  timesheet: Timesheet; profile: Profile; invoices: Invoice[];
-  onSave: (inv: Invoice) => void; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
-}) {
-  const cur = timesheet.currency || profile.defaultCurrency || "ZAR";
-  const sum = useMemo(() => calcSummary(timesheet.entries || [], profile), [timesheet.entries, profile]);
-  const [baseLines] = useState<InvoiceLine[]>(() => buildTimesheetLines(sum, cur));
-  const [extras, setExtras] = useState<InvoiceLine[]>([]);
-  const [newItem, setNewItem] = useState({ description: "", quantity: "1", unitPrice: "" });
-  const [dueDate, setDueDate] = useState("");
-  const [payNotes, setPayNotes] = useState("");
+function buildDetailedTimesheetLines(sum: ReturnType<typeof calcSummary>): InvoiceLine[] {
+  const lines: InvoiceLine[] = [];
+  sum.calcs.forEach(({ entry, c }) => {
+    const d = fmtDate(entry.date);
+    if (c.dayRate > 0) lines.push({ id: uid(), description: `${d} — Day Rate`, quantity: 1, unitPrice: c.dayRate, amount: c.dayRate, taxable: true, category: "day-rate" });
+    if (c.b1H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 1 (${hoursToHM(c.b1H)} @ ${c.bands.band1Mult}x)`, quantity: c.b1H, unitPrice: c.b1Cost / Math.max(c.b1H, 1), amount: c.b1Cost, taxable: true, category: "overtime" });
+    if (c.b2H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 2 (${hoursToHM(c.b2H)} @ ${c.bands.band2Mult}x)`, quantity: c.b2H, unitPrice: c.b2Cost / Math.max(c.b2H, 1), amount: c.b2Cost, taxable: true, category: "overtime" });
+    if (c.equip > 0) lines.push({ id: uid(), description: `${d} — Equipment Rental`, quantity: 1, unitPrice: c.equip, amount: c.equip, taxable: true, category: "equipment" });
+    if (c.travH > 0) lines.push({ id: uid(), description: `${d} — Travel (${hoursToHM(c.travH)}${entry.travelDistance ? `, ${entry.travelDistance} km` : ""})`, quantity: 1, unitPrice: 0, amount: 0, taxable: false, category: "travel" });
+    if (c.perDiem + c.expenses > 0) lines.push({ id: uid(), description: `${d} — Expenses`, quantity: 1, unitPrice: c.perDiem + c.expenses, amount: c.perDiem + c.expenses, taxable: true, category: "expenses" });
+    if (c.turnaroundPenalty > 0) lines.push({ id: uid(), description: `${d} — Turnaround penalty`, quantity: 1, unitPrice: c.turnaroundPenalty, amount: c.turnaroundPenalty, taxable: true, category: "turnaround" });
+  });
+  return lines;
+}
 
+const buildTimesheetLines = (sum: ReturnType<typeof calcSummary>, mode: InvoiceDetailMode) =>
+  mode === "detailed" ? buildDetailedTimesheetLines(sum) : buildSummaryTimesheetLines(sum);
+
+function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoices, onSave, onUpdateTimesheet, onBack, onShowToast }: {
+  timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void; invoices: Invoice[];
+  onSave: (inv: Invoice) => void; onUpdateTimesheet: (ts: Timesheet) => void; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
+}) {
+  const effectiveProfile = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
+  const cur = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
+  const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
+  const sum = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
+  const savedClient = getTimesheetClient(timesheet, clients);
+
+  const [invoiceNumber, setInvoiceNumber] = useState(() => genINVNum(invoices));
+  const [issueDate, setIssueDate] = useState(todayStr());
+  const [dueDate, setDueDate] = useState("");
+  const [detailMode, setDetailMode] = useState<InvoiceDetailMode>("summary");
+  const [clientDraft, setClientDraft] = useState<Client>(() => savedClient ? { ...savedClient } : blankClient({ companyName: timesheet.clientName === "Unknown / add later" ? "" : timesheet.clientName || "" }));
+  const [extras, setExtras] = useState<InvoiceLine[]>([]);
+  const [newItem, setNewItem] = useState({ description: "", quantity: "1", unitPrice: "", taxable: true });
+  const [paymentTerms, setPaymentTerms] = useState(timesheet.paymentTerms || savedClient?.defaultPaymentTerms || profile.paymentTerms || "");
+  const [notes, setNotes] = useState(timesheet.notes || "");
+
+  const baseLines = useMemo(() => buildTimesheetLines(sum, detailMode), [sum, detailMode]);
   const allLines = [...baseLines, ...extras];
   const subtotal = allLines.reduce((s, l) => s + (l.amount || 0), 0);
-  const vatPct   = sum.vatPct;
-  const vatAmt   = subtotal * (vatPct / 100);
-  const total    = subtotal + vatAmt;
+  const taxableSubtotal = allLines.reduce((s, l) => s + (l.taxable === false ? 0 : (l.amount || 0)), 0);
+  const vatPct = sum.vatPct;
+  const vatAmt = taxableSubtotal * (vatPct / 100);
+  const total = subtotal + vatAmt;
+  const clientIncomplete = !clientBillingComplete(clientDraft);
+
+  const persistClientDetails = (notify = true) => {
+    if (!clientDraft.companyName.trim()) { if (notify) onShowToast("Client company name is required", "error"); return null; }
+    const client = normalizeClient(clientDraft);
+    const exists = clients.some(c => c.id === client.id);
+    onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    const updatedTS = {
+      ...timesheet,
+      clientId: client.id,
+      clientName: clientName(client),
+      clientIncomplete: !clientBillingComplete(client),
+      paymentTerms: client.defaultPaymentTerms || timesheet.paymentTerms || profile.paymentTerms,
+    };
+    onUpdateTimesheet(updatedTS);
+    setClientDraft(client);
+    if (client.defaultPaymentTerms) setPaymentTerms(client.defaultPaymentTerms);
+    if (notify) onShowToast(clientBillingComplete(client) ? "Client billing details saved" : "Client saved, but billing address is still missing", clientBillingComplete(client) ? "success" : "info");
+    return client;
+  };
+
+  const saveClientDetails = () => { persistClientDetails(true); };
 
   const addExtra = () => {
     const qty = parseFloat(newItem.quantity) || 1;
     const up  = parseFloat(newItem.unitPrice) || 0;
-    if (!newItem.description || !up) { onShowToast("Enter description and price", "error"); return; }
-    setExtras(p => [...p, { id: uid(), description: newItem.description, quantity: qty, unitPrice: up, amount: qty * up, isExtra: true }]);
-    setNewItem({ description: "", quantity: "1", unitPrice: "" });
+    if (!newItem.description.trim() || !up) { onShowToast("Enter description and price", "error"); return; }
+    setExtras(p => [...p, { id: uid(), description: newItem.description.trim(), quantity: qty, unitPrice: up, amount: qty * up, isExtra: true, taxable: newItem.taxable, category: "additional" }]);
+    setNewItem({ description: "", quantity: "1", unitPrice: "", taxable: true });
   };
 
   const removeExtra = (id: string) => setExtras(p => p.filter(e => e.id !== id));
 
+  const makeInvoice = (): Invoice => ({
+    id: uid(),
+    invoiceNumber,
+    issueDate,
+    dueDate,
+    clientId: clientDraft.id,
+    clientName: clientName(clientDraft),
+    client: clientDraft,
+    crewName: profile.fullName || "",
+    role: timesheet.role || profile.role || "",
+    companyName: profile.companyName || profile.fullName || "",
+    productionName: timesheet.productionName || "",
+    timesheetNumber: timesheet.timesheetNumber || "",
+    timesheetDates: timesheetDateRange(timesheet),
+    detailMode,
+    lineItems: allLines,
+    subtotal,
+    vat: vatPct,
+    vatAmount: vatAmt,
+    total,
+    currency: cur,
+    status: "unpaid",
+    banking: { accountName: profile.bankAccountName, bankName: profile.bankName, accountNumber: profile.bankAccountNumber, branchCode: profile.bankBranchCode, swift: profile.bankSwift, iban: profile.bankIban, reference: profile.bankReference || invoiceNumber },
+    paymentTerms,
+    paymentNotes: paymentTerms,
+    notes,
+    fromTimesheetId: timesheet.id,
+    createdAt: new Date().toISOString(),
+  });
+
+  const ensureClientReady = () => {
+    if (!clientIncomplete) return true;
+    onShowToast("Client billing details are incomplete. Please add them before finalising this invoice.", "error");
+    return false;
+  };
+
   const handleSave = () => {
-    const inv: Invoice = {
-      id: uid(), invoiceNumber: genINVNum(invoices),
-      issueDate: todayStr(), dueDate,
-      clientName: timesheet.productionName || "",
-      crewName: profile.fullName || "", role: profile.role || "", companyName: profile.companyName || "",
-      timesheetNumber: timesheet.timesheetNumber,
-      lineItems: allLines,
-      subtotal, vat: vatPct, vatAmount: vatAmt, total,
-      currency: cur, status: "unpaid",
-      banking: { accountName: profile.bankAccountName, bankName: profile.bankName, accountNumber: profile.bankAccountNumber, branchCode: profile.bankBranchCode, swift: profile.bankSwift, iban: profile.bankIban, reference: profile.bankReference },
-      paymentNotes: payNotes, fromTimesheetId: timesheet.id, createdAt: new Date().toISOString(),
-    };
+    if (!ensureClientReady()) return;
+    persistClientDetails(false);
+    const inv = makeInvoice();
     onSave(inv);
     onShowToast(`Invoice ${inv.invoiceNumber} created`);
   };
 
   const openPDF = () => {
-    const inv: Invoice = { id: uid(), invoiceNumber: genINVNum(invoices), issueDate: todayStr(), dueDate, clientName: timesheet.productionName || "", crewName: profile.fullName, role: profile.role, companyName: profile.companyName, timesheetNumber: timesheet.timesheetNumber, lineItems: allLines, subtotal, vat: vatPct, vatAmount: vatAmt, total, currency: cur, status: "unpaid", banking: { accountName: profile.bankAccountName, bankName: profile.bankName, accountNumber: profile.bankAccountNumber, branchCode: profile.bankBranchCode, swift: profile.bankSwift, iban: profile.bankIban, reference: profile.bankReference }, paymentNotes: payNotes, fromTimesheetId: timesheet.id, createdAt: new Date().toISOString() };
-    printInvoice(inv, profile);
+    if (!ensureClientReady()) return;
+    persistClientDetails(false);
+    printInvoice(makeInvoice(), profile);
   };
-
-  const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
 
   return (
     <div className="space-y-5">
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
           <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400"><ChevronLeft size={20}/></button>
-          <div><h1 className="text-xl font-bold text-gray-900">Invoice Review</h1><p className="text-sm text-gray-400 mt-0.5">Review, add extras, then save or export PDF</p></div>
+          <div><h1 className="text-xl font-bold text-gray-900">Invoice Review</h1><p className="text-sm text-gray-400 mt-0.5">{timesheet.productionName || "Not set"} · {timesheet.timesheetNumber || "Not set"}</p></div>
         </div>
         <div className="flex items-center gap-2">
           <Btn variant="secondary" onClick={openPDF}><FileText size={14}/> Export PDF</Btn>
@@ -937,67 +1319,108 @@ function InvoiceReviewScreen({ timesheet, profile, invoices, onSave, onBack, onS
         </div>
       </div>
 
+      {clientIncomplete && (
+        <AlertBox type="warning">Client billing details are incomplete. Please add them before finalising this invoice.</AlertBox>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 space-y-5">
-          {/* From / To */}
           <Card className="p-5">
             <div className="grid grid-cols-2 gap-6">
-              <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">From</p><p className="font-semibold">{profile.companyName || profile.fullName || "—"}</p><p className="text-sm text-gray-500">{profile.fullName}</p><p className="text-sm text-gray-500">{profile.role}</p></div>
-              <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Bill To</p><p className="font-semibold">{timesheet.productionName || "—"}</p></div>
-            </div>
-            <div className="grid grid-cols-2 gap-4 mt-4">
-              <Inp label="Due Date" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+              <div>
+                <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">From</p>
+                <p className="font-semibold">{profile.companyName || profile.fullName || "Not set"}</p>
+                <p className="text-sm text-gray-500">{profile.fullName || "Not set"}</p>
+                <p className="text-sm text-gray-500">{profile.role || "Not set"}</p>
+                <p className="text-sm text-gray-500">{profile.email || "Not set"}</p>
+                <p className="text-sm text-gray-500 whitespace-pre-line">{profile.address || "Not set"}</p>
+                {profile.vatNumber && <p className="text-sm text-gray-500">VAT / Tax: {profile.vatNumber}</p>}
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-bold text-gray-300 uppercase tracking-wider">Bill To</p>
+                  <Btn variant="secondary" size="xs" onClick={saveClientDetails}><Save size={12}/> Save Client Details</Btn>
+                </div>
+                <ClientFields client={clientDraft} onChange={setClientDraft} />
+              </div>
             </div>
           </Card>
 
-          {/* Timesheet line items (read-only) */}
           <Card className="p-5">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Timesheet Items</p>
-            <p className="text-xs text-gray-400 mb-4">From {timesheet.timesheetNumber}</p>
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Invoice Details</p>
+            <div className="grid grid-cols-2 gap-4">
+              <Inp label="Invoice Number" value={invoiceNumber} onChange={e => setInvoiceNumber(e.target.value)} />
+              <Inp label="Issue Date" type="date" value={issueDate} onChange={e => setIssueDate(e.target.value)} />
+              <Inp label="Due Date" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+              <Inp label="Production / Project" value={timesheet.productionName || "Not set"} readOnly />
+              <Inp label="Timesheet Reference" value={timesheet.timesheetNumber || "Not set"} readOnly />
+              <Inp label="Timesheet Dates" value={timesheetDateRange(timesheet)} readOnly />
+            </div>
+          </Card>
+
+          <Card className="p-5">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Timesheet Items</p>
+                <p className="text-xs text-gray-400">From {timesheet.timesheetNumber || "Not set"}</p>
+              </div>
+              <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden">
+                {(["summary","detailed"] as InvoiceDetailMode[]).map(mode => (
+                  <button key={mode} onClick={() => setDetailMode(mode)} className={`px-3 py-1.5 text-xs font-semibold capitalize ${detailMode === mode ? "bg-blue-600 text-white" : "bg-white text-gray-500 hover:bg-gray-50"}`}>{mode}</button>
+                ))}
+              </div>
+            </div>
             <div className="space-y-0">
               {baseLines.map(l => (
                 <div key={l.id} className="grid grid-cols-12 gap-2 py-2.5 border-b border-gray-100">
                   <div className="col-span-7 text-sm text-gray-700">{l.description}</div>
-                  <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{l.quantity > 1 ? `${l.quantity} ×` : ""}</div>
+                  <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{l.quantity > 1 ? `${Number(l.quantity).toFixed(l.quantity % 1 ? 2 : 0)} ×` : ""}</div>
                   <div className="col-span-3 text-sm text-right font-medium tabular-nums">{fmtMoney(l.amount, cur)}</div>
                 </div>
               ))}
             </div>
           </Card>
 
-          {/* Extra items */}
           <Card className="p-5">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Additional Items <span className="normal-case font-normal text-gray-300">(optional — kit prep, parking, accommodation, etc.)</span></p>
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Additional Items</p>
             {extras.length > 0 && (
               <div className="mb-4 space-y-0">
                 {extras.map(l => (
                   <div key={l.id} className="grid grid-cols-12 gap-2 py-2.5 border-b border-gray-100 items-center">
-                    <div className="col-span-6 text-sm text-gray-700">{l.description}</div>
+                    <div className="col-span-5 text-sm text-gray-700">{l.description}</div>
                     <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{l.quantity} × {sym}{l.unitPrice.toFixed(2)}</div>
-                    <div className="col-span-3 text-sm text-right font-medium tabular-nums">{fmtMoney(l.amount, cur)}</div>
+                    <div className="col-span-2 text-xs text-right text-gray-400">{l.taxable === false ? "No VAT" : "VAT"}</div>
+                    <div className="col-span-2 text-sm text-right font-medium tabular-nums">{fmtMoney(l.amount, cur)}</div>
                     <div className="col-span-1 flex justify-end"><button onClick={() => removeExtra(l.id)} className="p-1 text-gray-300 hover:text-red-500 rounded"><Trash2 size={13}/></button></div>
                   </div>
                 ))}
               </div>
             )}
             <div className="grid grid-cols-12 gap-2 items-end border-t border-gray-100 pt-4">
-              <div className="col-span-5"><Inp placeholder="Description (e.g. Kit Prep Day, Parking)" value={newItem.description} onChange={e => setNewItem(p => ({ ...p, description: e.target.value }))} onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && addExtra()} /></div>
+              <div className="col-span-4"><Inp placeholder="Description (parking, prep day, mileage)" value={newItem.description} onChange={e => setNewItem(p => ({ ...p, description: e.target.value }))} onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && addExtra()} /></div>
               <div className="col-span-2"><Inp placeholder="Qty" type="number" value={newItem.quantity} onChange={e => setNewItem(p => ({ ...p, quantity: e.target.value }))} /></div>
-              <div className="col-span-3"><Inp placeholder={`Unit price (${sym})`} type="number" value={newItem.unitPrice} onChange={e => setNewItem(p => ({ ...p, unitPrice: e.target.value }))} onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && addExtra()} /></div>
+              <div className="col-span-2"><Inp placeholder={`Unit price (${sym})`} type="number" value={newItem.unitPrice} onChange={e => setNewItem(p => ({ ...p, unitPrice: e.target.value }))} onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && addExtra()} /></div>
+              <label className="col-span-2 flex items-center gap-2 text-sm text-gray-600 pb-2">
+                <input type="checkbox" checked={newItem.taxable} onChange={e => setNewItem(p => ({ ...p, taxable: e.target.checked }))} className="w-4 h-4 rounded border-gray-300 text-blue-600" />
+                VAT
+              </label>
               <div className="col-span-2"><Btn variant="primary" className="w-full justify-center" onClick={addExtra}><Plus size={14}/> Add</Btn></div>
             </div>
           </Card>
 
-          <TxInp label="Payment Notes" rows={2} value={payNotes} onChange={e => setPayNotes(e.target.value)} placeholder="e.g. Payment due within 30 days of invoice date" />
+          <Card className="p-5 space-y-4">
+            <TxInp label="Payment Terms" rows={2} value={paymentTerms} onChange={e => setPaymentTerms(e.target.value)} placeholder="e.g. Payment due within 30 days" />
+            <TxInp label="Invoice Notes" rows={2} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Optional note for the client" />
+          </Card>
         </div>
 
-        {/* Totals sidebar */}
         <div>
           <Card className="p-5 sticky top-5">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Invoice Total</p>
             <div className="space-y-0.5">
               {allLines.map(l => <SRow key={l.id} label={l.description.length > 28 ? l.description.slice(0, 28) + "…" : l.description} value={fmtMoney(l.amount, cur)} indent={l.isExtra} />)}
               <div className="border-t border-gray-200 pt-2 mt-1"><SRow label="Subtotal" value={fmtMoney(subtotal, cur)} /></div>
+              {vatPct > 0 && taxableSubtotal !== subtotal && <SRow label="VAT-able subtotal" value={fmtMoney(taxableSubtotal, cur)} />}
               {vatPct > 0 && <SRow label={`VAT (${vatPct}%)`} value={fmtMoney(vatAmt, cur)} />}
               <div className="border-t-2 border-gray-900 pt-2.5 mt-1 flex justify-between">
                 <span className="font-bold text-gray-900">TOTAL DUE</span>
@@ -1021,17 +1444,26 @@ function InvoiceReviewScreen({ timesheet, profile, invoices, onSave, onBack, onS
 
 function printInvoice(inv: Invoice, profile: Profile) {
   const esc = (s: unknown) => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const block = (s: unknown) => esc(s).replace(/\n/g, "<br/>");
   const m = (n: unknown) => fmtMoney(n, inv.currency);
+  const client = invoiceClient(inv);
   const bd = inv.banking || {};
-  const bankRows = ([["Account Name", bd.accountName],["Bank", bd.bankName],["Account No.", bd.accountNumber],["Branch", bd.branchCode],bd.swift&&["SWIFT", bd.swift],bd.iban&&["IBAN", bd.iban],bd.reference&&["Reference", bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
-  const lineRows = (inv.lineItems||[]).map(l=>`<tr><td style="padding:9px 0;border-bottom:1px solid #F3F4F6;font-size:13px">${esc(l.description)}</td><td style="padding:9px 0;border-bottom:1px solid #F3F4F6;font-size:13px;text-align:right;color:#6B7280">${l.quantity > 1 ? l.quantity + " ×" : ""}</td><td style="padding:9px 0;border-bottom:1px solid #F3F4F6;font-size:13px;text-align:right;font-weight:500">${m(l.amount)}</td></tr>`).join("");
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(inv.invoiceNumber)}</title><style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Inter',sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:800px;margin:0 auto;padding:52px 44px}@media print{.page{padding:32px}}</style></head><body><div class="page">
-<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:32px"><div><div style="font-size:28px;font-weight:700;letter-spacing:-.4px">INVOICE</div><div style="color:#6B7280;font-size:13px;margin-top:4px">${esc(inv.invoiceNumber)}</div></div><div style="text-align:right"><div style="font-size:16px;font-weight:700">${esc(inv.companyName||profile.companyName)}</div><div style="font-size:12px;color:#6B7280;margin-top:2px">${esc(inv.crewName)}</div><div style="font-size:12px;color:#6B7280">${esc(inv.role)}</div></div></div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:28px"><div><div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Bill To</div><div style="font-size:14px;font-weight:500">${esc(inv.clientName||"—")}</div>${inv.timesheetNumber?`<div style="font-size:11px;color:#9CA3AF;margin-top:4px">Timesheet: ${esc(inv.timesheetNumber)}</div>`:""}</div><div style="text-align:right"><div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Issue Date</div><div style="font-size:14px;font-weight:500">${esc(fmtDate(inv.issueDate))}</div>${inv.dueDate?`<div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.07em;margin-top:10px;margin-bottom:4px">Due Date</div><div style="font-size:14px;font-weight:500">${esc(fmtDate(inv.dueDate))}</div>`:""}</div></div>
-<table style="width:100%;border-collapse:collapse"><thead><tr style="border-top:2px solid #111827;border-bottom:1px solid #E5E7EB"><th style="padding:8px 0;font-size:10px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left">Description</th><th style="padding:8px 0;font-size:10px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:right">Qty</th><th style="padding:8px 0;font-size:10px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:right">Amount</th></tr></thead><tbody>${lineRows}</tbody></table>
-<div style="display:flex;justify-content:flex-end;margin-top:18px"><div style="width:240px"><div style="display:flex;justify-content:space-between;font-size:13px;color:#6B7280;padding:4px 0">Subtotal<span>${m(inv.subtotal)}</span></div>${inv.vat>0?`<div style="display:flex;justify-content:space-between;font-size:13px;color:#6B7280;padding:4px 0">VAT (${inv.vat}%)<span>${m(inv.vatAmount)}</span></div>`:""}<div style="display:flex;justify-content:space-between;font-size:16px;font-weight:700;padding:10px 0 0;border-top:2px solid #111827;margin-top:6px">TOTAL DUE<span>${m(inv.total)}</span></div></div></div>
-${bankRows.length?`<div style="margin-top:28px;padding-top:20px;border-top:1px solid #E5E7EB"><div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px">Banking Details</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">${bankRows.map(([k,v])=>`<div><div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;margin-bottom:3px">${esc(k)}</div><div style="font-size:13px;font-weight:500">${esc(v)}</div></div>`).join("")}</div></div>`:""}
-${inv.paymentNotes?`<div style="margin-top:20px;padding-top:16px;border-top:1px solid #E5E7EB"><div style="font-size:10px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px">Payment Notes</div><div style="font-size:13px;color:#374151;line-height:1.6">${esc(inv.paymentNotes)}</div></div>`:""}
+  const bankRows = ([["Account Holder", bd.accountName],["Bank", bd.bankName],["Account No.", bd.accountNumber],["Branch", bd.branchCode],bd.swift&&["SWIFT", bd.swift],bd.iban&&["IBAN", bd.iban],bd.reference&&["Reference", bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
+  const sellerRows = ([profile.fullName, profile.role, profile.email, profile.phone, profile.address, profile.vatNumber && `VAT / Tax: ${profile.vatNumber}`] as string[]).filter(Boolean);
+  const clientRows = ([client?.contactPerson, client?.email, client?.phone, client?.billingAddress, client?.vatNumber && `VAT: ${client.vatNumber}`] as string[]).filter(Boolean);
+  const lineRows = (inv.lineItems||[]).map(l=>`<tr><td>${esc(l.description)}${l.isExtra?`<span class="pill">Additional</span>`:""}</td><td class="num">${l.quantity || ""}</td><td class="num">${m(l.unitPrice || 0)}</td><td class="num muted">${l.taxable === false ? "No" : inv.vat > 0 ? "Yes" : "—"}</td><td class="num strong">${m(l.amount)}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">No line items</td></tr>`;
+  const paymentTerms = inv.paymentTerms || inv.paymentNotes || profile.paymentTerms || "";
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(inv.invoiceNumber)}</title><style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:46px}.top{display:flex;justify-content:space-between;gap:32px;margin-bottom:30px}.title{font-size:30px;font-weight:750;letter-spacing:.02em}.muted{color:#6B7280}.tiny{font-size:10px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:.08em}.strong{font-weight:700}.boxgrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-bottom:24px}.meta{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;border:1px solid #E5E7EB;border-radius:10px;padding:14px;margin-bottom:24px}.meta div{min-width:0}.meta p:last-child{font-size:12px;margin-top:4px;font-weight:600}.party{line-height:1.5;font-size:12px}.party h2{font-size:15px;margin:6px 0 4px}table{width:100%;border-collapse:collapse;margin-top:8px}th{padding:9px 0;border-top:2px solid #111827;border-bottom:1px solid #E5E7EB;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left}td{padding:10px 0;border-bottom:1px solid #F3F4F6;font-size:12px;vertical-align:top}.num{text-align:right;white-space:nowrap}.pill{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;background:#F3F4F6;color:#6B7280;font-size:9px;font-weight:700;text-transform:uppercase}.totals{display:flex;justify-content:flex-end;margin-top:18px}.totals>div{width:260px}.row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:#6B7280}.due{font-size:17px;font-weight:750;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:10px}.section{margin-top:24px;padding-top:18px;border-top:1px solid #E5E7EB}.bank{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:10px}.bank div p:last-child{font-size:12px;font-weight:600;margin-top:2px}.notes{font-size:12px;color:#374151;line-height:1.55;margin-top:8px}@media print{.page{padding:30px}.meta{break-inside:avoid}.section{break-inside:avoid}}
+</style></head><body><div class="page">
+<div class="top"><div><div class="title">INVOICE</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(inv.invoiceNumber || "Not set")}</div></div><div style="text-align:right"><div style="font-size:17px;font-weight:750">${esc(inv.companyName || profile.companyName || profile.fullName || "Not set")}</div>${sellerRows.map(r=>`<div class="muted" style="font-size:12px">${block(r)}</div>`).join("")}</div></div>
+<div class="boxgrid"><div class="party"><div class="tiny">Bill To</div><h2>${esc(inv.clientName || "Not set")}</h2>${clientRows.length ? clientRows.map(r=>`<div class="muted">${block(r)}</div>`).join("") : `<div class="muted">Not set</div>`}</div><div class="party" style="text-align:right"><div class="tiny">Invoice Date</div><h2>${esc(fmtDate(inv.issueDate))}</h2>${inv.dueDate?`<div class="tiny" style="margin-top:10px">Due Date</div><div style="font-weight:700">${esc(fmtDate(inv.dueDate))}</div>`:""}</div></div>
+<div class="meta"><div><p class="tiny">Production</p><p>${esc(inv.productionName || "Not set")}</p></div><div><p class="tiny">Timesheet</p><p>${esc(inv.timesheetNumber || "Not set")}</p></div><div><p class="tiny">Timesheet Dates</p><p>${esc(inv.timesheetDates || "Not set")}</p></div><div><p class="tiny">Detail Mode</p><p>${esc(inv.detailMode || "summary")}</p></div></div>
+<table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">VAT</th><th class="num">Amount</th></tr></thead><tbody>${lineRows}</tbody></table>
+<div class="totals"><div><div class="row"><span>Subtotal</span><span>${m(inv.subtotal)}</span></div>${inv.vat>0?`<div class="row"><span>VAT (${inv.vat}%)</span><span>${m(inv.vatAmount)}</span></div>`:""}<div class="row due"><span>Total Due</span><span>${m(inv.total)}</span></div></div></div>
+${bankRows.length?`<div class="section"><div class="tiny">Banking Details</div><div class="bank">${bankRows.map(([k,v])=>`<div><p class="tiny">${esc(k)}</p><p>${esc(v)}</p></div>`).join("")}</div></div>`:""}
+${paymentTerms?`<div class="section"><div class="tiny">Payment Terms</div><div class="notes">${block(paymentTerms)}</div></div>`:""}
+${inv.notes?`<div class="section"><div class="tiny">Notes</div><div class="notes">${block(inv.notes)}</div></div>`:""}
 </div><script>window.addEventListener('load',function(){setTimeout(function(){window.print()},500)})<\/script></body></html>`;
   const w = window.open("", "_blank", "width=960,height=720");
   if (!w) { alert("Allow pop-ups to export PDF"); return; }
@@ -1047,8 +1479,9 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
   onBack: () => void; onCreateInvoice: (ts: Timesheet) => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const [tab, setTab]     = useState("add");
-  const sum               = useMemo(() => calcSummary(timesheet.entries || [], profile), [timesheet.entries, profile]);
-  const cur               = profile.defaultCurrency || "ZAR";
+  const effectiveProfile  = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
+  const sum               = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
+  const cur               = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
   const addEntry          = (e: TimesheetEntry) => onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), e] });
   const deleteEntry       = (id: string) => onUpdate({ ...timesheet, entries: (timesheet.entries || []).filter(e => e.id !== id) });
   const statusColor       = ({ open: "blue", submitted: "purple", invoiced: "green" } as Record<string, string>)[timesheet.status] || "blue";
@@ -1062,7 +1495,7 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
           <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400"><ChevronLeft size={20}/></button>
           <div>
             <h1 className="text-xl font-bold text-gray-900">{timesheet.productionName || "Untitled"}</h1>
-            <p className="text-sm text-gray-400 mt-0.5">{timesheet.timesheetNumber} · {(timesheet.entries||[]).length} day{(timesheet.entries||[]).length !== 1 ? "s" : ""} · {fmtMoney(sum.grandTotal, cur)}</p>
+            <p className="text-sm text-gray-400 mt-0.5">{timesheet.timesheetNumber} · Bill to {timesheet.clientName || "Unknown / add later"} · {(timesheet.entries||[]).length} day{(timesheet.entries||[]).length !== 1 ? "s" : ""} · {fmtMoney(sum.grandTotal, cur)}</p>
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -1073,9 +1506,9 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
       <div className="flex border-b border-gray-200">
         {TABS.map(t => <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${tab === t.id ? "border-blue-600 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-800"}`}>{t.label}</button>)}
       </div>
-      {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={profile} onAdd={addEntry} onShowToast={onShowToast} />}
-      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={profile} onDeleteEntry={deleteEntry} />}
-      {tab === "summary"&& <SummaryView timesheet={timesheet} profile={profile} onStartInvoice={() => onCreateInvoice(timesheet)} />}
+      {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={effectiveProfile} onAdd={addEntry} onShowToast={onShowToast} />}
+      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onDeleteEntry={deleteEntry} />}
+      {tab === "summary"&& <SummaryView timesheet={timesheet} profile={effectiveProfile} onStartInvoice={() => onCreateInvoice(timesheet)} />}
     </div>
   );
 }
@@ -1084,20 +1517,84 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
 // TIMESHEETS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function TimesheetsPage({ timesheets, profile, onSave, invoices, onAddInvoice, onShowToast }: {
-  timesheets: Timesheet[]; profile: Profile; onSave: (t: Timesheet[]) => void;
+function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onShowToast }: {
+  timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void;
   invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const [view, setView]           = useState<"list" | "detail" | "invoice-review">("list");
   const [selected, setSelected]   = useState<Timesheet | null>(null);
   const [showNew, setShowNew]     = useState(false);
-  const [newProd, setNewProd]     = useState("");
+  const [newTs, setNewTs] = useState({
+    productionName: "",
+    clientChoice: "unknown",
+    role: profile.role || "",
+    startDate: todayStr(),
+    currency: profile.defaultCurrency || "ZAR",
+    notes: "",
+  });
+  const [newClient, setNewClient] = useState<Client>(() => blankClient());
   const cur = profile.defaultCurrency || "ZAR";
 
+  const resetNewTimesheet = () => {
+    setNewTs({
+      productionName: "",
+      clientChoice: "unknown",
+      role: profile.role || "",
+      startDate: todayStr(),
+      currency: profile.defaultCurrency || "ZAR",
+      notes: "",
+    });
+    setNewClient(blankClient());
+  };
+
   const createTS = () => {
-    if (!newProd.trim()) return;
-    const ts: Timesheet = { id: uid(), timesheetNumber: genTSNum(timesheets), productionName: newProd.trim(), crewName: profile.fullName, role: profile.role, currency: profile.defaultCurrency, vat: profile.defaultVat, status: "open", entries: [], createdAt: new Date().toISOString() };
-    onSave([...timesheets, ts]); setSelected(ts); setView("detail"); setShowNew(false); setNewProd("");
+    if (!newTs.productionName.trim()) return;
+
+    let chosenClient: Client | null = null;
+    let nextClients = clients;
+
+    if (newTs.clientChoice === "new") {
+      if (!newClient.companyName.trim()) { onShowToast("Enter the new client company name or choose Unknown / add later", "error"); return; }
+      chosenClient = normalizeClient(newClient);
+      nextClients = [...clients, chosenClient];
+      onSaveClients(nextClients);
+    } else if (newTs.clientChoice !== "unknown") {
+      chosenClient = clients.find(c => c.id === newTs.clientChoice) || null;
+    }
+
+    const ts: Timesheet = {
+      id: uid(),
+      timesheetNumber: genTSNum(timesheets),
+      productionName: newTs.productionName.trim(),
+      clientId: chosenClient?.id,
+      clientName: chosenClient ? clientName(chosenClient) : "Unknown / add later",
+      clientIncomplete: !chosenClient || !clientBillingComplete(chosenClient),
+      crewName: profile.fullName,
+      role: newTs.role || profile.role,
+      startDate: newTs.startDate || todayStr(),
+      notes: newTs.notes,
+      currency: newTs.currency,
+      vat: profile.defaultVat,
+      status: "open",
+      entries: [],
+      paymentTerms: chosenClient?.defaultPaymentTerms || profile.paymentTerms,
+      defaultDayRate: profile.defaultDayRate,
+      defaultIncludedHours: profile.defaultIncludedHours,
+      defaultEquipmentRental: profile.defaultEquipmentRental,
+      defaultPerDiem: profile.defaultPerDiem,
+      defaultOvertimeRule: profile.defaultOvertimeRule,
+      defaultOtBand1Hours: profile.defaultOtBand1Hours,
+      defaultOtBand1Mult: profile.defaultOtBand1Mult,
+      defaultOtBand2Mult: profile.defaultOtBand2Mult,
+      defaultMinTurnaround: profile.defaultMinTurnaround,
+      defaultTurnaroundMode: profile.defaultTurnaroundMode,
+      defaultTurnaroundPenMult: profile.defaultTurnaroundPenMult,
+      mealBreaksDeducted: profile.mealBreaksDeducted,
+      travelTimePaid: profile.travelTimePaid,
+      equipmentRentalDaily: profile.equipmentRentalDaily,
+      createdAt: new Date().toISOString(),
+    };
+    onSave([...timesheets, ts]); setSelected(ts); setView("detail"); setShowNew(false); resetNewTimesheet();
   };
 
   const updateTS = useCallback((ts: Timesheet) => {
@@ -1115,15 +1612,25 @@ function TimesheetsPage({ timesheets, profile, onSave, invoices, onAddInvoice, o
 
   const saveInvoice = useCallback((inv: Invoice) => {
     onAddInvoice(inv);
-    const updated = { ...selected!, status: "invoiced" as const, invoiceId: inv.id };
-    updateTS(updated);
+    const source = (timesheets || []).find(t => t.id === inv.fromTimesheetId) || selected!;
+    const updated = {
+      ...source,
+      status: "invoiced" as const,
+      invoiceId: inv.id,
+      clientId: inv.clientId || source.clientId,
+      clientName: inv.clientName || source.clientName,
+      clientIncomplete: false,
+      paymentTerms: inv.paymentTerms || source.paymentTerms,
+    };
+    onSave((timesheets || []).map(x => x.id === updated.id ? updated : x));
+    setSelected(updated);
     setView("list"); setSelected(null);
-  }, [selected, onAddInvoice, updateTS]);
+  }, [selected, timesheets, onAddInvoice, onSave]);
 
   const currentTS = selected ? ((timesheets||[]).find(t => t.id === selected.id) || selected) : null;
 
   if (view === "invoice-review" && currentTS)
-    return <InvoiceReviewScreen timesheet={currentTS} profile={profile} invoices={invoices} onSave={saveInvoice} onBack={() => setView("detail")} onShowToast={onShowToast} />;
+    return <InvoiceReviewScreen timesheet={currentTS} profile={profile} clients={clients} onSaveClients={onSaveClients} invoices={invoices} onSave={saveInvoice} onUpdateTimesheet={updateTS} onBack={() => setView("detail")} onShowToast={onShowToast} />;
 
   if (view === "detail" && currentTS)
     return <TimesheetDetail timesheet={currentTS} profile={profile} onUpdate={updateTS} onBack={() => { setView("list"); setSelected(null); }} onCreateInvoice={startInvoice} onShowToast={onShowToast} />;
@@ -1140,14 +1647,40 @@ function TimesheetsPage({ timesheets, profile, onSave, invoices, onAddInvoice, o
       )}
 
       {showNew && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) setShowNew(false); }}>
-          <div className="bg-white rounded-2xl p-6 w-full max-w-md shadow-2xl">
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) { setShowNew(false); resetNewTimesheet(); } }}>
+          <div className="bg-white rounded-2xl p-6 w-full max-w-3xl shadow-2xl max-h-[90vh] overflow-y-auto">
             <h2 className="text-base font-bold text-gray-900 mb-1">New Timesheet</h2>
-            <p className="text-sm text-gray-400 mb-4">Enter the production name — your rates and OT rules fill in automatically.</p>
-            <Inp label="Production / Project Name" value={newProd} onChange={e => setNewProd(e.target.value)} placeholder="e.g. The Crown S6, Nike Commercial…" onKeyDown={(e: React.KeyboardEvent) => e.key === "Enter" && createTS()} autoFocus />
+            <p className="text-sm text-gray-400 mb-4">Production and bill-to client can be different. Rates and rules fill from your business profile.</p>
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <Inp label="Production / Project Name" value={newTs.productionName} onChange={e => setNewTs(p => ({ ...p, productionName: e.target.value }))} placeholder="e.g. Kokkedoor S4" autoFocus />
+                <Inp label="Role" value={newTs.role} onChange={e => setNewTs(p => ({ ...p, role: e.target.value }))} placeholder="e.g. Sound Mixer" />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <Inp label="Start Date" type="date" value={newTs.startDate} onChange={e => setNewTs(p => ({ ...p, startDate: e.target.value }))} />
+                <SInp label="Currency" value={newTs.currency} onChange={e => setNewTs(p => ({ ...p, currency: e.target.value }))}>
+                  {["ZAR","USD","GBP","EUR"].map(c => <option key={c} value={c}>{c}</option>)}
+                </SInp>
+              </div>
+              <SInp label="Bill-to Client" value={newTs.clientChoice} onChange={e => setNewTs(p => ({ ...p, clientChoice: e.target.value }))}>
+                <option value="unknown">Unknown / add later</option>
+                {clients.map(c => <option key={c.id} value={c.id}>{clientName(c) || "Unnamed client"}{!clientBillingComplete(c) ? " (incomplete)" : ""}</option>)}
+                <option value="new">Add new client</option>
+              </SInp>
+              {newTs.clientChoice === "unknown" && (
+                <AlertBox type="warning">This timesheet can be created now, but the client will be marked incomplete until billing details are added.</AlertBox>
+              )}
+              {newTs.clientChoice === "new" && (
+                <div className="rounded-xl border border-gray-200 bg-gray-50 p-4">
+                  <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">New Client</p>
+                  <ClientFields client={newClient} onChange={setNewClient} />
+                </div>
+              )}
+              <TxInp label="Notes" rows={2} value={newTs.notes} onChange={e => setNewTs(p => ({ ...p, notes: e.target.value }))} placeholder="Optional production or billing notes" />
+            </div>
             <div className="flex gap-2 mt-4">
-              <Btn className="flex-1 justify-center" onClick={createTS} disabled={!newProd.trim()}>Create Timesheet →</Btn>
-              <Btn variant="secondary" onClick={() => setShowNew(false)}>Cancel</Btn>
+              <Btn className="flex-1 justify-center" onClick={createTS} disabled={!newTs.productionName.trim()}>Create Timesheet →</Btn>
+              <Btn variant="secondary" onClick={() => { setShowNew(false); resetNewTimesheet(); }}>Cancel</Btn>
             </div>
           </div>
         </div>
@@ -1164,16 +1697,24 @@ function TimesheetsPage({ timesheets, profile, onSave, invoices, onAddInvoice, o
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full">
-              <thead><tr className="border-b border-gray-200">{["Timesheet","Production","Days","Status","Total",""].map((h,i) => <th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i >= 4 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
+              <thead><tr className="border-b border-gray-200">{["Timesheet","Production","Bill To","Days","Status","Total",""].map((h,i) => <th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i >= 5 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
               <tbody className="divide-y divide-gray-50">
                 {[...(timesheets||[])].sort((a,b) => new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime()).map(ts => {
-                  const s = calcSummary(ts.entries||[], profile);
+                  const effectiveProfile = profileForTimesheet(profile, ts);
+                  const s = calcSummary(ts.entries||[], effectiveProfile);
+                  const billTo = getTimesheetClient(ts, clients);
                   const col = ({ open:"blue", submitted:"purple", invoiced:"green" } as Record<string,string>)[ts.status]||"blue";
                   const lbl = ({ open:"Open", submitted:"Submitted", invoiced:"Invoiced" } as Record<string,string>)[ts.status]||"Open";
                   return (
                     <tr key={ts.id} className="hover:bg-gray-50 transition-colors">
                       <td className="px-4 py-3.5"><button onClick={() => { setSelected(ts); setView("detail"); }} className="text-sm font-semibold text-blue-600 hover:text-blue-800">{ts.timesheetNumber}</button></td>
                       <td className="px-4 py-3.5 text-sm font-medium text-gray-900">{ts.productionName||"—"}</td>
+                      <td className="px-4 py-3.5 text-sm text-gray-500">
+                        <div className="flex items-center gap-2">
+                          <span>{clientName(billTo) || ts.clientName || "Unknown / add later"}</span>
+                          {(!billTo || !clientBillingComplete(billTo)) && <Badge color="amber">Incomplete</Badge>}
+                        </div>
+                      </td>
                       <td className="px-4 py-3.5 text-sm text-gray-500">{(ts.entries||[]).length}</td>
                       <td className="px-4 py-3.5"><Badge color={col}>{lbl}</Badge></td>
                       <td className="px-4 py-3.5 text-sm font-semibold text-gray-900 text-right tabular-nums">{fmtMoney(s.grandTotal, ts.currency||cur)}</td>
@@ -1199,8 +1740,9 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
   const inv = sel ? (invoices||[]).find(i => i.id === sel) || null : null;
 
   if (inv) {
+    const c = invoiceClient(inv);
     const bd = inv.banking || {};
-    const bankRows = ([["Account Name",bd.accountName],["Bank",bd.bankName],["Account No.",bd.accountNumber],["Branch",bd.branchCode],bd.swift&&["SWIFT",bd.swift],bd.iban&&["IBAN",bd.iban],bd.reference&&["Reference",bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
+    const bankRows = ([["Account Holder",bd.accountName],["Bank",bd.bankName],["Account No.",bd.accountNumber],["Branch",bd.branchCode],bd.swift&&["SWIFT",bd.swift],bd.iban&&["IBAN",bd.iban],bd.reference&&["Reference",bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
     return (
       <div className="space-y-5">
         <div className="flex items-center gap-2">
@@ -1208,22 +1750,28 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
           <div><h1 className="text-xl font-bold text-gray-900">{inv.invoiceNumber}</h1><p className="text-sm text-gray-400 mt-0.5">For {inv.clientName||"—"}</p></div>
           <div className="ml-auto"><Btn variant="secondary" onClick={() => printInvoice(inv, profile)}><FileText size={14}/> Export PDF</Btn></div>
         </div>
-        <Card className="p-8 max-w-2xl">
+        <Card className="p-8 max-w-3xl">
           <div className="flex justify-between items-start mb-8">
-            <div><h2 className="text-3xl font-bold tracking-tight">INVOICE</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p>{inv.timesheetNumber&&<p className="text-gray-300 text-xs mt-0.5">Timesheet: {inv.timesheetNumber}</p>}</div>
-            <div className="text-right"><p className="font-bold text-base">{inv.companyName||profile.companyName}</p><p className="text-gray-500 text-sm">{inv.crewName}</p><p className="text-gray-500 text-sm">{inv.role}</p></div>
+            <div><h2 className="text-3xl font-bold tracking-tight">INVOICE</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p></div>
+            <div className="text-right"><p className="font-bold text-base">{inv.companyName||profile.companyName||profile.fullName}</p><p className="text-gray-500 text-sm">{inv.crewName || profile.fullName}</p><p className="text-gray-500 text-sm">{inv.role || profile.role}</p>{profile.email&&<p className="text-gray-500 text-sm">{profile.email}</p>}</div>
           </div>
           <div className="grid grid-cols-2 gap-6 mb-8">
-            <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Bill To</p><p className="font-medium">{inv.clientName||"—"}</p></div>
+            <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Bill To</p><p className="font-medium">{inv.clientName||"—"}</p>{c?.contactPerson&&<p className="text-sm text-gray-500">{c.contactPerson}</p>}{c?.billingAddress&&<p className="text-sm text-gray-500 whitespace-pre-line">{c.billingAddress}</p>}{c?.vatNumber&&<p className="text-sm text-gray-500">VAT: {c.vatNumber}</p>}</div>
             <div className="text-right"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Issue Date</p><p className="font-medium">{fmtDate(inv.issueDate)}</p>{inv.dueDate&&<><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1 mt-3">Due Date</p><p className="font-medium">{fmtDate(inv.dueDate)}</p></>}</div>
           </div>
+          <div className="grid grid-cols-3 gap-3 mb-6 p-3 rounded-lg border border-gray-100 bg-gray-50">
+            <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Production</p><p className="text-sm font-medium">{inv.productionName || "Not set"}</p></div>
+            <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Timesheet</p><p className="text-sm font-medium">{inv.timesheetNumber || "Not set"}</p></div>
+            <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Dates</p><p className="text-sm font-medium">{inv.timesheetDates || "Not set"}</p></div>
+          </div>
           <div className="border-t-2 border-gray-900 mb-1">
-            <div className="grid grid-cols-12 gap-3 py-2 text-[10px] font-bold text-gray-400 uppercase tracking-wider"><div className="col-span-8">Description</div><div className="col-span-2 text-right">Qty</div><div className="col-span-2 text-right">Amount</div></div>
+            <div className="grid grid-cols-12 gap-3 py-2 text-[10px] font-bold text-gray-400 uppercase tracking-wider"><div className="col-span-6">Description</div><div className="col-span-2 text-right">Qty</div><div className="col-span-2 text-right">Unit</div><div className="col-span-2 text-right">Amount</div></div>
           </div>
           {(inv.lineItems||[]).map(item => (
             <div key={item.id} className={`grid grid-cols-12 gap-3 py-2.5 border-b border-gray-100 ${item.isExtra ? "bg-gray-50" : ""}`}>
-              <div className="col-span-8 text-sm text-gray-700">{item.description}{item.isExtra&&<span className="ml-2 text-xs text-gray-400">extra</span>}</div>
+              <div className="col-span-6 text-sm text-gray-700">{item.description}{item.isExtra&&<span className="ml-2 text-xs text-gray-400">extra</span>}</div>
               <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{item.quantity > 1 ? item.quantity : ""}</div>
+              <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{fmtMoney(item.unitPrice || 0, inv.currency)}</div>
               <div className="col-span-2 text-sm font-medium text-right tabular-nums">{fmtMoney(item.amount, inv.currency)}</div>
             </div>
           ))}
@@ -1235,7 +1783,8 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
             </div>
           </div>
           {bankRows.length>0&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Banking Details</p><div className="grid grid-cols-2 gap-3">{bankRows.map(([k,v])=><div key={k}><p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">{k}</p><p className="text-sm font-medium mt-0.5">{v}</p></div>)}</div></div>}
-          {inv.paymentNotes&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Payment Notes</p><p className="text-sm text-gray-600 leading-relaxed">{inv.paymentNotes}</p></div>}
+          {(inv.paymentTerms || inv.paymentNotes)&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Payment Terms</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.paymentTerms || inv.paymentNotes}</p></div>}
+          {inv.notes&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Notes</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.notes}</p></div>}
         </Card>
       </div>
     );
@@ -1263,7 +1812,7 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
 // LAYOUT
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings }];
+const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings }];
 
 function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:string)=>void; profile:Profile; children:React.ReactNode }) {
   const initial = (profile.fullName||"?").charAt(0).toUpperCase();
@@ -1302,6 +1851,7 @@ function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:
 export default function App() {
   const [page,       setPage]       = useState("timesheets");
   const [profile,    setProfile]    = useState<Profile>({ ...DEFAULT_PROFILE });
+  const [clients,    setClients]    = useState<Client[]>([]);
   const [timesheets, setTimesheets] = useState<Timesheet[]>([]);
   const [invoices,   setInvoices]   = useState<Invoice[]>([]);
   const [ready,      setReady]      = useState(false);
@@ -1309,10 +1859,11 @@ export default function App() {
 
   useEffect(() => {
     (async () => {
-      const [p, t, i] = await Promise.all([Store.get("cqp-profile"), Store.get("cqp-timesheets"), Store.get("cqp-invoices")]);
+      const [p, c, t, i] = await Promise.all([Store.get("cqp-profile"), Store.get("cqp-clients"), Store.get("cqp-timesheets"), Store.get("cqp-invoices")]);
       if (p) setProfile({ ...DEFAULT_PROFILE, ...p });
-      if (t) setTimesheets(Array.isArray(t) ? t : []);
-      if (i) setInvoices(Array.isArray(i) ? i : []);
+      if (c) setClients(Array.isArray(c) ? c.map(normalizeClient) : []);
+      if (t) setTimesheets(Array.isArray(t) ? t.map(normalizeTimesheet) : []);
+      if (i) setInvoices(Array.isArray(i) ? i.map(normalizeInvoice) : []);
       setReady(true);
     })();
   }, []);
@@ -1324,6 +1875,7 @@ export default function App() {
   }, []);
 
   const saveProfile    = (p: Profile)     => { setProfile(p);    Store.set("cqp-profile",    p); };
+  const saveClients    = (c: Client[])    => { setClients(c);    Store.set("cqp-clients",    c); };
   const saveTimesheets = (t: Timesheet[]) => { setTimesheets(t); Store.set("cqp-timesheets", t); };
   const addInvoice     = (inv: Invoice)   => { const next = [...invoices, inv]; setInvoices(next); Store.set("cqp-invoices", next); };
 
@@ -1339,7 +1891,8 @@ export default function App() {
   return (
     <Layout page={page} setPage={setPage} profile={profile}>
       <ToastContainer toasts={toasts} />
-      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} onSave={saveTimesheets} invoices={invoices} onAddInvoice={addInvoice} onShowToast={showToast} />}
+      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onShowToast={showToast} />}
+      {page === "clients"    && <ClientsPage    clients={clients}         onSave={saveClients} onShowToast={showToast} />}
       {page === "invoices"   && <InvoicesPage   invoices={invoices}     profile={profile} />}
       {page === "settings"   && <SettingsPage   profile={profile}       onSave={saveProfile} />}
     </Layout>

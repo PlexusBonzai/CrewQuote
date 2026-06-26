@@ -1,6 +1,6 @@
 import { Fragment, useState, useEffect, useMemo, useCallback } from "react";
 import {
-  Clock, Receipt, Settings, Film, Plus, ChevronLeft, Trash2,
+  Clock, Receipt, Settings, Film, Plus, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
   Save, Zap, Copy, FileText, Info, Users, Building2, Pencil
 } from "lucide-react";
@@ -12,7 +12,8 @@ import {
 type OTRuleId        = "sa-film" | "sa-bcea" | "custom";
 type TurnaroundMode  = "warning" | "penalty" | "manual";
 type ToastType       = "success" | "error" | "info";
-type InvoiceDetailMode = "summary" | "detailed";
+type InvoiceDetailMode = "summary" | "detailed" | "summary_timesheet";
+type InvoiceStatus = "draft" | "sent" | "paid" | "partial" | "overdue" | "cancelled";
 
 interface ToastMsg { id: string; msg: string; type: ToastType; }
 
@@ -24,6 +25,11 @@ interface Client {
   phone: string;
   billingAddress: string;
   vatNumber: string;
+  poRequired: boolean;
+  vendorNumber: string;
+  accountsEmail: string;
+  paymentTerms: string;
+  preferredInvoiceDetailMode: InvoiceDetailMode;
   defaultPaymentTerms: string;
   notes: string;
 }
@@ -103,6 +109,7 @@ interface InvoiceLine {
 interface Invoice {
   id: string;
   invoiceNumber: string;
+  poNumber?: string;
   issueDate: string;
   dueDate: string;
   clientId?: string;
@@ -116,12 +123,16 @@ interface Invoice {
   timesheetDates?: string;
   detailMode?: InvoiceDetailMode;
   lineItems: InvoiceLine[];
+  timesheetBreakdown?: InvoiceLine[];
   subtotal: number;
   vat: number;
   vatAmount: number;
   total: number;
+  paidAmount?: number;
+  paidDate?: string;
+  balanceDue?: number;
   currency: string;
-  status: "draft" | "unpaid" | "paid";
+  status: InvoiceStatus;
   banking: Record<string, string>;
   paymentTerms?: string;
   paymentNotes: string;
@@ -140,6 +151,15 @@ const OT_PRESETS: Record<OTRuleId, { name: string; desc: string }> = {
   "custom":   { name: "Custom Rule",                    desc: "Define your own overtime bands" },
 };
 
+const INVOICE_STATUS: Record<InvoiceStatus, { label: string; color: string }> = {
+  draft:     { label: "Draft",     color: "gray"  },
+  sent:      { label: "Sent",      color: "blue"  },
+  paid:      { label: "Paid",      color: "green" },
+  partial:   { label: "Partial",   color: "orange" },
+  overdue:   { label: "Overdue",   color: "red"   },
+  cancelled: { label: "Cancelled", color: "gray"  },
+};
+
 function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; band1Mult: number; band2Mult: number } {
   if (ruleId === "sa-film") return { band1Hours: 4,    band1Mult: 1.5, band2Mult: 2.0 };
   if (ruleId === "sa-bcea") return { band1Hours: 9999, band1Mult: 1.5, band2Mult: 1.5 };
@@ -152,6 +172,8 @@ function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; b
 
 const DEFAULT_PROFILE = {
   fullName: "", role: "", companyName: "", email: "", phone: "", address: "", vatNumber: "",
+  vatRegistered:          false,
+  invoiceLabel:           "Invoice",
   paymentTerms:           "Payment due within 30 days",
   defaultCurrency:          "ZAR",
   defaultDayRate:           0,
@@ -232,16 +254,35 @@ const blankClient = (overrides: Partial<Client> = {}): Client => ({
   phone: "",
   billingAddress: "",
   vatNumber: "",
+  poRequired: false,
+  vendorNumber: "",
+  accountsEmail: "",
+  paymentTerms: "",
+  preferredInvoiceDetailMode: "summary",
   defaultPaymentTerms: "",
   notes: "",
   ...overrides,
 });
 
-const normalizeClient = (c: Partial<Client>): Client => blankClient({ ...c, id: c.id || uid() });
+const normalizeClient = (c: Partial<Client>): Client => {
+  const terms = c.paymentTerms || c.defaultPaymentTerms || "";
+  return blankClient({ ...c, id: c.id || uid(), paymentTerms: terms, defaultPaymentTerms: terms });
+};
 const clientName = (c?: Partial<Client> | null) => c?.companyName || c?.contactPerson || "";
 const clientBillingComplete = (c?: Partial<Client> | null) => Boolean((c?.companyName || "").trim() && (c?.billingAddress || "").trim());
 const getTimesheetClient = (ts: Partial<Timesheet>, clients: Client[]) => clients.find(c => c.id === ts.clientId) || null;
 const invoiceClient = (inv: Invoice): Client | null => inv.client || (inv.clientName ? blankClient({ companyName: inv.clientName, id: inv.clientId || uid() }) : null);
+
+function normalizeInvoiceStatus(status?: string): InvoiceStatus {
+  if (status === "unpaid") return "sent";
+  if (status === "partially_paid") return "partial";
+  if (["draft","sent","paid","partial","overdue","cancelled"].includes(status || "")) return status as InvoiceStatus;
+  return "draft";
+}
+
+const invoiceBalance = (inv: Partial<Invoice>) => Math.max(safe(inv.total, 0) - safe(inv.paidAmount, 0), 0);
+const invoiceDetailModeLabel = (mode?: InvoiceDetailMode) =>
+  mode === "detailed" ? "Detailed" : mode === "summary_timesheet" ? "Summary + Attached Timesheet" : "Summary";
 
 function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile {
   if (!ts) return profile;
@@ -311,9 +352,13 @@ function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
 }
 
 function normalizeInvoice(i: Partial<Invoice>): Invoice {
+  const status = normalizeInvoiceStatus(i.status);
+  const paidAmount = safe(i.paidAmount, status === "paid" ? i.total : 0);
+  const total = safe(i.total, 0);
   return {
     id: i.id || uid(),
     invoiceNumber: i.invoiceNumber || "I-Not set",
+    poNumber: i.poNumber || "",
     issueDate: i.issueDate || todayStr(),
     dueDate: i.dueDate || "",
     clientId: i.clientId,
@@ -327,12 +372,16 @@ function normalizeInvoice(i: Partial<Invoice>): Invoice {
     timesheetDates: i.timesheetDates || "",
     detailMode: i.detailMode || "summary",
     lineItems: Array.isArray(i.lineItems) ? i.lineItems : [],
+    timesheetBreakdown: Array.isArray(i.timesheetBreakdown) ? i.timesheetBreakdown : [],
     subtotal: safe(i.subtotal, 0),
     vat: safe(i.vat, 0),
     vatAmount: safe(i.vatAmount, 0),
-    total: safe(i.total, 0),
+    total,
+    paidAmount,
+    paidDate: i.paidDate || "",
+    balanceDue: Math.max(total - paidAmount, 0),
     currency: i.currency || "ZAR",
-    status: i.status || "draft",
+    status,
     banking: i.banking || {},
     paymentTerms: i.paymentTerms || i.paymentNotes || "",
     paymentNotes: i.paymentNotes || "",
@@ -400,7 +449,7 @@ function calcSummary(entries: TimesheetEntry[], profile: Profile) {
   const totalPaidH   = calcs.reduce((s, { c }) => s + (c.paidH       || 0), 0);
   const totalTravH   = calcs.reduce((s, { c }) => s + (c.travH       || 0), 0);
   const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp + totalTurnaroundPenalty;
-  const vatPct       = safe(profile.defaultVat);
+  const vatPct       = profile.vatRegistered ? safe(profile.defaultVat) : 0;
   const vatAmt       = subtotal * (vatPct / 100);
   const grandTotal   = subtotal + vatAmt;
   return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, vatAmt, grandTotal };
@@ -495,7 +544,7 @@ const Card = ({ children, className = "" }: { children: React.ReactNode; classNa
   <div className={`bg-white rounded-xl border border-gray-200 shadow-sm ${className}`}>{children}</div>;
 
 const Badge = ({ children, color = "gray" }: { children: React.ReactNode; color?: string }) => {
-  const c: Record<string, string> = { gray: "bg-gray-100 text-gray-700", blue: "bg-blue-100 text-blue-700", green: "bg-green-100 text-green-700", amber: "bg-amber-100 text-amber-800", purple: "bg-purple-100 text-purple-700", red: "bg-red-100 text-red-700" };
+  const c: Record<string, string> = { gray: "bg-gray-100 text-gray-700", blue: "bg-blue-100 text-blue-700", green: "bg-green-100 text-green-700", amber: "bg-amber-100 text-amber-800", orange: "bg-orange-100 text-orange-700", purple: "bg-purple-100 text-purple-700", red: "bg-red-100 text-red-700" };
   return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${c[color] || c.gray}`}>{children}</span>;
 };
 
@@ -578,7 +627,14 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
               <Inp label="Phone" type="tel"     value={f.phone}       onChange={set("phone")} />
             </div>
             <TxInp label="Address"             value={f.address}     onChange={set("address")} rows={2} placeholder="Street, city, postal code" />
-            <Inp label="VAT / Tax Number"       value={f.vatNumber}   onChange={set("vatNumber")} placeholder="Your VAT registration number" />
+            <div className="grid grid-cols-2 gap-4">
+              <SInp label="Invoice Label" value={f.invoiceLabel} onChange={set("invoiceLabel")}>
+                <option value="Invoice">Invoice</option>
+                <option value="Tax Invoice">Tax Invoice</option>
+              </SInp>
+              <Inp label="VAT / Tax Number" value={f.vatNumber} onChange={set("vatNumber")} placeholder="Your VAT registration number" />
+            </div>
+            <Tog checked={f.vatRegistered} onChange={setT("vatRegistered")} label="VAT registered" hint="When enabled, invoices show subtotal excluding VAT, VAT amount, and total including VAT" />
             <TxInp label="Payment Terms"         value={f.paymentTerms} onChange={set("paymentTerms")} rows={2} placeholder="e.g. Payment due within 30 days" />
           </div>
         )}
@@ -693,6 +749,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
 
 function ClientFields({ client, onChange }: { client: Client; onChange: (c: Client) => void }) {
   const set = (k: keyof Client) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => onChange({ ...client, [k]: e.target.value });
+  const setPaymentTerms = (e: React.ChangeEvent<HTMLInputElement>) => onChange({ ...client, paymentTerms: e.target.value, defaultPaymentTerms: e.target.value });
   return (
     <div className="space-y-4">
       <div className="grid grid-cols-2 gap-4">
@@ -702,11 +759,24 @@ function ClientFields({ client, onChange }: { client: Client; onChange: (c: Clie
       <div className="grid grid-cols-2 gap-4">
         <Inp label="Email" type="email" value={client.email} onChange={set("email")} />
         <Inp label="Phone" type="tel" value={client.phone} onChange={set("phone")} />
+        <Inp label="Accounts Email" type="email" value={client.accountsEmail} onChange={set("accountsEmail")} placeholder="accounts@example.com" />
+        <Inp label="Vendor Number" value={client.vendorNumber} onChange={set("vendorNumber")} placeholder="Optional" />
       </div>
       <TxInp label="Billing Address" value={client.billingAddress} onChange={set("billingAddress")} rows={2} placeholder="Registered billing address" />
       <div className="grid grid-cols-2 gap-4">
         <Inp label="VAT Number" value={client.vatNumber} onChange={set("vatNumber")} placeholder="Optional" />
-        <Inp label="Default Payment Terms" value={client.defaultPaymentTerms} onChange={set("defaultPaymentTerms")} placeholder="Optional" />
+        <Inp label="Payment Terms" value={client.paymentTerms || client.defaultPaymentTerms} onChange={setPaymentTerms} placeholder="Optional" />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <SInp label="Preferred Invoice Detail" value={client.preferredInvoiceDetailMode} onChange={e => onChange({ ...client, preferredInvoiceDetailMode: e.target.value as InvoiceDetailMode })}>
+          <option value="summary">Summary</option>
+          <option value="detailed">Detailed</option>
+          <option value="summary_timesheet">Summary + Attached Timesheet</option>
+        </SInp>
+        <label className="flex items-center gap-3 text-sm font-medium text-gray-800 pt-6">
+          <input type="checkbox" checked={client.poRequired} onChange={e => onChange({ ...client, poRequired: e.target.checked })} className="w-4 h-4 rounded border-gray-300 text-blue-600" />
+          PO number required
+        </label>
       </div>
       <TxInp label="Notes" value={client.notes} onChange={set("notes")} rows={2} placeholder="Internal notes" />
     </div>
@@ -754,7 +824,7 @@ function ClientsPage({ clients, onSave, onShowToast }: {
               <p className="text-xs text-gray-400 mt-0.5">Client records are for invoice recipients only.</p>
             </div>
             <div className="flex gap-2">
-              <Btn variant="secondary" size="sm" onClick={cancel}>Cancel</Btn>
+              <Btn variant="secondary" size="sm" onClick={cancel}>{"\u2190"} Back to Clients</Btn>
               <Btn size="sm" onClick={saveClient}><Save size={13}/> Save Client</Btn>
             </div>
           </div>
@@ -766,8 +836,8 @@ function ClientsPage({ clients, onSave, onShowToast }: {
         {clients.length === 0 ? (
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Building2 size={24} className="text-gray-300"/></div>
-            <h3 className="text-base font-semibold text-gray-900 mb-1">No clients saved yet</h3>
-            <p className="text-sm text-gray-400 mb-5 max-w-xs mx-auto">Add your invoice recipients here, or create one when you start a timesheet.</p>
+            <h3 className="text-base font-semibold text-gray-900 mb-1">No invoice clients yet</h3>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Save the companies and accounts contacts you bill most often. You can still create a timesheet with an unknown client and add billing details later.</p>
             <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
           </div>
         ) : (
@@ -904,7 +974,7 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
     onAdd(entry);
     const nextDate = nextDayStr(form.date);
     setForm(p => ({ ...entryDefaults(profile, entry, timesheet.productionName), date: nextDate }));
-    onShowToast(`Day added — ${fmtDate(entry.date)} | ${fmtMoney(c.total, cur)}${c.totalOtH > 0 ? ` | ${hoursToHM(c.totalOtH)} OT` : ""}`);
+    onShowToast(`Day added successfully — ${fmtDate(entry.date)} | ${fmtMoney(c.total, cur)}${c.totalOtH > 0 ? ` | ${hoursToHM(c.totalOtH)} OT` : ""}`);
   };
 
   return (
@@ -1207,23 +1277,32 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const savedClient = getTimesheetClient(timesheet, clients);
 
   const [invoiceNumber, setInvoiceNumber] = useState(() => genINVNum(invoices));
+  const [poNumber, setPoNumber] = useState("");
   const [issueDate, setIssueDate] = useState(todayStr());
   const [dueDate, setDueDate] = useState("");
-  const [detailMode, setDetailMode] = useState<InvoiceDetailMode>("summary");
+  const [status, setStatus] = useState<InvoiceStatus>("draft");
+  const [detailMode, setDetailMode] = useState<InvoiceDetailMode>(savedClient?.preferredInvoiceDetailMode || "summary");
   const [clientDraft, setClientDraft] = useState<Client>(() => savedClient ? { ...savedClient } : blankClient({ companyName: timesheet.clientName === "Unknown / add later" ? "" : timesheet.clientName || "" }));
   const [extras, setExtras] = useState<InvoiceLine[]>([]);
   const [newItem, setNewItem] = useState({ description: "", quantity: "1", unitPrice: "", taxable: true });
-  const [paymentTerms, setPaymentTerms] = useState(timesheet.paymentTerms || savedClient?.defaultPaymentTerms || profile.paymentTerms || "");
+  const [paymentTerms, setPaymentTerms] = useState(timesheet.paymentTerms || savedClient?.paymentTerms || savedClient?.defaultPaymentTerms || profile.paymentTerms || "");
+  const [paidAmountStr, setPaidAmountStr] = useState("");
+  const [paidDate, setPaidDate] = useState("");
   const [notes, setNotes] = useState(timesheet.notes || "");
 
   const baseLines = useMemo(() => buildTimesheetLines(sum, detailMode), [sum, detailMode]);
+  const timesheetBreakdown = useMemo(() => detailMode === "summary_timesheet" ? buildDetailedTimesheetLines(sum) : [], [sum, detailMode]);
   const allLines = [...baseLines, ...extras];
   const subtotal = allLines.reduce((s, l) => s + (l.amount || 0), 0);
   const taxableSubtotal = allLines.reduce((s, l) => s + (l.taxable === false ? 0 : (l.amount || 0)), 0);
-  const vatPct = sum.vatPct;
+  const vatPct = profile.vatRegistered ? sum.vatPct : 0;
   const vatAmt = taxableSubtotal * (vatPct / 100);
   const total = subtotal + vatAmt;
+  const paidAmount = Math.min(safe(paidAmountStr, 0), total);
+  const balanceDue = Math.max(total - paidAmount, 0);
   const clientIncomplete = !clientBillingComplete(clientDraft);
+  const duplicateInvoice = invoices.some(inv => inv.invoiceNumber === invoiceNumber);
+  const poMissing = clientDraft.poRequired && !poNumber.trim();
 
   const persistClientDetails = (notify = true) => {
     if (!clientDraft.companyName.trim()) { if (notify) onShowToast("Client company name is required", "error"); return null; }
@@ -1235,11 +1314,11 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
       clientId: client.id,
       clientName: clientName(client),
       clientIncomplete: !clientBillingComplete(client),
-      paymentTerms: client.defaultPaymentTerms || timesheet.paymentTerms || profile.paymentTerms,
+      paymentTerms: client.paymentTerms || client.defaultPaymentTerms || timesheet.paymentTerms || profile.paymentTerms,
     };
     onUpdateTimesheet(updatedTS);
     setClientDraft(client);
-    if (client.defaultPaymentTerms) setPaymentTerms(client.defaultPaymentTerms);
+    if (client.paymentTerms || client.defaultPaymentTerms) setPaymentTerms(client.paymentTerms || client.defaultPaymentTerms);
     if (notify) onShowToast(clientBillingComplete(client) ? "Client billing details saved" : "Client saved, but billing address is still missing", clientBillingComplete(client) ? "success" : "info");
     return client;
   };
@@ -1256,9 +1335,18 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
 
   const removeExtra = (id: string) => setExtras(p => p.filter(e => e.id !== id));
 
+  const changeReviewStatus = (nextStatus: InvoiceStatus) => {
+    setStatus(nextStatus);
+    if (nextStatus === "paid") {
+      setPaidAmountStr(String(total));
+      if (!paidDate) setPaidDate(todayStr());
+    }
+  };
+
   const makeInvoice = (): Invoice => ({
     id: uid(),
     invoiceNumber,
+    poNumber,
     issueDate,
     dueDate,
     clientId: clientDraft.id,
@@ -1272,12 +1360,16 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     timesheetDates: timesheetDateRange(timesheet),
     detailMode,
     lineItems: allLines,
+    timesheetBreakdown,
     subtotal,
     vat: vatPct,
     vatAmount: vatAmt,
     total,
+    paidAmount,
+    paidDate,
+    balanceDue,
     currency: cur,
-    status: "unpaid",
+    status,
     banking: { accountName: profile.bankAccountName, bankName: profile.bankName, accountNumber: profile.bankAccountNumber, branchCode: profile.bankBranchCode, swift: profile.bankSwift, iban: profile.bankIban, reference: profile.bankReference || invoiceNumber },
     paymentTerms,
     paymentNotes: paymentTerms,
@@ -1292,35 +1384,51 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     return false;
   };
 
+  const ensureInvoiceReady = () => {
+    if (!ensureClientReady()) return false;
+    if (poMissing) {
+      onShowToast("This client requires a PO number before finalising or exporting.", "error");
+      return false;
+    }
+    if (duplicateInvoice && !confirm(`Invoice number ${invoiceNumber} already exists. Continue anyway?`)) return false;
+    return true;
+  };
+
   const handleSave = () => {
-    if (!ensureClientReady()) return;
+    if (!ensureInvoiceReady()) return;
     persistClientDetails(false);
     const inv = makeInvoice();
     onSave(inv);
-    onShowToast(`Invoice ${inv.invoiceNumber} created`);
+    onShowToast(`Invoice ${inv.invoiceNumber} saved`);
   };
 
   const openPDF = () => {
-    if (!ensureClientReady()) return;
+    if (!ensureInvoiceReady()) return;
     persistClientDetails(false);
     printInvoice(makeInvoice(), profile);
   };
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
-        <div className="flex items-center gap-2">
-          <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400"><ChevronLeft size={20}/></button>
+      <div className="space-y-3">
+        <Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>
+        <div className="flex items-start justify-between gap-4">
           <div><h1 className="text-xl font-bold text-gray-900">Invoice Review</h1><p className="text-sm text-gray-400 mt-0.5">{timesheet.productionName || "Not set"} · {timesheet.timesheetNumber || "Not set"}</p></div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Btn variant="secondary" onClick={openPDF}><FileText size={14}/> Export PDF</Btn>
-          <Btn variant="success" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
+          <div className="flex items-center gap-2">
+            <Btn variant="secondary" onClick={openPDF}><FileText size={14}/> Export PDF</Btn>
+            <Btn variant="success" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
+          </div>
         </div>
       </div>
 
       {clientIncomplete && (
         <AlertBox type="warning">Client billing details are incomplete. Please add them before finalising this invoice.</AlertBox>
+      )}
+      {duplicateInvoice && (
+        <AlertBox type="warning">Invoice number {invoiceNumber || "Not set"} already exists. You can override it, but double-check before saving or exporting.</AlertBox>
+      )}
+      {poMissing && (
+        <AlertBox type="warning">This client requires a PO number before finalising or exporting this invoice.</AlertBox>
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -1334,7 +1442,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
                 <p className="text-sm text-gray-500">{profile.role || "Not set"}</p>
                 <p className="text-sm text-gray-500">{profile.email || "Not set"}</p>
                 <p className="text-sm text-gray-500 whitespace-pre-line">{profile.address || "Not set"}</p>
-                {profile.vatNumber && <p className="text-sm text-gray-500">VAT / Tax: {profile.vatNumber}</p>}
+                {profile.vatRegistered && profile.vatNumber && <p className="text-sm text-gray-500">VAT / Tax: {profile.vatNumber}</p>}
               </div>
               <div>
                 <div className="flex items-center justify-between mb-2">
@@ -1350,12 +1458,19 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Invoice Details</p>
             <div className="grid grid-cols-2 gap-4">
               <Inp label="Invoice Number" value={invoiceNumber} onChange={e => setInvoiceNumber(e.target.value)} />
+              <Inp label="PO Number" value={poNumber} onChange={e => setPoNumber(e.target.value)} placeholder={clientDraft.poRequired ? "Required by client" : "Optional"} />
               <Inp label="Issue Date" type="date" value={issueDate} onChange={e => setIssueDate(e.target.value)} />
               <Inp label="Due Date" type="date" value={dueDate} onChange={e => setDueDate(e.target.value)} />
+              <SInp label="Status" value={status} onChange={e => changeReviewStatus(e.target.value as InvoiceStatus)}>
+                {(Object.entries(INVOICE_STATUS) as [InvoiceStatus, { label: string; color: string }][]).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+              </SInp>
               <Inp label="Production / Project" value={timesheet.productionName || "Not set"} readOnly />
               <Inp label="Timesheet Reference" value={timesheet.timesheetNumber || "Not set"} readOnly />
               <Inp label="Timesheet Dates" value={timesheetDateRange(timesheet)} readOnly />
+              <Inp label="Paid Amount" type="number" min="0" value={paidAmountStr} onChange={e => setPaidAmountStr(e.target.value)} placeholder="0.00" />
+              <Inp label="Paid Date" type="date" value={paidDate} onChange={e => setPaidDate(e.target.value)} />
             </div>
+            <div className="mt-3 text-sm text-gray-500">Balance due: <strong className="text-gray-900">{fmtMoney(balanceDue, cur)}</strong></div>
           </Card>
 
           <Card className="p-5">
@@ -1365,8 +1480,12 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
                 <p className="text-xs text-gray-400">From {timesheet.timesheetNumber || "Not set"}</p>
               </div>
               <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden">
-                {(["summary","detailed"] as InvoiceDetailMode[]).map(mode => (
-                  <button key={mode} onClick={() => setDetailMode(mode)} className={`px-3 py-1.5 text-xs font-semibold capitalize ${detailMode === mode ? "bg-blue-600 text-white" : "bg-white text-gray-500 hover:bg-gray-50"}`}>{mode}</button>
+                {([
+                  ["summary", "Summary"],
+                  ["detailed", "Detailed"],
+                  ["summary_timesheet", "Summary + Timesheet"],
+                ] as [InvoiceDetailMode, string][]).map(([mode, label]) => (
+                  <button key={mode} onClick={() => setDetailMode(mode)} className={`px-3 py-1.5 text-xs font-semibold ${detailMode === mode ? "bg-blue-600 text-white" : "bg-white text-gray-500 hover:bg-gray-50"}`}>{label}</button>
                 ))}
               </div>
             </div>
@@ -1380,6 +1499,22 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
               ))}
             </div>
           </Card>
+
+          {detailMode === "summary_timesheet" && (
+            <Card className="p-5">
+              <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Attached Timesheet Breakdown</p>
+              <p className="text-xs text-gray-400 mb-4">This will be included after the invoice summary in the PDF.</p>
+              <div className="space-y-0">
+                {timesheetBreakdown.map(l => (
+                  <div key={l.id} className="grid grid-cols-12 gap-2 py-2.5 border-b border-gray-100">
+                    <div className="col-span-7 text-sm text-gray-700">{l.description}</div>
+                    <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{l.quantity > 1 ? `${Number(l.quantity).toFixed(l.quantity % 1 ? 2 : 0)} ×` : ""}</div>
+                    <div className="col-span-3 text-sm text-right font-medium tabular-nums">{fmtMoney(l.amount, cur)}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          )}
 
           <Card className="p-5">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Additional Items</p>
@@ -1426,6 +1561,8 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
                 <span className="font-bold text-gray-900">TOTAL DUE</span>
                 <span className="font-bold text-lg tabular-nums">{fmtMoney(total, cur)}</span>
               </div>
+              {paidAmount > 0 && <SRow label="Paid" value={fmtMoney(paidAmount, cur)} />}
+              {paidAmount > 0 && <SRow label="Balance Due" value={fmtMoney(balanceDue, cur)} bold />}
             </div>
             <div className="mt-5 space-y-2">
               <Btn variant="success" className="w-full justify-center" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
@@ -1449,18 +1586,23 @@ function printInvoice(inv: Invoice, profile: Profile) {
   const client = invoiceClient(inv);
   const bd = inv.banking || {};
   const bankRows = ([["Account Holder", bd.accountName],["Bank", bd.bankName],["Account No.", bd.accountNumber],["Branch", bd.branchCode],bd.swift&&["SWIFT", bd.swift],bd.iban&&["IBAN", bd.iban],bd.reference&&["Reference", bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
-  const sellerRows = ([profile.fullName, profile.role, profile.email, profile.phone, profile.address, profile.vatNumber && `VAT / Tax: ${profile.vatNumber}`] as string[]).filter(Boolean);
-  const clientRows = ([client?.contactPerson, client?.email, client?.phone, client?.billingAddress, client?.vatNumber && `VAT: ${client.vatNumber}`] as string[]).filter(Boolean);
+  const sellerRows = ([profile.fullName, profile.role, profile.email, profile.phone, profile.address, profile.vatRegistered && profile.vatNumber && `VAT / Tax: ${profile.vatNumber}`] as string[]).filter(Boolean);
+  const clientRows = ([client?.contactPerson, client?.accountsEmail || client?.email, client?.phone, client?.billingAddress, client?.vendorNumber && `Vendor: ${client.vendorNumber}`, client?.vatNumber && `VAT: ${client.vatNumber}`] as string[]).filter(Boolean);
   const lineRows = (inv.lineItems||[]).map(l=>`<tr><td>${esc(l.description)}${l.isExtra?`<span class="pill">Additional</span>`:""}</td><td class="num">${l.quantity || ""}</td><td class="num">${m(l.unitPrice || 0)}</td><td class="num muted">${l.taxable === false ? "No" : inv.vat > 0 ? "Yes" : "—"}</td><td class="num strong">${m(l.amount)}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">No line items</td></tr>`;
+  const attachedRows = (inv.timesheetBreakdown || []).map(l=>`<tr><td>${esc(l.description)}</td><td class="num">${l.quantity || ""}</td><td class="num">${m(l.unitPrice || 0)}</td><td class="num"></td><td class="num strong">${m(l.amount)}</td></tr>`).join("");
   const paymentTerms = inv.paymentTerms || inv.paymentNotes || profile.paymentTerms || "";
+  const balanceDue = invoiceBalance(inv);
+  const paidAmount = safe(inv.paidAmount, 0);
+  const invoiceLabel = profile.vatRegistered ? (profile.invoiceLabel || "Tax Invoice") : (profile.invoiceLabel || "Invoice");
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(inv.invoiceNumber)}</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:46px}.top{display:flex;justify-content:space-between;gap:32px;margin-bottom:30px}.title{font-size:30px;font-weight:750;letter-spacing:.02em}.muted{color:#6B7280}.tiny{font-size:10px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:.08em}.strong{font-weight:700}.boxgrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-bottom:24px}.meta{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;border:1px solid #E5E7EB;border-radius:10px;padding:14px;margin-bottom:24px}.meta div{min-width:0}.meta p:last-child{font-size:12px;margin-top:4px;font-weight:600}.party{line-height:1.5;font-size:12px}.party h2{font-size:15px;margin:6px 0 4px}table{width:100%;border-collapse:collapse;margin-top:8px}th{padding:9px 0;border-top:2px solid #111827;border-bottom:1px solid #E5E7EB;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left}td{padding:10px 0;border-bottom:1px solid #F3F4F6;font-size:12px;vertical-align:top}.num{text-align:right;white-space:nowrap}.pill{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;background:#F3F4F6;color:#6B7280;font-size:9px;font-weight:700;text-transform:uppercase}.totals{display:flex;justify-content:flex-end;margin-top:18px}.totals>div{width:260px}.row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:#6B7280}.due{font-size:17px;font-weight:750;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:10px}.section{margin-top:24px;padding-top:18px;border-top:1px solid #E5E7EB}.bank{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:10px}.bank div p:last-child{font-size:12px;font-weight:600;margin-top:2px}.notes{font-size:12px;color:#374151;line-height:1.55;margin-top:8px}@media print{.page{padding:30px}.meta{break-inside:avoid}.section{break-inside:avoid}}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:46px}.top{display:flex;justify-content:space-between;gap:32px;margin-bottom:30px}.title{font-size:30px;font-weight:750;letter-spacing:.02em;text-transform:uppercase}.muted{color:#6B7280}.tiny{font-size:10px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:.08em}.strong{font-weight:700}.boxgrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-bottom:24px}.meta{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;border:1px solid #E5E7EB;border-radius:10px;padding:14px;margin-bottom:24px}.meta div{min-width:0}.meta p:last-child{font-size:12px;margin-top:4px;font-weight:600}.party{line-height:1.5;font-size:12px}.party h2{font-size:15px;margin:6px 0 4px}table{width:100%;border-collapse:collapse;margin-top:8px}th{padding:9px 0;border-top:2px solid #111827;border-bottom:1px solid #E5E7EB;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left}td{padding:10px 0;border-bottom:1px solid #F3F4F6;font-size:12px;vertical-align:top}.num{text-align:right;white-space:nowrap}.pill{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;background:#F3F4F6;color:#6B7280;font-size:9px;font-weight:700;text-transform:uppercase}.totals{display:flex;justify-content:flex-end;margin-top:18px}.totals>div{width:280px}.row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:#6B7280}.due{font-size:17px;font-weight:750;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:10px}.section{margin-top:24px;padding-top:18px;border-top:1px solid #E5E7EB}.bank{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:10px}.bank div p:last-child{font-size:12px;font-weight:600;margin-top:2px}.notes{font-size:12px;color:#374151;line-height:1.55;margin-top:8px}@media print{.page{padding:30px}.meta{break-inside:avoid}.section{break-inside:avoid}}
 </style></head><body><div class="page">
-<div class="top"><div><div class="title">INVOICE</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(inv.invoiceNumber || "Not set")}</div></div><div style="text-align:right"><div style="font-size:17px;font-weight:750">${esc(inv.companyName || profile.companyName || profile.fullName || "Not set")}</div>${sellerRows.map(r=>`<div class="muted" style="font-size:12px">${block(r)}</div>`).join("")}</div></div>
+<div class="top"><div><div class="title">${esc(invoiceLabel)}</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(inv.invoiceNumber || "Not set")}</div>${inv.poNumber?`<div class="muted" style="font-size:12px;margin-top:2px">PO: ${esc(inv.poNumber)}</div>`:""}</div><div style="text-align:right"><div style="font-size:17px;font-weight:750">${esc(inv.companyName || profile.companyName || profile.fullName || "Not set")}</div>${sellerRows.map(r=>`<div class="muted" style="font-size:12px">${block(r)}</div>`).join("")}</div></div>
 <div class="boxgrid"><div class="party"><div class="tiny">Bill To</div><h2>${esc(inv.clientName || "Not set")}</h2>${clientRows.length ? clientRows.map(r=>`<div class="muted">${block(r)}</div>`).join("") : `<div class="muted">Not set</div>`}</div><div class="party" style="text-align:right"><div class="tiny">Invoice Date</div><h2>${esc(fmtDate(inv.issueDate))}</h2>${inv.dueDate?`<div class="tiny" style="margin-top:10px">Due Date</div><div style="font-weight:700">${esc(fmtDate(inv.dueDate))}</div>`:""}</div></div>
-<div class="meta"><div><p class="tiny">Production</p><p>${esc(inv.productionName || "Not set")}</p></div><div><p class="tiny">Timesheet</p><p>${esc(inv.timesheetNumber || "Not set")}</p></div><div><p class="tiny">Timesheet Dates</p><p>${esc(inv.timesheetDates || "Not set")}</p></div><div><p class="tiny">Detail Mode</p><p>${esc(inv.detailMode || "summary")}</p></div></div>
+<div class="meta"><div><p class="tiny">Production</p><p>${esc(inv.productionName || "Not set")}</p></div><div><p class="tiny">PO Number</p><p>${esc(inv.poNumber || "Not set")}</p></div><div><p class="tiny">Timesheet</p><p>${esc(inv.timesheetNumber || "Not set")}</p></div><div><p class="tiny">Detail</p><p>${esc(invoiceDetailModeLabel(inv.detailMode))}</p></div><div><p class="tiny">Status</p><p>${esc(INVOICE_STATUS[normalizeInvoiceStatus(inv.status)].label)}</p></div></div>
 <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">VAT</th><th class="num">Amount</th></tr></thead><tbody>${lineRows}</tbody></table>
-<div class="totals"><div><div class="row"><span>Subtotal</span><span>${m(inv.subtotal)}</span></div>${inv.vat>0?`<div class="row"><span>VAT (${inv.vat}%)</span><span>${m(inv.vatAmount)}</span></div>`:""}<div class="row due"><span>Total Due</span><span>${m(inv.total)}</span></div></div></div>
+<div class="totals"><div><div class="row"><span>${profile.vatRegistered ? "Subtotal excl. VAT" : "Subtotal"}</span><span>${m(inv.subtotal)}</span></div>${inv.vat>0?`<div class="row"><span>VAT (${inv.vat}%)</span><span>${m(inv.vatAmount)}</span></div>`:""}<div class="row due"><span>${profile.vatRegistered ? "Total incl. VAT" : "Total Due"}</span><span>${m(inv.total)}</span></div>${paidAmount>0?`<div class="row"><span>Paid</span><span>${m(paidAmount)}</span></div><div class="row strong"><span>Balance Due</span><span>${m(balanceDue)}</span></div>`:""}</div></div>
+${attachedRows?`<div class="section"><div class="tiny">Attached Timesheet Breakdown</div><table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit</th><th></th><th class="num">Amount</th></tr></thead><tbody>${attachedRows}</tbody></table></div>`:""}
 ${bankRows.length?`<div class="section"><div class="tiny">Banking Details</div><div class="bank">${bankRows.map(([k,v])=>`<div><p class="tiny">${esc(k)}</p><p>${esc(v)}</p></div>`).join("")}</div></div>`:""}
 ${paymentTerms?`<div class="section"><div class="tiny">Payment Terms</div><div class="notes">${block(paymentTerms)}</div></div>`:""}
 ${inv.notes?`<div class="section"><div class="tiny">Notes</div><div class="notes">${block(inv.notes)}</div></div>`:""}
@@ -1490,17 +1632,17 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
-        <div className="flex items-center gap-2">
-          <button onClick={onBack} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400"><ChevronLeft size={20}/></button>
+      <div className="space-y-3">
+        <Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>
+        <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-xl font-bold text-gray-900">{timesheet.productionName || "Untitled"}</h1>
             <p className="text-sm text-gray-400 mt-0.5">{timesheet.timesheetNumber} · Bill to {timesheet.clientName || "Unknown / add later"} · {(timesheet.entries||[]).length} day{(timesheet.entries||[]).length !== 1 ? "s" : ""} · {fmtMoney(sum.grandTotal, cur)}</p>
           </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <Badge color={statusColor}>{statusLabel}</Badge>
-          {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
+          <div className="flex items-center gap-2">
+            <Badge color={statusColor}>{statusLabel}</Badge>
+            {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
+          </div>
         </div>
       </div>
       <div className="flex border-b border-gray-200">
@@ -1577,7 +1719,7 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
       vat: profile.defaultVat,
       status: "open",
       entries: [],
-      paymentTerms: chosenClient?.defaultPaymentTerms || profile.paymentTerms,
+      paymentTerms: chosenClient?.paymentTerms || chosenClient?.defaultPaymentTerms || profile.paymentTerms,
       defaultDayRate: profile.defaultDayRate,
       defaultIncludedHours: profile.defaultIncludedHours,
       defaultEquipmentRental: profile.defaultEquipmentRental,
@@ -1691,7 +1833,7 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Clock size={24} className="text-gray-300"/></div>
             <h3 className="text-base font-semibold text-gray-900 mb-1">No timesheets yet</h3>
-            <p className="text-sm text-gray-400 mb-5 max-w-xs mx-auto">{profile.defaultDayRate > 0 ? `Your rate of ${fmtMoney(profile.defaultDayRate, cur)}/day is ready. Create your first timesheet.` : "Set your rates in Settings, then create a timesheet to start logging shoot days."}</p>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">{profile.defaultDayRate > 0 ? `Your ${fmtMoney(profile.defaultDayRate, cur)} day rate is ready. Start with the production name and bill-to client, then add shoot days as you go.` : "Set your rates in Settings, then create a timesheet for the production you are working on."}</p>
             <Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>
           </div>
         ) : (
@@ -1735,25 +1877,130 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 // INVOICES PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Profile }) {
+function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: Invoice[]; profile: Profile; onSave: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void }) {
   const [sel, setSel] = useState<string | null>(null);
-  const inv = sel ? (invoices||[]).find(i => i.id === sel) || null : null;
+  const sortedInvoices = [...(invoices||[])].sort((a,b)=>new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime());
+  const inv = sel ? sortedInvoices.find(i => i.id === sel) || null : null;
+  const updateInvoice = (next: Invoice) => onSave((invoices || []).map(i => i.id === next.id ? next : i));
+  const summaryCurrency = profile.defaultCurrency || sortedInvoices[0]?.currency || "ZAR";
+  const currentMonth = todayStr().slice(0, 7);
+  const receivableStatuses = ["sent", "partial", "overdue"];
+  const paidForInvoice = (i: Invoice) => safe(i.paidAmount, normalizeInvoiceStatus(i.status) === "paid" ? i.total : 0);
+  const outstandingTotal = sortedInvoices
+    .filter(i => receivableStatuses.includes(normalizeInvoiceStatus(i.status)))
+    .reduce((sum, i) => sum + invoiceBalance(i), 0);
+  const paidThisMonth = sortedInvoices
+    .filter(i => (i.paidDate || (normalizeInvoiceStatus(i.status) === "paid" ? i.issueDate : "") || "").slice(0, 7) === currentMonth && paidForInvoice(i) > 0)
+    .reduce((sum, i) => sum + paidForInvoice(i), 0);
+  const overdueInvoices = sortedInvoices.filter(i => {
+    const status = normalizeInvoiceStatus(i.status);
+    return status === "overdue" || (!!i.dueDate && i.dueDate < todayStr() && ["sent", "partial"].includes(status));
+  });
+  const overdueTotal = overdueInvoices.reduce((sum, i) => sum + invoiceBalance(i), 0);
+  const draftCount = sortedInvoices.filter(i => normalizeInvoiceStatus(i.status) === "draft").length;
 
   if (inv) {
     const c = invoiceClient(inv);
     const bd = inv.banking || {};
     const bankRows = ([["Account Holder",bd.accountName],["Bank",bd.bankName],["Account No.",bd.accountNumber],["Branch",bd.branchCode],bd.swift&&["SWIFT",bd.swift],bd.iban&&["IBAN",bd.iban],bd.reference&&["Reference",bd.reference]] as [string,string][]).filter(r=>r&&r[1]);
+    const paidAmount = safe(inv.paidAmount, 0);
+    const balanceDue = invoiceBalance(inv);
+    const statusMeta = INVOICE_STATUS[normalizeInvoiceStatus(inv.status)];
+
+    const savePatch = (patch: Partial<Invoice>) => {
+      const next = normalizeInvoice({ ...inv, ...patch });
+      updateInvoice(next);
+    };
+
+    const editInvoiceNumber = () => {
+      const nextNumber = prompt("Invoice number", inv.invoiceNumber || "");
+      if (nextNumber === null || nextNumber === inv.invoiceNumber) return;
+      if ((inv.status === "sent" || inv.status === "paid") && !confirm("This invoice is already Sent or Paid. Change the invoice number anyway?")) return;
+      if (invoices.some(i => i.id !== inv.id && i.invoiceNumber === nextNumber) && !confirm(`Invoice number ${nextNumber} already exists. Use it anyway?`)) return;
+      savePatch({ invoiceNumber: nextNumber });
+      onShowToast("Invoice number updated");
+    };
+
+    const exportInvoice = () => {
+      if (c?.poRequired && !inv.poNumber) {
+        alert("This client requires a PO number before exporting this invoice.");
+        return;
+      }
+      printInvoice(inv, profile);
+    };
+
+    const changeStatus = (status: InvoiceStatus) => {
+      if (status === "paid") {
+        savePatch({ status, paidAmount: inv.total, paidDate: inv.paidDate || todayStr(), balanceDue: 0 });
+        onShowToast("Invoice marked paid");
+        return;
+      }
+      savePatch({ status });
+    };
+
+    const markPaid = () => changeStatus("paid");
+
     return (
       <div className="space-y-5">
-        <div className="flex items-center gap-2">
-          <button onClick={() => setSel(null)} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400"><ChevronLeft size={20}/></button>
-          <div><h1 className="text-xl font-bold text-gray-900">{inv.invoiceNumber}</h1><p className="text-sm text-gray-400 mt-0.5">For {inv.clientName||"—"}</p></div>
-          <div className="ml-auto"><Btn variant="secondary" onClick={() => printInvoice(inv, profile)}><FileText size={14}/> Export PDF</Btn></div>
+        <div className="space-y-3">
+          <Btn variant="secondary" size="sm" onClick={() => setSel(null)}>{"\u2190"} Back to Invoices</Btn>
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="text-xl font-bold text-gray-900">{inv.invoiceNumber || "Invoice not numbered"}</h1>
+                <Badge color={statusMeta.color}>{statusMeta.label}</Badge>
+              </div>
+              <p className="text-sm text-gray-500 mt-1">{inv.clientName || "No client set"}</p>
+              {inv.productionName && <p className="text-sm text-gray-400 mt-0.5">Production: {inv.productionName}</p>}
+              <div className="flex flex-wrap gap-x-6 gap-y-1 mt-3 text-sm">
+                <span className="text-gray-500">Total <strong className="text-gray-900 tabular-nums">{fmtMoney(inv.total, inv.currency)}</strong></span>
+                <span className="text-gray-500">Balance due <strong className={`tabular-nums ${balanceDue > 0 ? "text-red-700" : "text-green-700"}`}>{fmtMoney(balanceDue, inv.currency)}</strong></span>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2 lg:justify-end">
+              <Btn variant="secondary" onClick={() => document.getElementById("invoice-edit-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}><Pencil size={14}/> Edit</Btn>
+              <Btn variant="secondary" onClick={exportInvoice}><FileText size={14}/> Download PDF</Btn>
+              <Btn variant="success" onClick={markPaid} disabled={normalizeInvoiceStatus(inv.status) === "paid"}><CheckCircle size={14}/> Mark Paid</Btn>
+            </div>
+          </div>
         </div>
+
+        <div id="invoice-edit-panel">
+        <Card className="p-5 max-w-3xl">
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div>
+              <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Invoice #</p>
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-semibold">{inv.invoiceNumber || "Not set"}</p>
+                <button onClick={editInvoiceNumber} className="p-1 text-gray-300 hover:text-blue-600 rounded"><Pencil size={13}/></button>
+              </div>
+            </div>
+            <SInp label="Status" value={inv.status} onChange={e => changeStatus(e.target.value as InvoiceStatus)}>
+              {(Object.entries(INVOICE_STATUS) as [InvoiceStatus, { label: string; color: string }][]).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+            </SInp>
+            <Inp label="PO Number" value={inv.poNumber || ""} onChange={e => savePatch({ poNumber: e.target.value })} />
+            <Inp label="Due Date" type="date" value={inv.dueDate || ""} onChange={e => savePatch({ dueDate: e.target.value })} />
+            <Inp label="Paid Amount" type="number" min="0" value={String(inv.paidAmount || "")} onChange={e => savePatch({ paidAmount: safe(e.target.value, 0) })} />
+            <Inp label="Paid Date" type="date" value={inv.paidDate || ""} onChange={e => savePatch({ paidDate: e.target.value })} />
+            <div>
+              <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Balance Due</p>
+              <p className="text-sm font-semibold">{fmtMoney(balanceDue, inv.currency)}</p>
+            </div>
+            <div>
+              <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Current Status</p>
+              <Badge color={statusMeta.color}>{statusMeta.label}</Badge>
+            </div>
+          </div>
+          <div className="mt-4">
+            <TxInp label="Payment Terms" rows={2} value={inv.paymentTerms || inv.paymentNotes || ""} onChange={e => savePatch({ paymentTerms: e.target.value, paymentNotes: e.target.value })} />
+          </div>
+        </Card>
+        </div>
+
         <Card className="p-8 max-w-3xl">
           <div className="flex justify-between items-start mb-8">
-            <div><h2 className="text-3xl font-bold tracking-tight">INVOICE</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p></div>
-            <div className="text-right"><p className="font-bold text-base">{inv.companyName||profile.companyName||profile.fullName}</p><p className="text-gray-500 text-sm">{inv.crewName || profile.fullName}</p><p className="text-gray-500 text-sm">{inv.role || profile.role}</p>{profile.email&&<p className="text-gray-500 text-sm">{profile.email}</p>}</div>
+            <div><h2 className="text-3xl font-bold tracking-tight uppercase">{profile.invoiceLabel || "Invoice"}</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p>{inv.poNumber&&<p className="text-gray-400 text-xs mt-0.5">PO: {inv.poNumber}</p>}</div>
+            <div className="text-right"><p className="font-bold text-base">{inv.companyName||profile.companyName||profile.fullName}</p><p className="text-gray-500 text-sm">{inv.crewName || profile.fullName}</p><p className="text-gray-500 text-sm">{inv.role || profile.role}</p>{profile.email&&<p className="text-gray-500 text-sm">{profile.email}</p>}{profile.vatRegistered&&profile.vatNumber&&<p className="text-gray-500 text-sm">VAT: {profile.vatNumber}</p>}</div>
           </div>
           <div className="grid grid-cols-2 gap-6 mb-8">
             <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Bill To</p><p className="font-medium">{inv.clientName||"—"}</p>{c?.contactPerson&&<p className="text-sm text-gray-500">{c.contactPerson}</p>}{c?.billingAddress&&<p className="text-sm text-gray-500 whitespace-pre-line">{c.billingAddress}</p>}{c?.vatNumber&&<p className="text-sm text-gray-500">VAT: {c.vatNumber}</p>}</div>
@@ -1777,11 +2024,14 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
           ))}
           <div className="flex justify-end mt-5">
             <div className="w-56 space-y-1.5">
-              <div className="flex justify-between text-sm text-gray-500">Subtotal<span className="tabular-nums font-medium text-gray-900">{fmtMoney(inv.subtotal,inv.currency)}</span></div>
+              <div className="flex justify-between text-sm text-gray-500">{profile.vatRegistered ? "Subtotal excl. VAT" : "Subtotal"}<span className="tabular-nums font-medium text-gray-900">{fmtMoney(inv.subtotal,inv.currency)}</span></div>
               {inv.vat>0&&<div className="flex justify-between text-sm text-gray-500">VAT ({inv.vat}%)<span className="tabular-nums font-medium text-gray-900">{fmtMoney(inv.vatAmount,inv.currency)}</span></div>}
-              <div className="flex justify-between font-bold text-gray-900 border-t-2 border-gray-900 pt-2.5 text-base">TOTAL DUE<span className="tabular-nums">{fmtMoney(inv.total,inv.currency)}</span></div>
+              <div className="flex justify-between font-bold text-gray-900 border-t-2 border-gray-900 pt-2.5 text-base">{profile.vatRegistered ? "TOTAL INCL. VAT" : "TOTAL DUE"}<span className="tabular-nums">{fmtMoney(inv.total,inv.currency)}</span></div>
+              {paidAmount > 0&&<div className="flex justify-between text-sm text-gray-500">Paid<span className="tabular-nums font-medium text-gray-900">{fmtMoney(paidAmount,inv.currency)}</span></div>}
+              {paidAmount > 0&&<div className="flex justify-between text-sm font-semibold text-gray-900">Balance Due<span className="tabular-nums">{fmtMoney(balanceDue,inv.currency)}</span></div>}
             </div>
           </div>
+          {(inv.detailMode === "summary_timesheet" && (inv.timesheetBreakdown || []).length > 0)&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Attached Timesheet Breakdown</p>{(inv.timesheetBreakdown || []).map(item => <div key={item.id} className="grid grid-cols-12 gap-3 py-2 border-b border-gray-100"><div className="col-span-8 text-sm text-gray-700">{item.description}</div><div className="col-span-2 text-sm text-right text-gray-400">{item.quantity > 1 ? item.quantity : ""}</div><div className="col-span-2 text-sm text-right font-medium">{fmtMoney(item.amount, inv.currency)}</div></div>)}</div>}
           {bankRows.length>0&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Banking Details</p><div className="grid grid-cols-2 gap-3">{bankRows.map(([k,v])=><div key={k}><p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">{k}</p><p className="text-sm font-medium mt-0.5">{v}</p></div>)}</div></div>}
           {(inv.paymentTerms || inv.paymentNotes)&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Payment Terms</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.paymentTerms || inv.paymentNotes}</p></div>}
           {inv.notes&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Notes</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.notes}</p></div>}
@@ -1790,17 +2040,44 @@ function InvoicesPage({ invoices, profile }: { invoices: Invoice[]; profile: Pro
     );
   }
 
-  const STATUS: Record<string,{label:string;color:string}> = { unpaid:{label:"Unpaid",color:"amber"}, paid:{label:"Paid",color:"green"}, draft:{label:"Draft",color:"gray"} };
   return (
     <div className="space-y-5">
       <div><h1 className="text-xl font-bold text-gray-900">Invoices</h1><p className="text-sm text-gray-500 mt-0.5">{(invoices||[]).length} invoice{(invoices||[]).length !== 1 ? "s" : ""}</p></div>
+      {sortedInvoices.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Outstanding</p>
+            <p className="text-xl font-bold text-gray-900 mt-2 tabular-nums">{fmtMoney(outstandingTotal, summaryCurrency)}</p>
+            <p className="text-xs text-gray-400 mt-1">Unpaid balances</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Paid This Month</p>
+            <p className="text-xl font-bold text-green-700 mt-2 tabular-nums">{fmtMoney(paidThisMonth, summaryCurrency)}</p>
+            <p className="text-xs text-gray-400 mt-1">Invoices marked paid</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Overdue</p>
+            <p className="text-xl font-bold text-red-700 mt-2 tabular-nums">{fmtMoney(overdueTotal, summaryCurrency)}</p>
+            <p className="text-xs text-gray-400 mt-1">{overdueInvoices.length} invoice{overdueInvoices.length !== 1 ? "s" : ""}</p>
+          </Card>
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Drafts</p>
+            <p className="text-xl font-bold text-gray-900 mt-2 tabular-nums">{draftCount}</p>
+            <p className="text-xs text-gray-400 mt-1">Waiting to send</p>
+          </Card>
+        </div>
+      )}
       <Card>
         {(invoices||[]).length === 0 ? (
-          <div className="py-16 text-center"><div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Receipt size={24} className="text-gray-300"/></div><h3 className="text-base font-semibold text-gray-900 mb-1">No invoices yet</h3><p className="text-sm text-gray-400 max-w-xs mx-auto">Complete a timesheet and tap <strong>Create Invoice</strong> in the Summary tab.</p></div>
+          <div className="py-16 text-center">
+            <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Receipt size={24} className="text-gray-300"/></div>
+            <h3 className="text-base font-semibold text-gray-900 mb-1">No invoices yet</h3>
+            <p className="text-sm text-gray-400 max-w-sm mx-auto">Create invoices from completed timesheets. The review screen will pull in the client, production, PO, VAT, banking, and line-item totals before you download the PDF.</p>
+          </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full"><thead><tr className="border-b border-gray-200">{["Invoice","Client","Date","Status","Total"].map((h,i)=><th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i>=4?"text-right":"text-left"}`}>{h}</th>)}</tr></thead>
-            <tbody className="divide-y divide-gray-50">{[...(invoices||[])].sort((a,b)=>new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime()).map(i=>{const st=STATUS[i.status]||STATUS.draft;return(<tr key={i.id} className="hover:bg-gray-50 cursor-pointer transition-colors" onClick={()=>setSel(i.id)}><td className="px-4 py-3.5 text-sm font-semibold text-blue-600">{i.invoiceNumber}</td><td className="px-4 py-3.5 text-sm font-medium">{i.clientName||"—"}</td><td className="px-4 py-3.5 text-sm text-gray-400">{fmtDate(i.issueDate)}</td><td className="px-4 py-3.5"><Badge color={st.color}>{st.label}</Badge></td><td className="px-4 py-3.5 text-sm font-semibold text-right tabular-nums">{fmtMoney(i.total,i.currency)}</td></tr>);})}</tbody></table>
+            <table className="w-full"><thead><tr className="border-b border-gray-200">{["Invoice","Client / Production","PO","Due Date","Status","Total","Balance"].map((h,i)=><th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i>=5?"text-right":"text-left"}`}>{h}</th>)}</tr></thead>
+            <tbody className="divide-y divide-gray-50">{sortedInvoices.map(i=>{const st=INVOICE_STATUS[normalizeInvoiceStatus(i.status)];const bal=invoiceBalance(i);return(<tr key={i.id} role="button" tabIndex={0} className="hover:bg-gray-50 cursor-pointer transition-colors focus:outline-none focus:bg-blue-50" onClick={()=>setSel(i.id)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSel(i.id); } }}><td className="px-4 py-3.5"><p className="text-sm font-semibold text-blue-600">{i.invoiceNumber || "Not set"}</p><p className="text-xs text-gray-400 mt-0.5">{fmtDate(i.issueDate)}</p></td><td className="px-4 py-3.5"><p className="text-sm font-medium text-gray-900">{i.clientName||"—"}</p><p className="text-xs text-gray-400 mt-0.5">{i.productionName || "No production set"}</p></td><td className="px-4 py-3.5 text-sm text-gray-400">{i.poNumber || "—"}</td><td className="px-4 py-3.5 text-sm text-gray-500">{i.dueDate ? fmtDate(i.dueDate) : "Not set"}</td><td className="px-4 py-3.5"><Badge color={st.color}>{st.label}</Badge></td><td className="px-4 py-3.5 text-sm font-semibold text-gray-900 text-right tabular-nums">{fmtMoney(i.total,i.currency)}</td><td className="px-4 py-3.5 text-sm font-semibold text-right tabular-nums">{fmtMoney(bal,i.currency)}</td></tr>);})}</tbody></table>
           </div>
         )}
       </Card>
@@ -1877,7 +2154,8 @@ export default function App() {
   const saveProfile    = (p: Profile)     => { setProfile(p);    Store.set("cqp-profile",    p); };
   const saveClients    = (c: Client[])    => { setClients(c);    Store.set("cqp-clients",    c); };
   const saveTimesheets = (t: Timesheet[]) => { setTimesheets(t); Store.set("cqp-timesheets", t); };
-  const addInvoice     = (inv: Invoice)   => { const next = [...invoices, inv]; setInvoices(next); Store.set("cqp-invoices", next); };
+  const saveInvoices   = (i: Invoice[])   => { setInvoices(i);   Store.set("cqp-invoices",   i); };
+  const addInvoice     = (inv: Invoice)   => { const next = [...invoices, normalizeInvoice(inv)]; saveInvoices(next); };
 
   if (!ready) return (
     <div className="h-screen flex items-center justify-center bg-slate-900">
@@ -1893,7 +2171,7 @@ export default function App() {
       <ToastContainer toasts={toasts} />
       {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onShowToast={showToast} />}
       {page === "clients"    && <ClientsPage    clients={clients}         onSave={saveClients} onShowToast={showToast} />}
-      {page === "invoices"   && <InvoicesPage   invoices={invoices}     profile={profile} />}
+      {page === "invoices"   && <InvoicesPage   invoices={invoices}     profile={profile} onSave={saveInvoices} onShowToast={showToast} />}
       {page === "settings"   && <SettingsPage   profile={profile}       onSave={saveProfile} />}
     </Layout>
   );

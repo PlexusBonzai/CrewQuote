@@ -17,6 +17,42 @@ type InvoiceStatus = "draft" | "sent" | "paid" | "partial" | "overdue" | "cancel
 
 interface ToastMsg { id: string; msg: string; type: ToastType; }
 
+interface RateDraft {
+  dayRate: number;
+  includedHours: number;
+  overtimeRule: OTRuleId;
+  otBand1Hours: number;
+  otBand1Mult: number;
+  otBand2Mult: number;
+  equipmentRental: number;
+  perDiem: number;
+  vat: number;
+  minTurnaround: number;
+  turnaroundMode: TurnaroundMode;
+  turnaroundPenMult: number;
+  travelPaid: boolean;
+  mealDeducted: boolean;
+}
+
+interface RateMemory {
+  productionName: string;
+  dayRate: number;
+  includedHours: number;
+  overtimeRule: OTRuleId;
+  otBand1Hours: number;
+  otBand1Mult: number;
+  otBand2Mult: number;
+  equipmentRental: number;
+  perDiem: number;
+  vat: number;
+  minTurnaround: number;
+  turnaroundMode: TurnaroundMode;
+  turnaroundPenMult: number;
+  travelPaid: boolean;
+  mealDeducted: boolean;
+  updatedAt: string;
+}
+
 interface Client {
   id: string;
   companyName: string;
@@ -31,6 +67,7 @@ interface Client {
   paymentTerms: string;
   preferredInvoiceDetailMode: InvoiceDetailMode;
   defaultPaymentTerms: string;
+  rateMemory?: RateMemory;
   notes: string;
 }
 
@@ -57,6 +94,27 @@ interface TimesheetEntry {
   equipmentRental: number;
   perDiem: number;
   expenses: number;
+  dayRateUsed?: number;
+  includedHoursUsed?: number;
+  overtimeRuleUsed?: OTRuleId;
+  otBand1HoursUsed?: number;
+  otBand1MultUsed?: number;
+  otBand2MultUsed?: number;
+  equipmentRentalUsed?: number;
+  perDiemUsed?: number;
+  vatRateUsed?: number;
+  travelPaidUsed?: boolean;
+  mealDeductedUsed?: boolean;
+  turnaroundRuleUsed?: TurnaroundMode;
+  turnaroundMinimumHoursUsed?: number;
+  turnaroundPenaltyMultUsed?: number;
+  calcOnSetHours?: number;
+  calcMealHours?: number;
+  calcTravelHours?: number;
+  calcPaidHours?: number;
+  calcOvertimeHours?: number;
+  calcOvertimeCost?: number;
+  calcDayTotal?: number;
   isSunday: boolean;
   isPublicHoliday: boolean;
 }
@@ -230,6 +288,7 @@ const toMins     = (t: string) => { if (!t) return 0; const [h = 0, m = 0] = (t 
 const durH       = (s: string, e: string) => { let sm = toMins(s), em = toMins(e); if (em <= sm) em += 1440; return Math.max((em - sm) / 60, 0); };
 const hoursToHM  = (h: number) => { const n = Math.abs(h ?? 0); const hrs = Math.floor(n); const m = Math.round((n - hrs) * 60); return m > 0 ? `${hrs}h ${m}m` : `${hrs}h`; };
 const safe       = (v: unknown, def = 0) => parseFloat(String(v ?? def)) || def;
+const num        = (v: unknown, def = 0) => { const n = parseFloat(String(v ?? "")); return Number.isFinite(n) ? n : def; };
 const uid        = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const todayStr   = () => new Date().toISOString().split("T")[0];
 const nextDayStr = (d: string) => { try { const dt = new Date(d + "T12:00:00"); dt.setDate(dt.getDate() + 1); return dt.toISOString().split("T")[0]; } catch { return todayStr(); } };
@@ -239,11 +298,56 @@ const fmtMoney   = (n: unknown, cur = "ZAR") => {
   const locale = { ZAR: "en-ZA", USD: "en-US", GBP: "en-GB", EUR: "de-DE" }[cur] || "en-ZA";
   return `${sym} ${new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(parseFloat(String(n ?? 0)) || 0)}`;
 };
-const calcTurnaround = (prevWrap: string, nextCall: string) => {
+const parseDateOnly = (d?: string) => {
+  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  const dt = new Date(`${d}T00:00:00`);
+  return Number.isNaN(dt.getTime()) ? null : dt;
+};
+const parseTimeParts = (t?: string) => {
+  if (!t) return null;
+  const [hRaw, mRaw = "0"] = t.split(":");
+  const h = Number(hRaw), m = Number(mRaw);
+  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return { h, m };
+};
+const entryCallDateTime = (e: Partial<TimesheetEntry>) => {
+  const d = parseDateOnly(e.date);
+  const t = parseTimeParts(e.callTime);
+  if (!d || !t) return null;
+  d.setHours(t.h, t.m, 0, 0);
+  return d;
+};
+const entryWrapDateTime = (e: Partial<TimesheetEntry>) => {
+  const call = entryCallDateTime(e);
+  const t = parseTimeParts(e.wrapTime);
+  if (!call || !t) return null;
+  const wrap = new Date(call);
+  wrap.setHours(t.h, t.m, 0, 0);
+  if (wrap.getTime() <= call.getTime()) wrap.setDate(wrap.getDate() + 1);
+  return wrap;
+};
+const sortEntriesForTurnaround = <T extends Partial<TimesheetEntry>>(entries: T[]) =>
+  [...entries].map((entry, index) => ({ entry, index, start: entryCallDateTime(entry)?.getTime() }))
+    .sort((a, b) => (a.start ?? Number.POSITIVE_INFINITY) - (b.start ?? Number.POSITIVE_INFINITY) || a.index - b.index)
+    .map(({ entry }) => entry);
+const latestEntryForDefaults = (entries: TimesheetEntry[]) => {
+  const sorted = sortEntriesForTurnaround(entries);
+  return [...sorted].reverse().find(e => entryCallDateTime(e)) || entries[entries.length - 1];
+};
+const findPreviousEntryForTurnaround = (entries: TimesheetEntry[], next: Partial<TimesheetEntry>) => {
+  const nextCall = entryCallDateTime(next);
+  if (!nextCall) return null;
+  const nextMs = nextCall.getTime();
+  return [...sortEntriesForTurnaround(entries)].reverse().find(e => {
+    const start = entryCallDateTime(e)?.getTime();
+    return start !== undefined && start < nextMs;
+  }) || null;
+};
+const calcTurnaround = (prev: Partial<TimesheetEntry>, next: Partial<TimesheetEntry>) => {
+  const prevWrap = entryWrapDateTime(prev);
+  const nextCall = entryCallDateTime(next);
   if (!prevWrap || !nextCall) return null;
-  let w = toMins(prevWrap), n = toMins(nextCall);
-  if (n <= w) n += 1440;
-  return (n - w) / 60;
+  return Math.max((nextCall.getTime() - prevWrap.getTime()) / 3600000, 0);
 };
 
 const blankClient = (overrides: Partial<Client> = {}): Client => ({
@@ -260,6 +364,7 @@ const blankClient = (overrides: Partial<Client> = {}): Client => ({
   paymentTerms: "",
   preferredInvoiceDetailMode: "summary",
   defaultPaymentTerms: "",
+  rateMemory: undefined,
   notes: "",
   ...overrides,
 });
@@ -289,18 +394,18 @@ function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile
   return {
     ...profile,
     defaultCurrency:          ts.currency || profile.defaultCurrency,
-    defaultDayRate:           safe(ts.defaultDayRate, profile.defaultDayRate),
-    defaultIncludedHours:     safe(ts.defaultIncludedHours, profile.defaultIncludedHours),
-    defaultEquipmentRental:   safe(ts.defaultEquipmentRental, profile.defaultEquipmentRental),
-    defaultPerDiem:           safe(ts.defaultPerDiem, profile.defaultPerDiem),
-    defaultVat:               safe(ts.vat, profile.defaultVat),
+    defaultDayRate:           num(ts.defaultDayRate, profile.defaultDayRate),
+    defaultIncludedHours:     num(ts.defaultIncludedHours, profile.defaultIncludedHours),
+    defaultEquipmentRental:   num(ts.defaultEquipmentRental, profile.defaultEquipmentRental),
+    defaultPerDiem:           num(ts.defaultPerDiem, profile.defaultPerDiem),
+    defaultVat:               num(ts.vat, profile.defaultVat),
     defaultOvertimeRule:      (ts.defaultOvertimeRule || profile.defaultOvertimeRule) as OTRuleId,
-    defaultOtBand1Hours:      safe(ts.defaultOtBand1Hours, profile.defaultOtBand1Hours),
-    defaultOtBand1Mult:       safe(ts.defaultOtBand1Mult, profile.defaultOtBand1Mult),
-    defaultOtBand2Mult:       safe(ts.defaultOtBand2Mult, profile.defaultOtBand2Mult),
-    defaultMinTurnaround:     safe(ts.defaultMinTurnaround, profile.defaultMinTurnaround),
+    defaultOtBand1Hours:      num(ts.defaultOtBand1Hours, profile.defaultOtBand1Hours),
+    defaultOtBand1Mult:       num(ts.defaultOtBand1Mult, profile.defaultOtBand1Mult),
+    defaultOtBand2Mult:       num(ts.defaultOtBand2Mult, profile.defaultOtBand2Mult),
+    defaultMinTurnaround:     num(ts.defaultMinTurnaround, profile.defaultMinTurnaround),
     defaultTurnaroundMode:    (ts.defaultTurnaroundMode || profile.defaultTurnaroundMode) as TurnaroundMode,
-    defaultTurnaroundPenMult: safe(ts.defaultTurnaroundPenMult, profile.defaultTurnaroundPenMult),
+    defaultTurnaroundPenMult: num(ts.defaultTurnaroundPenMult, profile.defaultTurnaroundPenMult),
     mealBreaksDeducted:       ts.mealBreaksDeducted ?? profile.mealBreaksDeducted,
     travelTimePaid:           ts.travelTimePaid ?? profile.travelTimePaid,
     equipmentRentalDaily:     ts.equipmentRentalDaily ?? profile.equipmentRentalDaily,
@@ -316,7 +421,7 @@ function timesheetDateRange(ts: Timesheet): string {
 }
 
 function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
-  return {
+  const ts: Timesheet = {
     id: t.id || uid(),
     timesheetNumber: t.timesheetNumber || "T-Not set",
     productionName: t.productionName || "",
@@ -330,7 +435,7 @@ function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
     currency: t.currency || "ZAR",
     vat: safe(t.vat, 0),
     status: t.status || "open",
-    entries: Array.isArray(t.entries) ? t.entries : [],
+    entries: [],
     paymentTerms: t.paymentTerms || "",
     defaultDayRate: t.defaultDayRate,
     defaultIncludedHours: t.defaultIncludedHours,
@@ -349,6 +454,8 @@ function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
     invoiceId: t.invoiceId,
     createdAt: t.createdAt || new Date().toISOString(),
   };
+  ts.entries = Array.isArray(t.entries) ? t.entries.map(e => normalizeEntry(e, ts)) : [];
+  return ts;
 }
 
 function normalizeInvoice(i: Partial<Invoice>): Invoice {
@@ -391,6 +498,78 @@ function normalizeInvoice(i: Partial<Invoice>): Invoice {
   };
 }
 
+function normalizeEntry(e: Partial<TimesheetEntry>, ts?: Partial<Timesheet>): TimesheetEntry {
+  const p = profileForTimesheet(DEFAULT_PROFILE, ts);
+  const base: TimesheetEntry = {
+    id: e.id || uid(),
+    date: e.date || ts?.startDate || todayStr(),
+    productionName: e.productionName || ts?.productionName || "",
+    location: e.location || "",
+    notes: e.notes || "",
+    callTime: e.callTime || "08:00",
+    wrapTime: e.wrapTime || "18:00",
+    mealBreakMinutes: num(e.mealBreakMinutes, 60),
+    mealDeducted: e.mealDeductedUsed ?? e.mealDeducted ?? p.mealBreaksDeducted,
+    travelStartTime: e.travelStartTime || "",
+    travelEndTime: e.travelEndTime || "",
+    travelDistance: e.travelDistance || "",
+    travelPaid: e.travelPaidUsed ?? e.travelPaid ?? p.travelTimePaid,
+    dayRate: num(e.dayRateUsed ?? e.dayRate, p.defaultDayRate),
+    includedHours: num(e.includedHoursUsed ?? e.includedHours, p.defaultIncludedHours),
+    overtimeRule: (e.overtimeRuleUsed || e.overtimeRule || p.defaultOvertimeRule) as OTRuleId,
+    otBand1Hours: num(e.otBand1HoursUsed ?? e.otBand1Hours, p.defaultOtBand1Hours),
+    otBand1Mult: num(e.otBand1MultUsed ?? e.otBand1Mult, p.defaultOtBand1Mult),
+    otBand2Mult: num(e.otBand2MultUsed ?? e.otBand2Mult, p.defaultOtBand2Mult),
+    equipmentRental: num(e.equipmentRentalUsed ?? e.equipmentRental, p.equipmentRentalDaily ? p.defaultEquipmentRental : 0),
+    perDiem: num(e.perDiemUsed ?? e.perDiem, p.defaultPerDiem),
+    expenses: num(e.expenses, 0),
+    isSunday: e.isSunday ?? false,
+    isPublicHoliday: e.isPublicHoliday ?? false,
+  };
+  return withEntrySnapshots({ ...base, ...e }, p);
+}
+
+function withEntrySnapshots(entry: TimesheetEntry, profile: Profile): TimesheetEntry {
+  const normalized: TimesheetEntry = {
+    ...entry,
+    mealDeducted: entry.mealDeductedUsed ?? entry.mealDeducted ?? profile.mealBreaksDeducted,
+    travelPaid: entry.travelPaidUsed ?? entry.travelPaid ?? profile.travelTimePaid,
+    dayRate: num(entry.dayRateUsed ?? entry.dayRate, profile.defaultDayRate),
+    includedHours: num(entry.includedHoursUsed ?? entry.includedHours, profile.defaultIncludedHours),
+    overtimeRule: (entry.overtimeRuleUsed || entry.overtimeRule || profile.defaultOvertimeRule) as OTRuleId,
+    otBand1Hours: num(entry.otBand1HoursUsed ?? entry.otBand1Hours, profile.defaultOtBand1Hours),
+    otBand1Mult: num(entry.otBand1MultUsed ?? entry.otBand1Mult, profile.defaultOtBand1Mult),
+    otBand2Mult: num(entry.otBand2MultUsed ?? entry.otBand2Mult, profile.defaultOtBand2Mult),
+    equipmentRental: num(entry.equipmentRentalUsed ?? entry.equipmentRental, profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0),
+    perDiem: num(entry.perDiemUsed ?? entry.perDiem, profile.defaultPerDiem),
+  };
+  const c = calcDay(normalized, profile);
+  return {
+    ...normalized,
+    dayRateUsed: c.dayRate,
+    includedHoursUsed: c.incH,
+    overtimeRuleUsed: c.ruleId,
+    otBand1HoursUsed: c.bands.band1Hours,
+    otBand1MultUsed: c.bands.band1Mult,
+    otBand2MultUsed: c.bands.band2Mult,
+    equipmentRentalUsed: c.equip,
+    perDiemUsed: c.perDiem,
+    vatRateUsed: num(entry.vatRateUsed, profile.defaultVat),
+    travelPaidUsed: normalized.travelPaid,
+    mealDeductedUsed: normalized.mealDeducted,
+    turnaroundRuleUsed: entry.turnaroundRuleUsed || profile.defaultTurnaroundMode,
+    turnaroundMinimumHoursUsed: num(entry.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround),
+    turnaroundPenaltyMultUsed: num(entry.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult),
+    calcOnSetHours: c.onSetH,
+    calcMealHours: c.mealH,
+    calcTravelHours: c.travH,
+    calcPaidHours: c.paidH,
+    calcOvertimeHours: c.totalOtH,
+    calcOvertimeCost: c.totalOtCost,
+    calcDayTotal: c.total,
+  };
+}
+
 /** Core per-day calculation — FULLY DEFENSIVE, never throws */
 function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
   try {
@@ -398,17 +577,17 @@ function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
     const wrap  = e.wrapTime    || "18:00";
     const onSetH    = durH(call, wrap);
     const overnight = toMins(wrap) <= toMins(call);
-    const mealDeducted = e.mealDeducted ?? profile.mealBreaksDeducted ?? true;
-    const travelPaid   = e.travelPaid   ?? profile.travelTimePaid     ?? true;
-    const mealH = mealDeducted ? Math.max(safe(e.mealBreakMinutes) / 60, 0) : 0;
+    const mealDeducted = e.mealDeductedUsed ?? e.mealDeducted ?? profile.mealBreaksDeducted ?? true;
+    const travelPaid   = e.travelPaidUsed   ?? e.travelPaid   ?? profile.travelTimePaid     ?? true;
+    const mealH = mealDeducted ? Math.max(num(e.mealBreakMinutes) / 60, 0) : 0;
     const workH = Math.max(onSetH - mealH, 0);
     const travH = travelPaid && e.travelStartTime && e.travelEndTime ? durH(e.travelStartTime, e.travelEndTime) : 0;
     const paidH = workH + travH;
-    const dayRate     = safe(e.dayRate,       profile.defaultDayRate       ?? 0);
-    const incH        = Math.max(safe(e.includedHours, profile.defaultIncludedHours ?? 10), 1);
+    const dayRate     = num(e.dayRateUsed ?? e.dayRate, profile.defaultDayRate ?? 0);
+    const incH        = Math.max(num(e.includedHoursUsed ?? e.includedHours, profile.defaultIncludedHours ?? 10), 1);
     const baseHourly  = dayRate / incH;
-    const ruleId      = (e.overtimeRule || profile.defaultOvertimeRule || "sa-film") as OTRuleId;
-    const ovEntry     = { defaultOtBand1Hours: safe(e.otBand1Hours, profile.defaultOtBand1Hours ?? 4), defaultOtBand1Mult: safe(e.otBand1Mult, profile.defaultOtBand1Mult ?? 1.5), defaultOtBand2Mult: safe(e.otBand2Mult, profile.defaultOtBand2Mult ?? 2.0) };
+    const ruleId      = (e.overtimeRuleUsed || e.overtimeRule || profile.defaultOvertimeRule || "sa-film") as OTRuleId;
+    const ovEntry     = { defaultOtBand1Hours: num(e.otBand1HoursUsed ?? e.otBand1Hours, profile.defaultOtBand1Hours ?? 4), defaultOtBand1Mult: num(e.otBand1MultUsed ?? e.otBand1Mult, profile.defaultOtBand1Mult ?? 1.5), defaultOtBand2Mult: num(e.otBand2MultUsed ?? e.otBand2Mult, profile.defaultOtBand2Mult ?? 2.0) };
     const bands       = getOTBands(ruleId, { ...profile, ...ovEntry } as Profile);
     const totalOtH    = Math.max(paidH - incH, 0);
     const b1H         = Math.min(totalOtH, bands.band1Hours);
@@ -416,9 +595,9 @@ function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
     const b1Cost      = b1H * baseHourly * bands.band1Mult;
     const b2Cost      = b2H * baseHourly * bands.band2Mult;
     const totalOtCost = b1Cost + b2Cost;
-    const equip    = safe(e.equipmentRental, profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0);
-    const perDiem  = safe(e.perDiem,  profile.defaultPerDiem  ?? 0);
-    const expenses = safe(e.expenses, 0);
+    const equip    = num(e.equipmentRentalUsed ?? e.equipmentRental, profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0);
+    const perDiem  = num(e.perDiemUsed ?? e.perDiem, profile.defaultPerDiem ?? 0);
+    const expenses = num(e.expenses, 0);
     const total    = dayRate + totalOtCost + equip + perDiem + expenses;
     return { onSetH, overnight, mealH, workH, travH, paidH, incH, baseHourly, totalOtH, b1H, b1Cost, b2H, b2Cost, totalOtCost, equip, perDiem, expenses, dayRate, total, ruleId, bands };
   } catch {
@@ -427,16 +606,20 @@ function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
 }
 
 function calcSummary(entries: TimesheetEntry[], profile: Profile) {
-  const minTR        = profile.defaultMinTurnaround || 10;
-  const calcs        = (entries || []).map((e, i) => {
+  const sortedEntries = sortEntriesForTurnaround(entries || []);
+  const calcs        = sortedEntries.map((e, i) => {
     const c = calcDay(e, profile);
-    const prev = i > 0 ? entries[i - 1] : undefined;
-    const turnaround = prev ? calcTurnaround(prev.wrapTime || "", e.callTime || "") : null;
+    const prev = i > 0 ? sortedEntries[i - 1] : undefined;
+    const turnaround = prev ? calcTurnaround(prev, e) : null;
+    const minTR = num(e.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
+    const trMode = (e.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
     const shortfall = turnaround !== null ? Math.max(minTR - turnaround, 0) : 0;
-    const turnaroundPenalty = profile.defaultTurnaroundMode === "penalty"
-      ? shortfall * (c.baseHourly || 0) * (profile.defaultTurnaroundPenMult || 1)
+    const turnaroundPenalty = trMode === "penalty"
+      ? shortfall * (c.baseHourly || 0) * num(e.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult || 1)
       : 0;
-    return { entry: e, c: { ...c, turnaround, turnaroundPenalty, totalWithPenalty: c.total + turnaroundPenalty } };
+    const vatRate = profile.vatRegistered ? num(e.vatRateUsed, profile.defaultVat) : 0;
+    const totalWithPenalty = c.total + turnaroundPenalty;
+    return { entry: e, c: { ...c, turnaround, turnaroundPenalty, totalWithPenalty, vatRate, vatAmount: totalWithPenalty * (vatRate / 100) } };
   });
   const totalDays    = calcs.length;
   const totalDayRates = calcs.reduce((s, { c }) => s + (c.dayRate    || 0), 0);
@@ -449,14 +632,119 @@ function calcSummary(entries: TimesheetEntry[], profile: Profile) {
   const totalPaidH   = calcs.reduce((s, { c }) => s + (c.paidH       || 0), 0);
   const totalTravH   = calcs.reduce((s, { c }) => s + (c.travH       || 0), 0);
   const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp + totalTurnaroundPenalty;
-  const vatPct       = profile.vatRegistered ? safe(profile.defaultVat) : 0;
-  const vatAmt       = subtotal * (vatPct / 100);
+  const vatRates     = [...new Set(calcs.map(({ c }) => c.vatRate || 0))];
+  const vatPct       = vatRates.length === 1 ? vatRates[0] : (profile.vatRegistered ? num(profile.defaultVat) : 0);
+  const mixedVat     = vatRates.length > 1;
+  const vatAmt       = calcs.reduce((s, { c }) => s + (c.vatAmount || 0), 0);
   const grandTotal   = subtotal + vatAmt;
-  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, vatAmt, grandTotal };
+  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, mixedVat, vatAmt, grandTotal };
 }
 
 const genTSNum  = (list: Timesheet[]) => { const yr = new Date().getFullYear(); return `T-${yr}-${String((list || []).filter(t => t?.timesheetNumber?.startsWith(`T-${yr}`)).length + 1).padStart(4, "0")}`; };
 const genINVNum = (list: Invoice[])   => { const yr = new Date().getFullYear(); return `I-${yr}-${String((list || []).filter(i => i?.invoiceNumber?.startsWith(`I-${yr}`)).length + 1).padStart(4, "0")}`; };
+
+const rateDraftFromProfile = (profile: Profile): RateDraft => ({
+  dayRate: profile.defaultDayRate,
+  includedHours: profile.defaultIncludedHours,
+  overtimeRule: profile.defaultOvertimeRule,
+  otBand1Hours: profile.defaultOtBand1Hours,
+  otBand1Mult: profile.defaultOtBand1Mult,
+  otBand2Mult: profile.defaultOtBand2Mult,
+  equipmentRental: profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0,
+  perDiem: profile.defaultPerDiem,
+  vat: profile.defaultVat,
+  minTurnaround: profile.defaultMinTurnaround,
+  turnaroundMode: profile.defaultTurnaroundMode,
+  turnaroundPenMult: profile.defaultTurnaroundPenMult,
+  travelPaid: profile.travelTimePaid,
+  mealDeducted: profile.mealBreaksDeducted,
+});
+
+const rateDraftFromTimesheet = (timesheet: Partial<Timesheet>, profile: Profile): RateDraft => rateDraftFromProfile(profileForTimesheet(profile, timesheet));
+
+const rateDraftFromMemory = (memory: RateMemory): RateDraft => ({
+  dayRate: memory.dayRate,
+  includedHours: memory.includedHours,
+  overtimeRule: memory.overtimeRule,
+  otBand1Hours: memory.otBand1Hours,
+  otBand1Mult: memory.otBand1Mult,
+  otBand2Mult: memory.otBand2Mult,
+  equipmentRental: memory.equipmentRental,
+  perDiem: memory.perDiem,
+  vat: memory.vat,
+  minTurnaround: memory.minTurnaround,
+  turnaroundMode: memory.turnaroundMode,
+  turnaroundPenMult: memory.turnaroundPenMult,
+  travelPaid: memory.travelPaid,
+  mealDeducted: memory.mealDeducted,
+});
+
+const memoryFromRateDraft = (rates: RateDraft, productionName: string): RateMemory => ({
+  productionName,
+  dayRate: num(rates.dayRate),
+  includedHours: num(rates.includedHours, 10),
+  overtimeRule: rates.overtimeRule,
+  otBand1Hours: num(rates.otBand1Hours, 4),
+  otBand1Mult: num(rates.otBand1Mult, 1.5),
+  otBand2Mult: num(rates.otBand2Mult, 2),
+  equipmentRental: num(rates.equipmentRental),
+  perDiem: num(rates.perDiem),
+  vat: num(rates.vat),
+  minTurnaround: num(rates.minTurnaround, 10),
+  turnaroundMode: rates.turnaroundMode,
+  turnaroundPenMult: num(rates.turnaroundPenMult, 1.5),
+  travelPaid: rates.travelPaid,
+  mealDeducted: rates.mealDeducted,
+  updatedAt: new Date().toISOString(),
+});
+
+const applyRateDraftToTimesheet = (timesheet: Timesheet, rates: RateDraft): Timesheet => ({
+  ...timesheet,
+  vat: num(rates.vat),
+  defaultDayRate: num(rates.dayRate),
+  defaultIncludedHours: num(rates.includedHours, 10),
+  defaultEquipmentRental: num(rates.equipmentRental),
+  defaultPerDiem: num(rates.perDiem),
+  defaultOvertimeRule: rates.overtimeRule,
+  defaultOtBand1Hours: num(rates.otBand1Hours, 4),
+  defaultOtBand1Mult: num(rates.otBand1Mult, 1.5),
+  defaultOtBand2Mult: num(rates.otBand2Mult, 2),
+  defaultMinTurnaround: num(rates.minTurnaround, 10),
+  defaultTurnaroundMode: rates.turnaroundMode,
+  defaultTurnaroundPenMult: num(rates.turnaroundPenMult, 1.5),
+  mealBreaksDeducted: rates.mealDeducted,
+  travelTimePaid: rates.travelPaid,
+  equipmentRentalDaily: true,
+});
+
+const applyRateDraftToEntry = (entry: TimesheetEntry, rates: RateDraft, profile: Profile): TimesheetEntry =>
+  withEntrySnapshots({
+    ...entry,
+    dayRate: num(rates.dayRate),
+    includedHours: num(rates.includedHours, 10),
+    overtimeRule: rates.overtimeRule,
+    otBand1Hours: num(rates.otBand1Hours, 4),
+    otBand1Mult: num(rates.otBand1Mult, 1.5),
+    otBand2Mult: num(rates.otBand2Mult, 2),
+    equipmentRental: num(rates.equipmentRental),
+    perDiem: num(rates.perDiem),
+    mealDeducted: rates.mealDeducted,
+    travelPaid: rates.travelPaid,
+    dayRateUsed: num(rates.dayRate),
+    includedHoursUsed: num(rates.includedHours, 10),
+    overtimeRuleUsed: rates.overtimeRule,
+    otBand1HoursUsed: num(rates.otBand1Hours, 4),
+    otBand1MultUsed: num(rates.otBand1Mult, 1.5),
+    otBand2MultUsed: num(rates.otBand2Mult, 2),
+    equipmentRentalUsed: num(rates.equipmentRental),
+    perDiemUsed: num(rates.perDiem),
+    vatRateUsed: num(rates.vat),
+    mealDeductedUsed: rates.mealDeducted,
+    travelPaidUsed: rates.travelPaid,
+    turnaroundRuleUsed: rates.turnaroundMode,
+    turnaroundMinimumHoursUsed: num(rates.minTurnaround, 10),
+    turnaroundPenaltyMultUsed: num(rates.turnaroundPenMult, 1.5),
+  }, { ...profile, ...profileForTimesheet(profile, { vat: rates.vat, defaultDayRate: rates.dayRate, defaultIncludedHours: rates.includedHours, defaultEquipmentRental: rates.equipmentRental, defaultPerDiem: rates.perDiem, defaultOvertimeRule: rates.overtimeRule, defaultOtBand1Hours: rates.otBand1Hours, defaultOtBand1Mult: rates.otBand1Mult, defaultOtBand2Mult: rates.otBand2Mult, defaultMinTurnaround: rates.minTurnaround, defaultTurnaroundMode: rates.turnaroundMode, defaultTurnaroundPenMult: rates.turnaroundPenMult, mealBreaksDeducted: rates.mealDeducted, travelTimePaid: rates.travelPaid, equipmentRentalDaily: true }) });
 
 /** Default fields for a new entry, auto-filled from profile */
 const entryDefaults = (profile: Profile, prev?: TimesheetEntry, prodName?: string): Omit<TimesheetEntry, "id"> => ({
@@ -481,6 +769,20 @@ const entryDefaults = (profile: Profile, prev?: TimesheetEntry, prodName?: strin
   equipmentRental:  profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0,
   perDiem:          profile.defaultPerDiem,
   expenses:         0,
+  dayRateUsed:      profile.defaultDayRate,
+  includedHoursUsed: profile.defaultIncludedHours,
+  overtimeRuleUsed: profile.defaultOvertimeRule,
+  otBand1HoursUsed: profile.defaultOtBand1Hours,
+  otBand1MultUsed:  profile.defaultOtBand1Mult,
+  otBand2MultUsed:  profile.defaultOtBand2Mult,
+  equipmentRentalUsed: profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0,
+  perDiemUsed:      profile.defaultPerDiem,
+  vatRateUsed:      profile.defaultVat,
+  travelPaidUsed:   profile.travelTimePaid,
+  mealDeductedUsed: profile.mealBreaksDeducted,
+  turnaroundRuleUsed: profile.defaultTurnaroundMode,
+  turnaroundMinimumHoursUsed: profile.defaultMinTurnaround,
+  turnaroundPenaltyMultUsed: profile.defaultTurnaroundPenMult,
   isSunday:         false,
   isPublicHoliday:  false,
 });
@@ -561,6 +863,53 @@ const AlertBox = ({ type = "info", children }: { type?: string; children: React.
   const Icon = I[type] || Info;
   return <div className={`flex items-start gap-2.5 p-3 rounded-lg border text-sm ${t[type] || t.info}`}><Icon size={15} className="flex-shrink-0 mt-0.5" /><div>{children}</div></div>;
 };
+
+function ProductionRateFields({ rates, onChange, currency }: { rates: RateDraft; onChange: (rates: RateDraft) => void; currency: string }) {
+  const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[currency] || "R";
+  const setN = (k: keyof RateDraft) => (e: React.ChangeEvent<HTMLInputElement>) => onChange({ ...rates, [k]: num(e.target.value) });
+  const setS = (k: keyof RateDraft) => (e: React.ChangeEvent<HTMLSelectElement>) => onChange({ ...rates, [k]: e.target.value });
+  const setB = (k: keyof RateDraft) => (v: boolean) => onChange({ ...rates, [k]: v });
+  const isCustom = rates.overtimeRule === "custom";
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        <Inp label={`Day Rate (${sym})`} type="number" min="0" value={rates.dayRate || ""} onChange={setN("dayRate")} />
+        <Inp label="Included Hours" type="number" min="1" value={rates.includedHours || ""} onChange={setN("includedHours")} />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <SInp label="Overtime Rule" value={rates.overtimeRule} onChange={setS("overtimeRule") as any}>
+          {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string }][]).map(([id, preset]) => <option key={id} value={id}>{preset.name}</option>)}
+        </SInp>
+        <Inp label="Minimum Turnaround (hrs)" type="number" min="0" value={rates.minTurnaround || ""} onChange={setN("minTurnaround")} />
+      </div>
+      {isCustom && (
+        <div className="grid grid-cols-3 gap-3">
+          <Inp label="Band 1 hrs" type="number" min="0" value={rates.otBand1Hours || ""} onChange={setN("otBand1Hours")} />
+          <Inp label="Band 1 mult" type="number" min="0" step="0.1" value={rates.otBand1Mult || ""} onChange={setN("otBand1Mult")} />
+          <Inp label="Band 2 mult" type="number" min="0" step="0.1" value={rates.otBand2Mult || ""} onChange={setN("otBand2Mult")} />
+        </div>
+      )}
+      <div className="grid grid-cols-3 gap-4">
+        <Inp label={`Equipment / day (${sym})`} type="number" min="0" value={rates.equipmentRental || ""} onChange={setN("equipmentRental")} />
+        <Inp label={`Per Diem (${sym})`} type="number" min="0" value={rates.perDiem || ""} onChange={setN("perDiem")} />
+        <Inp label="VAT %" type="number" min="0" max="100" value={rates.vat || ""} onChange={setN("vat")} />
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <SInp label="Short Turnaround" value={rates.turnaroundMode} onChange={setS("turnaroundMode") as any}>
+          <option value="warning">Show warning only</option>
+          <option value="penalty">Charge penalty automatically</option>
+          <option value="manual">Manual approval required</option>
+        </SInp>
+        <Inp label="Penalty Multiplier" type="number" min="0" step="0.1" value={rates.turnaroundPenMult || ""} onChange={setN("turnaroundPenMult")} />
+      </div>
+      <div className="divide-y divide-gray-100">
+        <Tog checked={rates.travelPaid} onChange={setB("travelPaid")} label="Travel time is paid" />
+        <Tog checked={rates.mealDeducted} onChange={setB("mealDeducted")} label="Meal breaks are deducted" />
+      </div>
+    </div>
+  );
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TOAST
@@ -946,13 +1295,21 @@ function LiveCalcPanel({ entry, profile, turnaround }: { entry: Partial<Timeshee
 // ═══════════════════════════════════════════════════════════════════════════
 
 function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Timesheet; profile: Profile; onAdd: (e: TimesheetEntry) => void; onShowToast: (msg: string, type?: ToastType) => void }) {
-  const prev     = timesheet.entries.length > 0 ? timesheet.entries[timesheet.entries.length - 1] : undefined;
-  const [form, setForm] = useState<Omit<TimesheetEntry, "id">>(() => entryDefaults(profile, prev, timesheet.productionName));
+  const defaultPrev = latestEntryForDefaults(timesheet.entries || []);
+  const [form, setForm] = useState<Omit<TimesheetEntry, "id">>(() => entryDefaults(profile, defaultPrev, timesheet.productionName));
   const [showRates, setShowRates] = useState(false);
-  const upd    = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setForm(p => ({ ...p, [k]: e.target.value }));
-  const updNum = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, [k]: parseFloat(e.target.value) || 0 }));
-  const updBool= (k: string) => (v: boolean) => setForm(p => ({ ...p, [k]: v }));
-  const turnaround = prev ? calcTurnaround(prev.wrapTime, form.callTime) : null;
+  const usedKey: Record<string, string> = { dayRate: "dayRateUsed", includedHours: "includedHoursUsed", overtimeRule: "overtimeRuleUsed", otBand1Hours: "otBand1HoursUsed", otBand1Mult: "otBand1MultUsed", otBand2Mult: "otBand2MultUsed", equipmentRental: "equipmentRentalUsed", perDiem: "perDiemUsed", travelPaid: "travelPaidUsed", mealDeducted: "mealDeductedUsed" };
+  const upd    = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
+    const v = e.target.value;
+    setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  };
+  const updNum = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = num(e.target.value);
+    setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  };
+  const updBool= (k: string) => (v: boolean) => setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  const prev = findPreviousEntryForTurnaround(timesheet.entries || [], form);
+  const turnaround = prev ? calcTurnaround(prev, form) : null;
   const cur = profile.defaultCurrency || "ZAR";
   const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
   const isCustom = form.overtimeRule === "custom";
@@ -969,7 +1326,7 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
     if (!form.date)     { onShowToast("Please enter a date", "error"); return; }
     if (!form.callTime) { onShowToast("Please enter a call time", "error"); return; }
     if (!form.wrapTime) { onShowToast("Please enter a wrap time", "error"); return; }
-    const entry: TimesheetEntry = { id: uid(), ...form };
+    const entry: TimesheetEntry = withEntrySnapshots({ id: uid(), ...form }, profile);
     const c = calcDay(entry, profile);
     onAdd(entry);
     const nextDate = nextDayStr(form.date);
@@ -1067,12 +1424,134 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
   );
 }
 
+function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
+  entry: TimesheetEntry;
+  profile: Profile;
+  mode: "edit" | "duplicate";
+  onSave: (entry: TimesheetEntry) => void;
+  onCancel: () => void;
+}) {
+  const [form, setForm] = useState<TimesheetEntry>(() => normalizeEntry(entry));
+  const [showRates, setShowRates] = useState(false);
+  const cur = profile.defaultCurrency || "ZAR";
+  const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
+  const usedKey: Record<string, string> = { dayRate: "dayRateUsed", includedHours: "includedHoursUsed", overtimeRule: "overtimeRuleUsed", otBand1Hours: "otBand1HoursUsed", otBand1Mult: "otBand1MultUsed", otBand2Mult: "otBand2MultUsed", equipmentRental: "equipmentRentalUsed", perDiem: "perDiemUsed", travelPaid: "travelPaidUsed", mealDeducted: "mealDeductedUsed" };
+  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+    const v = e.target.value;
+    setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  };
+  const setN = (k: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    const v = num(e.target.value);
+    setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  };
+  const setB = (k: string) => (v: boolean) => setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  const setVat = (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, vatRateUsed: num(e.target.value) }));
+  const c = calcDay(form, profile);
+
+  const save = () => {
+    if (!form.date || !form.callTime || !form.wrapTime) return;
+    onSave(withEntrySnapshots(form, profile));
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div className="bg-white rounded-2xl p-6 w-full max-w-3xl shadow-2xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-start justify-between gap-4 mb-5">
+          <div>
+            <h2 className="text-base font-bold text-gray-900">{mode === "duplicate" ? "Duplicate Timesheet Day" : "Edit Timesheet Day"}</h2>
+            <p className="text-sm text-gray-400 mt-0.5">{fmtDate(form.date)} · {hoursToHM(c.paidH)} paid · {fmtMoney(c.total, cur)}</p>
+          </div>
+          <div className="flex gap-2">
+            <Btn variant="secondary" size="sm" onClick={onCancel}>Cancel</Btn>
+            <Btn size="sm" onClick={save}><Save size={13}/> {mode === "duplicate" ? "Add Duplicate" : "Save Day"}</Btn>
+          </div>
+        </div>
+
+        <div className="space-y-4">
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Day Details</p>
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <Inp label="Date" type="date" value={form.date} onChange={set("date")} />
+              <Inp label="Location" value={form.location} onChange={set("location")} />
+            </div>
+            <div className="grid grid-cols-2 gap-4 mb-4">
+              <TInp label="Call Time" value={form.callTime} onChange={set("callTime")} />
+              <TInp label="Wrap Time" value={form.wrapTime} onChange={set("wrapTime")} />
+            </div>
+            <Inp label="Meal Break (minutes)" type="number" min="0" value={form.mealBreakMinutes} onChange={setN("mealBreakMinutes")} />
+          </Card>
+
+          <Card className="p-4">
+            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Travel</p>
+            <div className="grid grid-cols-3 gap-4">
+              <TInp label="Travel Start" value={form.travelStartTime} onChange={set("travelStartTime")} />
+              <TInp label="Travel End" value={form.travelEndTime} onChange={set("travelEndTime")} />
+              <Inp label="Distance (km)" type="number" min="0" value={form.travelDistance} onChange={set("travelDistance")} />
+            </div>
+          </Card>
+
+          <TxInp label="Notes" rows={2} value={form.notes} onChange={set("notes")} />
+
+          <div className="border border-gray-200 rounded-xl overflow-hidden">
+            <button type="button" onClick={() => setShowRates(v => !v)} className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-800 hover:bg-gray-50">
+              <span>Rates and rules for this day</span>
+              {showRates ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}
+            </button>
+            {showRates && (
+              <div className="p-4 border-t border-gray-100 space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <Inp label={`Day Rate (${sym})`} type="number" min="0" value={form.dayRate} onChange={setN("dayRate")} />
+                  <Inp label="Included Hours" type="number" min="1" value={form.includedHours} onChange={setN("includedHours")} />
+                </div>
+                <SInp label="Overtime Rule" value={form.overtimeRule} onChange={set("overtimeRule") as any}>
+                  {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string }][]).map(([id, preset]) => <option key={id} value={id}>{preset.name}</option>)}
+                </SInp>
+                {form.overtimeRule === "custom" && (
+                  <div className="grid grid-cols-3 gap-3">
+                    <Inp label="Band 1 hrs" type="number" min="0" value={form.otBand1Hours} onChange={setN("otBand1Hours")} />
+                    <Inp label="Band 1 mult" type="number" min="0" step="0.1" value={form.otBand1Mult} onChange={setN("otBand1Mult")} />
+                    <Inp label="Band 2 mult" type="number" min="0" step="0.1" value={form.otBand2Mult} onChange={setN("otBand2Mult")} />
+                  </div>
+                )}
+                <div className="grid grid-cols-3 gap-4">
+                  <Inp label={`Equipment (${sym})`} type="number" min="0" value={form.equipmentRental} onChange={setN("equipmentRental")} />
+                  <Inp label={`Per Diem (${sym})`} type="number" min="0" value={form.perDiem} onChange={setN("perDiem")} />
+                  <Inp label={`Expenses (${sym})`} type="number" min="0" value={form.expenses} onChange={setN("expenses")} />
+                </div>
+                <div className="grid grid-cols-3 gap-4">
+                  <Inp label="VAT %" type="number" min="0" max="100" value={form.vatRateUsed ?? profile.defaultVat} onChange={setVat} />
+                  <Inp label="Turnaround min hrs" type="number" min="0" value={form.turnaroundMinimumHoursUsed ?? profile.defaultMinTurnaround} onChange={e => setForm(p => ({ ...p, turnaroundMinimumHoursUsed: num(e.target.value) }))} />
+                  <SInp label="Turnaround Rule" value={form.turnaroundRuleUsed || profile.defaultTurnaroundMode} onChange={e => setForm(p => ({ ...p, turnaroundRuleUsed: e.target.value as TurnaroundMode }))}>
+                    <option value="warning">Show warning only</option>
+                    <option value="penalty">Charge penalty automatically</option>
+                    <option value="manual">Manual approval required</option>
+                  </SInp>
+                </div>
+                <div className="divide-y divide-gray-100">
+                  <Tog checked={form.mealDeducted} onChange={setB("mealDeducted")} label="Meal break deducted for this day" />
+                  <Tog checked={form.travelPaid} onChange={setB("travelPaid")} label="Travel time paid for this day" />
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WEEKLY VIEW  — crash-safe defensive rendering
 // ═══════════════════════════════════════════════════════════════════════════
 
-function WeeklyView({ timesheet, profile, onDeleteEntry }: { timesheet: Timesheet; profile: Profile; onDeleteEntry: (id: string) => void }) {
-  const entries = timesheet?.entries || [];
+function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDeleteEntry }: {
+  timesheet: Timesheet;
+  profile: Profile;
+  onEditEntry: (entry: TimesheetEntry) => void;
+  onDuplicateEntry: (entry: TimesheetEntry) => void;
+  onDeleteEntry: (id: string) => void;
+}) {
+  const entries = sortEntriesForTurnaround(timesheet?.entries || []);
   const cur     = profile?.defaultCurrency || "ZAR";
   const minTR   = profile?.defaultMinTurnaround || 10;
 
@@ -1086,7 +1565,7 @@ function WeeklyView({ timesheet, profile, onDeleteEntry }: { timesheet: Timeshee
     catch { c = { onSetH: 0, overnight: false, mealH: 0, travH: 0, paidH: 0, incH: 10, baseHourly: 0, totalOtH: 0, b1H: 0, b1Cost: 0, b2H: 0, b2Cost: 0, totalOtCost: 0, equip: 0, perDiem: 0, expenses: 0, dayRate: 0, total: 0, ruleId: "sa-film" as OTRuleId, bands: { band1Hours: 4, band1Mult: 1.5, band2Mult: 2.0 } }; }
     const prevEntry = i > 0 ? entries[i - 1] : undefined;
     let tr: number | null = null;
-    try { tr = prevEntry ? calcTurnaround(prevEntry.wrapTime || "", e.callTime || "") : null; } catch { tr = null; }
+    try { tr = prevEntry ? calcTurnaround(prevEntry, e) : null; } catch { tr = null; }
     const trWarn = tr !== null && tr < minTR;
     return { e, c, tr, trWarn };
   });
@@ -1158,7 +1637,11 @@ function WeeklyView({ timesheet, profile, onDeleteEntry }: { timesheet: Timeshee
                   <td className={`${tdR} text-gray-400`}>{tr !== null ? hoursToHM(tr) : "—"}</td>
                   <td className={`${tdR} font-semibold text-gray-900`}>{fmtMoney(c.total || 0, cur)}</td>
                   <td className={tdCls}>
-                    <button onClick={() => { if (confirm("Remove this day?")) onDeleteEntry(e.id); }} className="p-1 text-gray-300 hover:text-red-500 rounded transition-colors"><Trash2 size={13}/></button>
+                    <div className="flex justify-end gap-1">
+                      <button title="Edit" onClick={() => onEditEntry(e)} className="p-1 text-gray-300 hover:text-blue-600 rounded transition-colors"><Pencil size={13}/></button>
+                      <button title="Duplicate" onClick={() => onDuplicateEntry(e)} className="p-1 text-gray-300 hover:text-emerald-600 rounded transition-colors"><Copy size={13}/></button>
+                      <button title="Delete" onClick={() => { if (confirm("Delete this timesheet day? This cannot be undone.")) onDeleteEntry(e.id); }} className="p-1 text-gray-300 hover:text-red-500 rounded transition-colors"><Trash2 size={13}/></button>
+                    </div>
                   </td>
                 </tr>
               </Fragment>
@@ -1218,7 +1701,7 @@ function SummaryView({ timesheet, profile, onStartInvoice }: { timesheet: Timesh
             {sum.totalExp     > 0 && <SRow label="Expenses"         value={fmtMoney(sum.totalExp,     cur)} />}
             {sum.totalTurnaroundPenalty > 0 && <SRow label="Turnaround penalties" value={fmtMoney(sum.totalTurnaroundPenalty, cur)} amber />}
             <div className="border-t border-gray-200 pt-2 mt-1"><SRow label="Subtotal" value={fmtMoney(sum.subtotal, cur)} /></div>
-            {sum.vatPct > 0 && <SRow label={`VAT (${sum.vatPct}%)`} value={fmtMoney(sum.vatAmt, cur)} />}
+            {sum.vatAmt > 0 && <SRow label={sum.mixedVat ? "VAT" : `VAT (${sum.vatPct}%)`} value={fmtMoney(sum.vatAmt, cur)} />}
             <div className="border-t-2 border-gray-900 pt-2 mt-1 flex justify-between">
               <span className="font-bold text-gray-900 text-base">Total Due</span>
               <span className="font-bold text-gray-900 text-lg tabular-nums">{fmtMoney(sum.grandTotal, cur)}</span>
@@ -1266,6 +1749,37 @@ function buildDetailedTimesheetLines(sum: ReturnType<typeof calcSummary>): Invoi
 const buildTimesheetLines = (sum: ReturnType<typeof calcSummary>, mode: InvoiceDetailMode) =>
   mode === "detailed" ? buildDetailedTimesheetLines(sum) : buildSummaryTimesheetLines(sum);
 
+function rebuildDraftInvoiceFromTimesheet(inv: Invoice, timesheet: Timesheet, profile: Profile): Invoice {
+  const effectiveProfile = profileForTimesheet(profile, timesheet);
+  const sum = calcSummary(timesheet.entries || [], effectiveProfile);
+  const detailMode = inv.detailMode || "summary";
+  const baseLines = buildTimesheetLines(sum, detailMode);
+  const extraLines = (inv.lineItems || []).filter(l => l.isExtra || l.category === "additional");
+  const lineItems = [...baseLines, ...extraLines];
+  const extraSubtotal = extraLines.reduce((s, l) => s + (l.amount || 0), 0);
+  const extraTaxable = extraLines.reduce((s, l) => s + (l.taxable === false ? 0 : (l.amount || 0)), 0);
+  const extraVat = profile.vatRegistered ? extraTaxable * ((sum.vatPct || effectiveProfile.defaultVat || 0) / 100) : 0;
+  const subtotal = sum.subtotal + extraSubtotal;
+  const vatAmount = sum.vatAmt + extraVat;
+  const total = subtotal + vatAmount;
+  const paidAmount = Math.min(safe(inv.paidAmount, 0), total);
+  return normalizeInvoice({
+    ...inv,
+    productionName: timesheet.productionName,
+    timesheetNumber: timesheet.timesheetNumber,
+    timesheetDates: timesheetDateRange(timesheet),
+    detailMode,
+    lineItems,
+    timesheetBreakdown: detailMode === "summary_timesheet" ? buildDetailedTimesheetLines(sum) : inv.timesheetBreakdown || [],
+    subtotal,
+    vat: sum.vatPct,
+    vatAmount,
+    total,
+    paidAmount,
+    balanceDue: Math.max(total - paidAmount, 0),
+  });
+}
+
 function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoices, onSave, onUpdateTimesheet, onBack, onShowToast }: {
   timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void; invoices: Invoice[];
   onSave: (inv: Invoice) => void; onUpdateTimesheet: (ts: Timesheet) => void; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
@@ -1296,7 +1810,8 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const subtotal = allLines.reduce((s, l) => s + (l.amount || 0), 0);
   const taxableSubtotal = allLines.reduce((s, l) => s + (l.taxable === false ? 0 : (l.amount || 0)), 0);
   const vatPct = profile.vatRegistered ? sum.vatPct : 0;
-  const vatAmt = taxableSubtotal * (vatPct / 100);
+  const extraTaxableSubtotal = extras.reduce((s, l) => s + (l.taxable === false ? 0 : (l.amount || 0)), 0);
+  const vatAmt = profile.vatRegistered ? sum.vatAmt + extraTaxableSubtotal * (vatPct / 100) : 0;
   const total = subtotal + vatAmt;
   const paidAmount = Math.min(safe(paidAmountStr, 0), total);
   const balanceDue = Math.max(total - paidAmount, 0);
@@ -1616,16 +2131,62 @@ ${inv.notes?`<div class="section"><div class="tiny">Notes</div><div class="notes
 // TIMESHEET DETAIL
 // ═══════════════════════════════════════════════════════════════════════════
 
-function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice, onShowToast }: {
+function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, onCreateInvoice, onShowToast }: {
   timesheet: Timesheet; profile: Profile; onUpdate: (ts: Timesheet) => void;
-  onBack: () => void; onCreateInvoice: (ts: Timesheet) => void; onShowToast: (msg: string, type?: ToastType) => void;
+  linkedInvoice?: Invoice | null; onBack: () => void; onCreateInvoice: (ts: Timesheet) => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const [tab, setTab]     = useState("add");
+  const [editingDay, setEditingDay] = useState<{ mode: "edit" | "duplicate"; entry: TimesheetEntry } | null>(null);
+  const [showProductionRates, setShowProductionRates] = useState(false);
+  const [productionRates, setProductionRates] = useState<RateDraft>(() => rateDraftFromTimesheet(timesheet, profile));
   const effectiveProfile  = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
   const sum               = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
   const cur               = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
-  const addEntry          = (e: TimesheetEntry) => onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), e] });
-  const deleteEntry       = (id: string) => onUpdate({ ...timesheet, entries: (timesheet.entries || []).filter(e => e.id !== id) });
+  const linkedStatus      = linkedInvoice ? normalizeInvoiceStatus(linkedInvoice.status) : null;
+  const linkedFinalised   = Boolean(linkedStatus && linkedStatus !== "draft");
+  const addEntry          = (e: TimesheetEntry) => {
+    onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), withEntrySnapshots(e, effectiveProfile)] });
+  };
+  const updateEntry       = (entry: TimesheetEntry) => {
+    onUpdate({ ...timesheet, entries: (timesheet.entries || []).map(e => e.id === entry.id ? withEntrySnapshots(entry, effectiveProfile) : e) });
+    onShowToast("Timesheet day updated.");
+  };
+  const duplicateEntryFromWeekly = (entry: TimesheetEntry) => {
+    setEditingDay({ mode: "duplicate", entry: withEntrySnapshots({ ...entry, id: uid(), date: nextDayStr(entry.date), callTime: "08:00", wrapTime: "18:00" }, effectiveProfile) });
+  };
+  const deleteEntry       = (id: string) => {
+    onUpdate({ ...timesheet, entries: (timesheet.entries || []).filter(e => e.id !== id) });
+    onShowToast("Timesheet day deleted", "info");
+  };
+  const saveDayEditor     = (entry: TimesheetEntry) => {
+    if (!editingDay) return;
+    const snapshot = withEntrySnapshots(entry, effectiveProfile);
+    if (editingDay.mode === "duplicate") {
+      onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), snapshot] });
+      onShowToast("Timesheet day duplicated.");
+    } else {
+      updateEntry(snapshot);
+    }
+    setEditingDay(null);
+  };
+  const openProductionRates = () => {
+    setProductionRates(rateDraftFromTimesheet(timesheet, profile));
+    setShowProductionRates(v => !v);
+  };
+  const saveProductionRates = () => {
+    const choice = prompt("How should these changes apply?\n\n1. Apply to future days only\n2. Recalculate existing days that have not been invoiced\n3. Recalculate all days in this timesheet", "1") || "1";
+    if (!["1", "2", "3"].includes(choice)) return;
+    if (linkedFinalised && choice === "3" && !confirm("This timesheet is linked to an invoice. Editing it may require updating or recreating the invoice. Recalculate all days anyway?")) return;
+    let next = applyRateDraftToTimesheet(timesheet, productionRates);
+    const nextProfile = profileForTimesheet(profile, next);
+    const canRecalculateExisting = choice === "3" || (choice === "2" && !linkedFinalised);
+    if (canRecalculateExisting) {
+      next = { ...next, entries: (next.entries || []).map(e => applyRateDraftToEntry(e, productionRates, nextProfile)) };
+    }
+    onUpdate(next);
+    setShowProductionRates(false);
+    onShowToast(choice === "1" ? "Production rates saved for future days." : "Production rates saved and matching days recalculated.");
+  };
   const statusColor       = ({ open: "blue", submitted: "purple", invoiced: "green" } as Record<string, string>)[timesheet.status] || "blue";
   const statusLabel       = ({ open: "Open", submitted: "Submitted", invoiced: "Invoiced" } as Record<string, string>)[timesheet.status] || "Open";
   const TABS = [{ id: "add", label: "Add Day" }, { id: "weekly", label: `Weekly (${(timesheet.entries||[]).length})` }, { id: "summary", label: "Summary" }];
@@ -1640,17 +2201,40 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
             <p className="text-sm text-gray-400 mt-0.5">{timesheet.timesheetNumber} · Bill to {timesheet.clientName || "Unknown / add later"} · {(timesheet.entries||[]).length} day{(timesheet.entries||[]).length !== 1 ? "s" : ""} · {fmtMoney(sum.grandTotal, cur)}</p>
           </div>
           <div className="flex items-center gap-2">
+            <Btn variant="secondary" size="sm" onClick={openProductionRates}><Pencil size={13}/> Edit production rates</Btn>
             <Badge color={statusColor}>{statusLabel}</Badge>
             {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
           </div>
         </div>
       </div>
+      {linkedInvoice && linkedFinalised && (
+        <AlertBox type="warning">This timesheet is linked to an invoice. Editing it may require updating or recreating the invoice.</AlertBox>
+      )}
+      {linkedInvoice && !linkedFinalised && (
+        <AlertBox type="info">Draft invoice {linkedInvoice.invoiceNumber} will use the latest timesheet totals when you update or save timesheet changes.</AlertBox>
+      )}
+      {showProductionRates && (
+        <Card className="p-5">
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <p className="text-sm font-bold text-gray-900">Production rates</p>
+              <p className="text-xs text-gray-400 mt-0.5">These rates fill future days unless you choose to recalculate existing entries.</p>
+            </div>
+            <div className="flex gap-2">
+              <Btn variant="secondary" size="sm" onClick={() => setShowProductionRates(false)}>Cancel</Btn>
+              <Btn size="sm" onClick={saveProductionRates}><Save size={13}/> Save Rates</Btn>
+            </div>
+          </div>
+          <ProductionRateFields rates={productionRates} onChange={setProductionRates} currency={cur} />
+        </Card>
+      )}
       <div className="flex border-b border-gray-200">
         {TABS.map(t => <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${tab === t.id ? "border-blue-600 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-800"}`}>{t.label}</button>)}
       </div>
       {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={effectiveProfile} onAdd={addEntry} onShowToast={onShowToast} />}
-      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onDeleteEntry={deleteEntry} />}
+      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onEditEntry={entry => setEditingDay({ mode: "edit", entry })} onDuplicateEntry={duplicateEntryFromWeekly} onDeleteEntry={deleteEntry} />}
       {tab === "summary"&& <SummaryView timesheet={timesheet} profile={effectiveProfile} onStartInvoice={() => onCreateInvoice(timesheet)} />}
+      {editingDay && <TimesheetDayEditor entry={editingDay.entry} profile={effectiveProfile} mode={editingDay.mode} onSave={saveDayEditor} onCancel={() => setEditingDay(null)} />}
     </div>
   );
 }
@@ -1659,13 +2243,14 @@ function TimesheetDetail({ timesheet, profile, onUpdate, onBack, onCreateInvoice
 // TIMESHEETS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onShowToast }: {
+function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onSaveInvoices, onShowToast }: {
   timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void;
-  invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onShowToast: (msg: string, type?: ToastType) => void;
+  invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onSaveInvoices: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const [view, setView]           = useState<"list" | "detail" | "invoice-review">("list");
   const [selected, setSelected]   = useState<Timesheet | null>(null);
   const [showNew, setShowNew]     = useState(false);
+  const [showNewRates, setShowNewRates] = useState(false);
   const [newTs, setNewTs] = useState({
     productionName: "",
     clientChoice: "unknown",
@@ -1673,9 +2258,19 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     startDate: todayStr(),
     currency: profile.defaultCurrency || "ZAR",
     notes: "",
+    rates: rateDraftFromProfile(profile),
   });
   const [newClient, setNewClient] = useState<Client>(() => blankClient());
   const cur = profile.defaultCurrency || "ZAR";
+  const selectedClientForNew = newTs.clientChoice !== "unknown" && newTs.clientChoice !== "new"
+    ? clients.find(c => c.id === newTs.clientChoice) || null
+    : null;
+  const useLastClientRate = () => {
+    const memory = selectedClientForNew?.rateMemory;
+    if (!memory) return;
+    setNewTs(p => ({ ...p, rates: rateDraftFromMemory(memory) }));
+    onShowToast("Last client rate loaded", "info");
+  };
 
   const resetNewTimesheet = () => {
     setNewTs({
@@ -1685,8 +2280,10 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
       startDate: todayStr(),
       currency: profile.defaultCurrency || "ZAR",
       notes: "",
+      rates: rateDraftFromProfile(profile),
     });
     setNewClient(blankClient());
+    setShowNewRates(false);
   };
 
   const createTS = () => {
@@ -1697,11 +2294,17 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 
     if (newTs.clientChoice === "new") {
       if (!newClient.companyName.trim()) { onShowToast("Enter the new client company name or choose Unknown / add later", "error"); return; }
-      chosenClient = normalizeClient(newClient);
+      chosenClient = normalizeClient({ ...newClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
       nextClients = [...clients, chosenClient];
       onSaveClients(nextClients);
     } else if (newTs.clientChoice !== "unknown") {
       chosenClient = clients.find(c => c.id === newTs.clientChoice) || null;
+      if (chosenClient) {
+        const remembered = normalizeClient({ ...chosenClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
+        nextClients = clients.map(c => c.id === remembered.id ? remembered : c);
+        onSaveClients(nextClients);
+        chosenClient = remembered;
+      }
     }
 
     const ts: Timesheet = {
@@ -1716,24 +2319,24 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
       startDate: newTs.startDate || todayStr(),
       notes: newTs.notes,
       currency: newTs.currency,
-      vat: profile.defaultVat,
+      vat: newTs.rates.vat,
       status: "open",
       entries: [],
       paymentTerms: chosenClient?.paymentTerms || chosenClient?.defaultPaymentTerms || profile.paymentTerms,
-      defaultDayRate: profile.defaultDayRate,
-      defaultIncludedHours: profile.defaultIncludedHours,
-      defaultEquipmentRental: profile.defaultEquipmentRental,
-      defaultPerDiem: profile.defaultPerDiem,
-      defaultOvertimeRule: profile.defaultOvertimeRule,
-      defaultOtBand1Hours: profile.defaultOtBand1Hours,
-      defaultOtBand1Mult: profile.defaultOtBand1Mult,
-      defaultOtBand2Mult: profile.defaultOtBand2Mult,
-      defaultMinTurnaround: profile.defaultMinTurnaround,
-      defaultTurnaroundMode: profile.defaultTurnaroundMode,
-      defaultTurnaroundPenMult: profile.defaultTurnaroundPenMult,
-      mealBreaksDeducted: profile.mealBreaksDeducted,
-      travelTimePaid: profile.travelTimePaid,
-      equipmentRentalDaily: profile.equipmentRentalDaily,
+      defaultDayRate: newTs.rates.dayRate,
+      defaultIncludedHours: newTs.rates.includedHours,
+      defaultEquipmentRental: newTs.rates.equipmentRental,
+      defaultPerDiem: newTs.rates.perDiem,
+      defaultOvertimeRule: newTs.rates.overtimeRule,
+      defaultOtBand1Hours: newTs.rates.otBand1Hours,
+      defaultOtBand1Mult: newTs.rates.otBand1Mult,
+      defaultOtBand2Mult: newTs.rates.otBand2Mult,
+      defaultMinTurnaround: newTs.rates.minTurnaround,
+      defaultTurnaroundMode: newTs.rates.turnaroundMode,
+      defaultTurnaroundPenMult: newTs.rates.turnaroundPenMult,
+      mealBreaksDeducted: newTs.rates.mealDeducted,
+      travelTimePaid: newTs.rates.travelPaid,
+      equipmentRentalDaily: true,
       createdAt: new Date().toISOString(),
     };
     onSave([...timesheets, ts]); setSelected(ts); setView("detail"); setShowNew(false); resetNewTimesheet();
@@ -1741,8 +2344,19 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 
   const updateTS = useCallback((ts: Timesheet) => {
     onSave((timesheets || []).map(x => x.id === ts.id ? ts : x));
+    const linked = (invoices || []).find(i => i.id === ts.invoiceId || i.fromTimesheetId === ts.id);
+    if (linked && normalizeInvoiceStatus(linked.status) === "draft") {
+      onSaveInvoices((invoices || []).map(i => i.id === linked.id ? rebuildDraftInvoiceFromTimesheet(i, ts, profile) : i));
+    }
+    if (ts.clientId) {
+      const client = clients.find(c => c.id === ts.clientId);
+      if (client) {
+        const remembered = normalizeClient({ ...client, rateMemory: memoryFromRateDraft(rateDraftFromTimesheet(ts, profile), ts.productionName) });
+        onSaveClients(clients.map(c => c.id === remembered.id ? remembered : c));
+      }
+    }
     setSelected(ts);
-  }, [timesheets, onSave]);
+  }, [timesheets, invoices, clients, profile, onSave, onSaveInvoices, onSaveClients]);
 
   const deleteTS = (id: string) => { if (!confirm("Delete this timesheet?")) return; onSave((timesheets||[]).filter(t => t.id !== id)); if (selected?.id === id) { setView("list"); setSelected(null); } };
 
@@ -1775,7 +2389,7 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     return <InvoiceReviewScreen timesheet={currentTS} profile={profile} clients={clients} onSaveClients={onSaveClients} invoices={invoices} onSave={saveInvoice} onUpdateTimesheet={updateTS} onBack={() => setView("detail")} onShowToast={onShowToast} />;
 
   if (view === "detail" && currentTS)
-    return <TimesheetDetail timesheet={currentTS} profile={profile} onUpdate={updateTS} onBack={() => { setView("list"); setSelected(null); }} onCreateInvoice={startInvoice} onShowToast={onShowToast} />;
+    return <TimesheetDetail timesheet={currentTS} profile={profile} linkedInvoice={(invoices || []).find(i => i.id === currentTS.invoiceId || i.fromTimesheetId === currentTS.id) || null} onUpdate={updateTS} onBack={() => { setView("list"); setSelected(null); }} onCreateInvoice={startInvoice} onShowToast={onShowToast} />;
 
   return (
     <div className="space-y-5">
@@ -1809,6 +2423,15 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
                 {clients.map(c => <option key={c.id} value={c.id}>{clientName(c) || "Unnamed client"}{!clientBillingComplete(c) ? " (incomplete)" : ""}</option>)}
                 <option value="new">Add new client</option>
               </SInp>
+              {selectedClientForNew?.rateMemory && (
+                <div className="rounded-lg border border-blue-100 bg-blue-50 p-3 flex items-center justify-between gap-3">
+                  <div className="text-sm text-blue-800">
+                    <p className="font-semibold">Last used for {clientName(selectedClientForNew)}:</p>
+                    <p className="text-xs mt-0.5">{fmtMoney(selectedClientForNew.rateMemory.dayRate, newTs.currency)}/day · {fmtMoney(selectedClientForNew.rateMemory.equipmentRental, newTs.currency)} kit · {OT_PRESETS[selectedClientForNew.rateMemory.overtimeRule]?.name}</p>
+                  </div>
+                  <Btn size="sm" variant="secondary" onClick={useLastClientRate}>Use last client rate</Btn>
+                </div>
+              )}
               {newTs.clientChoice === "unknown" && (
                 <AlertBox type="warning">This timesheet can be created now, but the client will be marked incomplete until billing details are added.</AlertBox>
               )}
@@ -1818,6 +2441,17 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
                   <ClientFields client={newClient} onChange={setNewClient} />
                 </div>
               )}
+              <div className="border border-gray-200 rounded-xl overflow-hidden">
+                <button type="button" onClick={() => setShowNewRates(v => !v)} className="w-full flex items-center justify-between px-4 py-3 text-sm font-semibold text-gray-800 hover:bg-gray-50">
+                  <span>Rates for this production</span>
+                  {showNewRates ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}
+                </button>
+                {showNewRates && (
+                  <div className="p-4 border-t border-gray-100 bg-gray-50/50">
+                    <ProductionRateFields rates={newTs.rates} onChange={rates => setNewTs(p => ({ ...p, rates }))} currency={newTs.currency} />
+                  </div>
+                )}
+              </div>
               <TxInp label="Notes" rows={2} value={newTs.notes} onChange={e => setNewTs(p => ({ ...p, notes: e.target.value }))} placeholder="Optional production or billing notes" />
             </div>
             <div className="flex gap-2 mt-4">
@@ -2169,7 +2803,7 @@ export default function App() {
   return (
     <Layout page={page} setPage={setPage} profile={profile}>
       <ToastContainer toasts={toasts} />
-      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onShowToast={showToast} />}
+      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} />}
       {page === "clients"    && <ClientsPage    clients={clients}         onSave={saveClients} onShowToast={showToast} />}
       {page === "invoices"   && <InvoicesPage   invoices={invoices}     profile={profile} onSave={saveInvoices} onShowToast={showToast} />}
       {page === "settings"   && <SettingsPage   profile={profile}       onSave={saveProfile} />}

@@ -1,59 +1,47 @@
-# CrewQuote Pro — Freelancer Timesheet
+# CrewQuote Pro
 
-> **Timesheets, Invoices and Cost Calculations for Film & TV Crew**
+Freelancer timesheets, invoices, clients, and cost calculations for Film & TV crew.
 
-A single-user web app built for freelance crew members. Set your rates once in Settings, then log shoot days in seconds — the app calculates overtime, turnaround, travel, equipment, and per diem automatically.
+This project currently ships the monolithic React app in `src/App.tsx`. The modular rewrite work has been preserved in `archive/modular-wip/`, but it is not wired into the running app or the production build yet.
 
----
+## Current App
 
-## The Workflow
+The active app is rendered by `src/main.tsx`, which imports `src/App.tsx` directly. The active navigation includes:
 
-```
-Settings  →  New Timesheet  →  Add Days  →  Summary  →  Create Invoice
-(once)        (per job)        (daily)       (totals)    (one click)
-```
+- Timesheets
+- Clients
+- Invoices
+- Settings
 
-1. **Settings** — Enter your name, day rate, overtime rate, included hours, equipment rental, per diem, VAT, and banking details. Done once. Saved forever.
+The app stores data in browser `localStorage` using `cqp-*` keys, with a fallback read/write path for `window.storage` when available. No backend is required for the current version.
 
-2. **New Timesheet** — Enter the production name. Your rates auto-fill every day.
+## Core Workflow
 
-3. **Add Day** — Enter date, location, call time, wrap time. Done. The app calculates everything live as you type:
-   - On-set hours (overnight shoots handled automatically)
-   - Meal break deduction
-   - Travel hours
-   - Overtime hours and cost
-   - Day total
-
-4. **Weekly tab** — See all days in a table. Turnaround warnings show in amber between short-turnaround days.
-
-5. **Summary tab** — Total days, hours, overtime, equipment, per diem, VAT, grand total.
-
-6. **Create Invoice** — One click generates a professional invoice with all your banking details.
-
----
+1. Open Settings and enter your crew profile, rates, VAT preference, payment terms, and banking details.
+2. Create clients as needed.
+3. Create a timesheet for a production.
+4. Add shoot days with call time, wrap time, meal break, travel time, expenses, and optional rate overrides.
+5. Review weekly totals, overtime, turnaround warnings, equipment, per diem, VAT, and totals.
+6. Create and export invoices from completed timesheets.
 
 ## Key Calculations
 
-### Overnight Shoots
-Call 22:00, Wrap 06:00 → **8 hours on-set** (not −16 hours).
-The app detects when wrap is earlier than call and adds 24h automatically.
+Overnight shoots are handled by treating a wrap time earlier than the call time as the next day.
 
-### Overtime
-```
-Paid Hours = (Wrap − Call) − Meal Break + Travel (if enabled)
-Overtime   = max(Paid Hours − Included Hours, 0)
-OT Cost    = Overtime Hours × OT Rate
-Day Total  = Day Rate + OT Cost + Equipment + Per Diem + Expenses
+```text
+Call 22:00, Wrap 06:00 -> 8 hours on set
 ```
 
-### Turnaround
-```
-Turnaround = Next Call − Previous Wrap (overnight-aware)
-Warning if Turnaround < Minimum Turnaround Hours (set in Settings)
-```
-Example: Wrap 22:00, Next call 06:00 → 8h turnaround, warns if minimum is 10h.
+Per-day totals include:
 
----
+```text
+Work hours = on-set hours - meal break
+Paid hours = work hours + paid travel hours
+Overtime = max(paid hours - included hours, 0)
+Day total = day rate + overtime + equipment + per diem + expenses
+```
+
+Turnaround warnings and penalties are calculated in the active `src/App.tsx` implementation.
 
 ## Setup
 
@@ -62,80 +50,43 @@ npm install
 npm run dev
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173)
+Open the URL printed by Vite, usually `http://127.0.0.1:5173`.
 
-### First time
-1. Go to **Settings**
-2. Set your **Full Name** and **Role**
-3. Set **Default Rates** (day rate, overtime rate, included hours, equipment, per diem, VAT)
-4. Set **Banking Details**
-5. Save — done. Now create a timesheet.
+## Build
 
-### Build for production
 ```bash
 npm run build
 ```
-Deploy the `dist/` folder to any static host (Netlify, Vercel, Cloudflare Pages).
 
----
+The production build checks only the active app files:
 
-## Architecture
+- `src/main.tsx`
+- `src/App.tsx`
 
-All application logic lives in **`src/App.tsx`** — a single, self-contained TypeScript file with no internal imports.
+The archived modular files are intentionally excluded from TypeScript checking until that rewrite is ready to be resumed.
 
-| Section | What it does |
-|---|---|
-| `DEFAULT_PROFILE` | All user settings with sensible defaults |
-| `calcDay()` | Core per-day calculation engine |
-| `calcSummary()` | Aggregates all days in a timesheet |
-| `calcTurnaround()` | Overnight-aware gap between days |
-| `SettingsPage` | 4-tab profile setup (saved to `window.storage`) |
-| `AddDayForm` | Daily entry form — auto-fills from profile, rates collapsible |
-| `LiveCalcPanel` | Real-time calculation preview (right column) |
-| `WeeklyView` | Table of all days with turnaround warnings |
-| `SummaryView` | Totals + Create Invoice button |
-| `TimesheetsPage` | List + create + detail |
-| `InvoicesPage` | List + detail view |
+## Project Structure
 
-Utility files in `src/utils/` and `src/services/` are kept as clean reference code for Phase 2 (Supabase backend, PDF export service, etc.) but are not imported by the current MVP.
+```text
+src/
+  App.tsx       Active monolithic app
+  main.tsx      React entrypoint
+  index.css     Tailwind/global styles
 
----
-
-## Phase 2 Roadmap
-
-The utility/service files are already written and ready:
-
-- **`src/services/pdf.ts`** — HTML-print-based PDF export for timesheets, quotes, invoices (no DOMPurify dependency)
-- **`src/services/storage.ts`** — Drop-in replacement with localStorage. Swap `window.storage` → `localStorage` for deployment outside Claude artifacts
-- **`src/utils/calculations.ts`** — Same calculation engine extracted as pure functions for testing
-- **`src/utils/time.ts`** — Overnight-aware time utilities
-
-### When ready to add a backend
-1. Replace `window.storage` calls with Supabase queries
-2. Add authentication (Supabase Auth)
-3. Add `src/services/pdf.ts` exports to the PDF buttons
-4. Add Stripe subscriptions
-
----
-
-## Production Notes
-
-### Storage
-In this version, data persists in `window.storage` (Claude artifact storage). For a deployed standalone app, change `Store.get/set` in `App.tsx` to use `localStorage`:
-
-```ts
-const Store = {
-  get: (k: string) => JSON.parse(localStorage.getItem(k) || 'null'),
-  set: (k: string, v: unknown) => localStorage.setItem(k, JSON.stringify(v)),
-}
+archive/modular-wip/
+  src/          Preserved modular rewrite work, not part of the active app
 ```
 
-### Security
-- `vite.config.ts` sets `host: '127.0.0.1'` to mitigate GHSA-67mh-4wv8-2f99 (esbuild dev server exposure)
-- No jsPDF / DOMPurify in the dependency tree (previously had 13+ CVEs)
-- All user input is escaped before HTML rendering
+## Notes For Future Modular Work
 
----
+Before moving `archive/modular-wip/src` back into `src`, finish the migration deliberately:
 
-## Licence
-Private / Commercial — CrewQuote Pro
+- Add the required router, charting, and PDF dependencies only if they are still needed.
+- Add or update `@/*` path aliases in both TypeScript and Vite.
+- Add a data migration from current `cqp-*` localStorage keys to any new storage keys.
+- Wire the modular app through `src/main.tsx`.
+- Re-expand `tsconfig.json` only after the modular files compile.
+
+## License
+
+Private / Commercial - CrewQuote Pro

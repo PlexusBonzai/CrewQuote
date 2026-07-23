@@ -9,8 +9,14 @@
     -moz-osx-font-smoothing: grayscale;
   }
 
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
   body {
-    @apply bg-gray-50 text-gray-900;
+    @apply bg-slate-50 text-slate-900 overflow-hidden;
   }
 
   /* Number inputs — hide spinner arrows */

@@ -94,6 +94,7 @@ interface TimesheetEntry {
   equipmentRental: number;
   perDiem: number;
   expenses: number;
+  expenseDescription: string;
   dayRateUsed?: number;
   includedHoursUsed?: number;
   overtimeRuleUsed?: OTRuleId;
@@ -176,6 +177,7 @@ interface Invoice {
   crewName: string;
   role: string;
   companyName: string;
+  sellerLogoDataUrl?: string;
   productionName?: string;
   timesheetNumber: string;
   timesheetDates?: string;
@@ -230,6 +232,7 @@ function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; b
 
 const DEFAULT_PROFILE = {
   fullName: "", role: "", companyName: "", email: "", phone: "", address: "", vatNumber: "",
+  businessLogoDataUrl:     "",
   vatRegistered:          false,
   invoiceLabel:           "Invoice",
   paymentTerms:           "Payment due within 30 days",
@@ -389,6 +392,70 @@ const invoiceBalance = (inv: Partial<Invoice>) => Math.max(safe(inv.total, 0) - 
 const invoiceDetailModeLabel = (mode?: InvoiceDetailMode) =>
   mode === "detailed" ? "Detailed" : mode === "summary_timesheet" ? "Summary + Attached Timesheet" : "Summary";
 
+const LOGO_ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/webp"];
+const MAX_LOGO_FILE_BYTES = 5 * 1024 * 1024;
+const MAX_LOGO_EDGE_PX = 1000;
+const TARGET_LOGO_BYTES = 500 * 1024;
+const MAX_STORED_LOGO_BYTES = 750 * 1024;
+
+const dataUrlBytes = (dataUrl: string) => Math.ceil((dataUrl.split(",")[1]?.length || dataUrl.length) * 0.75);
+const formatBytes = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`;
+
+function loadLogoImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("decode")); };
+    img.src = url;
+  });
+}
+
+function canvasHasTransparency(ctx: CanvasRenderingContext2D, width: number, height: number) {
+  try {
+    const sample = ctx.getImageData(0, 0, width, height).data;
+    for (let i = 3; i < sample.length; i += 4) if (sample[i] < 255) return true;
+  } catch {}
+  return false;
+}
+
+async function prepareBusinessLogo(file: File) {
+  if (!LOGO_ACCEPTED_TYPES.includes(file.type)) throw new Error("Unsupported file type. Upload a PNG, JPG, or WebP logo.");
+  if (file.size > MAX_LOGO_FILE_BYTES) throw new Error(`Logo file is too large. Please upload an image under ${formatBytes(MAX_LOGO_FILE_BYTES)}.`);
+
+  const img = await loadLogoImage(file).catch(() => {
+    throw new Error("The selected file could not be decoded as an image. Try a different PNG, JPG, or WebP file.");
+  });
+  if (!img.naturalWidth || !img.naturalHeight) throw new Error("The selected image appears to be empty or corrupted.");
+
+  const scale = Math.min(1, MAX_LOGO_EDGE_PX / Math.max(img.naturalWidth, img.naturalHeight));
+  const width = Math.max(1, Math.round(img.naturalWidth * scale));
+  const height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("This browser could not prepare the logo image.");
+  ctx.drawImage(img, 0, 0, width, height);
+
+  const hasTransparency = canvasHasTransparency(ctx, width, height);
+  let dataUrl = hasTransparency ? canvas.toDataURL("image/png") : canvas.toDataURL("image/jpeg", 0.88);
+  if (!hasTransparency && dataUrlBytes(dataUrl) > TARGET_LOGO_BYTES) {
+    for (const quality of [0.82, 0.76, 0.7]) {
+      dataUrl = canvas.toDataURL("image/jpeg", quality);
+      if (dataUrlBytes(dataUrl) <= TARGET_LOGO_BYTES) break;
+    }
+  }
+
+  const bytes = dataUrlBytes(dataUrl);
+  if (bytes > MAX_STORED_LOGO_BYTES) throw new Error(`The optimised logo is still too large (${formatBytes(bytes)}). Try a smaller or simpler image.`);
+  return { dataUrl, width, height, bytes, hasTransparency };
+}
+
+const protectedInvoiceStatus = (status?: string) => normalizeInvoiceStatus(status) !== "draft";
+const invoiceLogoForDisplay = (inv: Partial<Invoice>, profile: Profile) =>
+  protectedInvoiceStatus(inv.status) ? (inv.sellerLogoDataUrl || "") : (profile.businessLogoDataUrl || inv.sellerLogoDataUrl || "");
+
 function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile {
   if (!ts) return profile;
   return {
@@ -474,6 +541,7 @@ function normalizeInvoice(i: Partial<Invoice>): Invoice {
     crewName: i.crewName || "",
     role: i.role || "",
     companyName: i.companyName || "",
+    sellerLogoDataUrl: i.sellerLogoDataUrl || "",
     productionName: i.productionName || "",
     timesheetNumber: i.timesheetNumber || "",
     timesheetDates: i.timesheetDates || "",
@@ -523,6 +591,7 @@ function normalizeEntry(e: Partial<TimesheetEntry>, ts?: Partial<Timesheet>): Ti
     equipmentRental: num(e.equipmentRentalUsed ?? e.equipmentRental, p.equipmentRentalDaily ? p.defaultEquipmentRental : 0),
     perDiem: num(e.perDiemUsed ?? e.perDiem, p.defaultPerDiem),
     expenses: num(e.expenses, 0),
+    expenseDescription: e.expenseDescription || "",
     isSunday: e.isSunday ?? false,
     isPublicHoliday: e.isPublicHoliday ?? false,
   };
@@ -769,6 +838,7 @@ const entryDefaults = (profile: Profile, prev?: TimesheetEntry, prodName?: strin
   equipmentRental:  profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0,
   perDiem:          profile.defaultPerDiem,
   expenses:         0,
+  expenseDescription: "",
   dayRateUsed:      profile.defaultDayRate,
   includedHoursUsed: profile.defaultIncludedHours,
   overtimeRuleUsed: profile.defaultOvertimeRule,
@@ -798,56 +868,79 @@ const duplicateEntry = (prev: TimesheetEntry, currentDate: string): Omit<Timeshe
   travelEndTime:    "",
   travelDistance:   "",
   expenses:         0,
+  expenseDescription: "",
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UI PRIMITIVES
 // ═══════════════════════════════════════════════════════════════════════════
 
-const Fld = ({ label, hint, children }: { label?: string; hint?: string; children: React.ReactNode }) => (
-  <div className="space-y-1">
-    {label && <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">{label}</label>}
+const UI = {
+  focus: "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500",
+  card: "bg-white rounded-lg border border-slate-200 shadow-[0_1px_2px_rgba(15,23,42,0.04)]",
+  field: "w-full min-h-10 px-3 py-2 text-sm border border-slate-200 rounded-lg bg-white placeholder:text-slate-300 text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500/25 focus:border-blue-500 disabled:bg-slate-50 disabled:text-slate-400 disabled:cursor-not-allowed aria-[invalid=true]:border-red-300 aria-[invalid=true]:focus:border-red-500 aria-[invalid=true]:focus:ring-red-500/20 transition-colors",
+  tableWrap: "overflow-x-auto scrollbar-thin",
+  table: "w-full min-w-[760px]",
+  th: "px-4 py-3 text-[11px] font-semibold text-slate-500 uppercase text-left whitespace-nowrap bg-slate-50/80 border-b border-slate-200",
+  td: "px-4 py-4 text-sm align-middle",
+  row: "group transition-colors hover:bg-blue-50/50 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500",
+  rowClickable: "group cursor-pointer transition-colors hover:bg-blue-50/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-blue-500",
+};
+
+const Fld = ({ label, hint, required, children }: { label?: string; hint?: string; required?: boolean; children: React.ReactNode }) => (
+  <div className="space-y-1.5">
+    {label && <label className="block text-[11px] font-semibold text-slate-600 uppercase">{label}{required && <span className="ml-1 text-red-500">*</span>}</label>}
     {children}
-    {hint && <p className="text-xs text-gray-400 mt-0.5">{hint}</p>}
+    {hint && <p className="text-xs leading-relaxed text-slate-500">{hint}</p>}
   </div>
 );
 
-const base = "w-full px-3 py-2 text-sm border border-gray-200 rounded-lg bg-white placeholder:text-gray-300 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors";
+const base = UI.field;
 
-const Inp = ({ label, hint, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { label?: string; hint?: string }) =>
-  <Fld label={label} hint={hint}><input className={base} {...p} /></Fld>;
+const Inp = ({ label, hint, className = "", required, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { label?: string; hint?: string }) =>
+  <Fld label={label} hint={hint} required={required}><input className={`${base} ${className}`} required={required} {...p} /></Fld>;
 
-const TInp = ({ label, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { label?: string }) =>
-  <Fld label={label}><input className={`${base} font-mono text-[15px] font-semibold`} type="time" {...p} /></Fld>;
+const TInp = ({ label, className = "", required, ...p }: React.InputHTMLAttributes<HTMLInputElement> & { label?: string }) =>
+  <Fld label={label} required={required}><input className={`${base} font-mono text-[15px] font-semibold ${className}`} type="time" required={required} {...p} /></Fld>;
 
-const SInp = ({ label, hint, children, ...p }: React.SelectHTMLAttributes<HTMLSelectElement> & { label?: string; hint?: string; children: React.ReactNode }) =>
-  <Fld label={label} hint={hint}><select className={base} {...p}>{children}</select></Fld>;
+const SInp = ({ label, hint, children, className = "", required, ...p }: React.SelectHTMLAttributes<HTMLSelectElement> & { label?: string; hint?: string; children: React.ReactNode }) =>
+  <Fld label={label} hint={hint} required={required}><select className={`${base} ${className}`} required={required} {...p}>{children}</select></Fld>;
 
-const TxInp = ({ label, ...p }: React.TextareaHTMLAttributes<HTMLTextAreaElement> & { label?: string }) =>
-  <Fld label={label}><textarea className={`${base} resize-none`} {...p} /></Fld>;
+const TxInp = ({ label, className = "", required, ...p }: React.TextareaHTMLAttributes<HTMLTextAreaElement> & { label?: string }) =>
+  <Fld label={label} required={required}><textarea className={`${base} resize-none ${className}`} required={required} {...p} /></Fld>;
 
 const Tog = ({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string }) => (
-  <label className="flex items-start justify-between gap-4 cursor-pointer py-2 select-none">
-    <div><p className="text-sm font-medium text-gray-800">{label}</p>{hint && <p className="text-xs text-gray-400 mt-0.5">{hint}</p>}</div>
-    <div className="flex-shrink-0" onClick={() => onChange(!checked)}
-      style={{ width: 40, height: 22, background: checked ? "#2563EB" : "#D1D5DB", borderRadius: 11, position: "relative", cursor: "pointer", transition: "background .2s" }}>
-      <div style={{ position: "absolute", width: 18, height: 18, background: "#fff", borderRadius: "50%", top: 2, left: checked ? 20 : 2, transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,.2)" }} />
-    </div>
-  </label>
+  <div className="flex min-h-12 items-center justify-between gap-4 py-2.5">
+    <div className="min-w-0"><p className="text-sm font-medium text-slate-800">{label}</p>{hint && <p className="text-xs leading-relaxed text-slate-500 mt-0.5">{hint}</p>}</div>
+    <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)}
+      className={`relative h-6 w-11 flex-shrink-0 rounded-full transition-colors ${UI.focus} ${checked ? "bg-blue-600" : "bg-slate-300"}`}>
+      <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-0.5"}`} />
+    </button>
+  </div>
 );
 
 const Btn = ({ children, variant = "primary", size = "md", className = "", ...p }: React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: string; size?: string }) => {
-  const v: Record<string, string> = { primary: "bg-blue-600 hover:bg-blue-700 text-white shadow-sm", secondary: "bg-white hover:bg-gray-50 text-gray-700 border border-gray-200 shadow-sm", ghost: "hover:bg-gray-100 text-gray-600", success: "bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm", danger: "bg-red-50 hover:bg-red-100 text-red-600 border border-red-200", amber: "bg-amber-500 hover:bg-amber-600 text-white shadow-sm" };
-  const s: Record<string, string> = { xs: "px-2.5 py-1 text-xs rounded-md", sm: "px-3 py-1.5 text-xs rounded-md", md: "px-4 py-2 text-sm rounded-lg", lg: "px-5 py-2.5 text-sm rounded-xl" };
-  return <button className={`inline-flex items-center gap-2 font-medium transition-colors ${v[variant] || v.primary} ${s[size] || s.md} disabled:opacity-40 disabled:cursor-not-allowed ${className}`} {...p}>{children}</button>;
+  const v: Record<string, string> = { primary: "bg-blue-600 hover:bg-blue-700 text-white shadow-sm", secondary: "bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 shadow-sm", ghost: "hover:bg-slate-100 text-slate-600", success: "bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm", danger: "bg-red-50 hover:bg-red-100 text-red-700 border border-red-200", amber: "bg-amber-500 hover:bg-amber-600 text-white shadow-sm" };
+  const s: Record<string, string> = { xs: "px-2.5 py-1.5 text-xs rounded-md min-h-8", sm: "px-3 py-2 text-xs rounded-md min-h-9", md: "px-4 py-2.5 text-sm rounded-lg min-h-10", lg: "px-5 py-3 text-sm rounded-lg min-h-11" };
+  return <button type={p.type || "button"} className={`inline-flex items-center justify-center gap-2 font-semibold transition-colors ${UI.focus} ${v[variant] || v.primary} ${s[size] || s.md} disabled:opacity-50 disabled:cursor-not-allowed ${className}`} {...p}>{children}</button>;
 };
 
 const Card = ({ children, className = "" }: { children: React.ReactNode; className?: string }) =>
-  <div className={`bg-white rounded-xl border border-gray-200 shadow-sm ${className}`}>{children}</div>;
+  <div className={`${UI.card} ${className}`}>{children}</div>;
 
 const Badge = ({ children, color = "gray" }: { children: React.ReactNode; color?: string }) => {
-  const c: Record<string, string> = { gray: "bg-gray-100 text-gray-700", blue: "bg-blue-100 text-blue-700", green: "bg-green-100 text-green-700", amber: "bg-amber-100 text-amber-800", orange: "bg-orange-100 text-orange-700", purple: "bg-purple-100 text-purple-700", red: "bg-red-100 text-red-700" };
-  return <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${c[color] || c.gray}`}>{children}</span>;
+  const c: Record<string, string> = {
+    gray: "bg-slate-100 text-slate-700 ring-slate-200",
+    neutral: "bg-slate-100 text-slate-700 ring-slate-200",
+    blue: "bg-blue-50 text-blue-700 ring-blue-200",
+    teal: "bg-teal-50 text-teal-700 ring-teal-200",
+    green: "bg-emerald-50 text-emerald-700 ring-emerald-200",
+    amber: "bg-amber-50 text-amber-800 ring-amber-200",
+    orange: "bg-orange-50 text-orange-700 ring-orange-200",
+    purple: "bg-purple-50 text-purple-700 ring-purple-200",
+    red: "bg-red-50 text-red-700 ring-red-200",
+  };
+  return <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-[11px] font-semibold leading-none ring-1 ${c[color] || c.gray}`}>{children}</span>;
 };
 
 const SRow = ({ label, value, bold, amber, indent }: { label: string; value: React.ReactNode; bold?: boolean; amber?: boolean; indent?: boolean }) => (
@@ -864,6 +957,59 @@ const AlertBox = ({ type = "info", children }: { type?: string; children: React.
   return <div className={`flex items-start gap-2.5 p-3 rounded-lg border text-sm ${t[type] || t.info}`}><Icon size={15} className="flex-shrink-0 mt-0.5" /><div>{children}</div></div>;
 };
 
+const IconButton = ({ label, variant = "ghost", className = "", children, ...p }: React.ButtonHTMLAttributes<HTMLButtonElement> & { label: string; variant?: "ghost" | "danger" | "primary"; children: React.ReactNode }) => {
+  const tone = variant === "danger"
+    ? "text-slate-400 hover:text-red-600 hover:bg-red-50 focus-visible:text-red-600"
+    : variant === "primary"
+      ? "text-slate-400 hover:text-blue-600 hover:bg-blue-50 focus-visible:text-blue-600"
+      : "text-slate-400 hover:text-slate-700 hover:bg-slate-100 focus-visible:text-slate-700";
+  return <button type={p.type || "button"} aria-label={label} title={label} className={`inline-flex h-9 w-9 items-center justify-center rounded-md transition-colors ${UI.focus} ${tone} ${className}`} {...p}>{children}</button>;
+};
+
+function PageHeader({ title, description, actions, secondaryActions, badge }: { title: React.ReactNode; description?: React.ReactNode; actions?: React.ReactNode; secondaryActions?: React.ReactNode; badge?: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="truncate text-2xl font-bold tracking-tight text-slate-950">{title}</h1>
+          {badge}
+        </div>
+        {description && <p className="mt-1 text-sm leading-relaxed text-slate-500">{description}</p>}
+        {secondaryActions && <div className="mt-3 flex flex-wrap gap-2">{secondaryActions}</div>}
+      </div>
+      {actions && <div className="flex flex-wrap items-center gap-2 sm:justify-end">{actions}</div>}
+    </div>
+  );
+}
+
+function SectionCard({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+  return (
+    <Card className="p-5 sm:p-6">
+      <div className="mb-5">
+        <h2 className="text-base font-bold text-slate-950">{title}</h2>
+        {description && <p className="mt-1 text-sm leading-relaxed text-slate-500">{description}</p>}
+      </div>
+      {children}
+    </Card>
+  );
+}
+
+function MetricCard({ label, value, detail, tone = "slate", icon: Icon }: { label: string; value: React.ReactNode; detail: React.ReactNode; tone?: "slate" | "blue" | "green" | "red" | "orange"; icon: React.ElementType }) {
+  const tones: Record<string, string> = { slate: "text-slate-900 bg-slate-100", blue: "text-blue-700 bg-blue-50", green: "text-emerald-700 bg-emerald-50", red: "text-red-700 bg-red-50", orange: "text-orange-700 bg-orange-50" };
+  return (
+    <Card className="p-4 sm:p-5 min-h-32">
+      <div className="flex h-full items-start justify-between gap-4">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold uppercase text-slate-500">{label}</p>
+          <p className={`mt-3 truncate text-2xl font-bold tabular-nums ${tones[tone]?.split(" ")[0] || "text-slate-900"}`}>{value}</p>
+          <p className="mt-2 text-sm text-slate-500">{detail}</p>
+        </div>
+        <span className={`flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg ${tones[tone] || tones.slate}`}><Icon size={16}/></span>
+      </div>
+    </Card>
+  );
+}
+
 function ProductionRateFields({ rates, onChange, currency }: { rates: RateDraft; onChange: (rates: RateDraft) => void; currency: string }) {
   const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[currency] || "R";
   const setN = (k: keyof RateDraft) => (e: React.ChangeEvent<HTMLInputElement>) => onChange({ ...rates, [k]: num(e.target.value) });
@@ -873,29 +1019,29 @@ function ProductionRateFields({ rates, onChange, currency }: { rates: RateDraft;
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Inp label={`Day Rate (${sym})`} type="number" min="0" value={rates.dayRate || ""} onChange={setN("dayRate")} />
         <Inp label="Included Hours" type="number" min="1" value={rates.includedHours || ""} onChange={setN("includedHours")} />
       </div>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <SInp label="Overtime Rule" value={rates.overtimeRule} onChange={setS("overtimeRule") as any}>
           {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string }][]).map(([id, preset]) => <option key={id} value={id}>{preset.name}</option>)}
         </SInp>
         <Inp label="Minimum Turnaround (hrs)" type="number" min="0" value={rates.minTurnaround || ""} onChange={setN("minTurnaround")} />
       </div>
       {isCustom && (
-        <div className="grid grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Inp label="Band 1 hrs" type="number" min="0" value={rates.otBand1Hours || ""} onChange={setN("otBand1Hours")} />
           <Inp label="Band 1 mult" type="number" min="0" step="0.1" value={rates.otBand1Mult || ""} onChange={setN("otBand1Mult")} />
           <Inp label="Band 2 mult" type="number" min="0" step="0.1" value={rates.otBand2Mult || ""} onChange={setN("otBand2Mult")} />
         </div>
       )}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <Inp label={`Equipment / day (${sym})`} type="number" min="0" value={rates.equipmentRental || ""} onChange={setN("equipmentRental")} />
         <Inp label={`Per Diem (${sym})`} type="number" min="0" value={rates.perDiem || ""} onChange={setN("perDiem")} />
         <Inp label="VAT %" type="number" min="0" max="100" value={rates.vat || ""} onChange={setN("vat")} />
       </div>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <SInp label="Short Turnaround" value={rates.turnaroundMode} onChange={setS("turnaroundMode") as any}>
           <option value="warning">Show warning only</option>
           <option value="penalty">Charge penalty automatically</option>
@@ -933,161 +1079,290 @@ function ToastContainer({ toasts }: { toasts: ToastMsg[] }) {
 // SETTINGS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
+type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking";
+
 function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profile) => void }) {
   const [f, setF] = useState<Profile>({ ...DEFAULT_PROFILE, ...profile });
-  const [tab, setTab] = useState("profile");
+  const [tab, setTab] = useState<SettingsTabId>("profile");
   const [saved, setSaved] = useState(false);
+  const [logoMessage, setLogoMessage] = useState<{ type: "error" | "info"; text: string } | null>(null);
+  const [logoBusy, setLogoBusy] = useState(false);
+  const logoInputId = "business-logo-upload";
   const set  = (k: keyof Profile) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setF(p => ({ ...p, [k]: e.target.value }));
   const setN = (k: keyof Profile) => (e: React.ChangeEvent<HTMLInputElement>) => setF(p => ({ ...p, [k]: parseFloat(e.target.value) || 0 }));
   const setT = (k: keyof Profile) => (v: boolean) => setF(p => ({ ...p, [k]: v }));
-  const save = () => { onSave(f); setSaved(true); setTimeout(() => setSaved(false), 2500); };
+  const savedProfile = useMemo(() => ({ ...DEFAULT_PROFILE, ...profile }), [profile]);
+  const hasUnsavedChanges = useMemo(() => JSON.stringify(f) !== JSON.stringify(savedProfile), [f, savedProfile]);
+  const save = () => {
+    try {
+      window.localStorage?.setItem("cqp-profile", JSON.stringify(f));
+    } catch {
+      setLogoMessage({ type: "error", text: "Settings could not be saved because browser storage is full. Try removing the logo or uploading a smaller image." });
+      return;
+    }
+    onSave(f);
+    setSaved(true);
+    setLogoMessage(null);
+    setTimeout(() => setSaved(false), 2500);
+  };
+  const handleLogoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setLogoBusy(true);
+    setLogoMessage(null);
+    try {
+      const logo = await prepareBusinessLogo(file);
+      setF(p => ({ ...p, businessLogoDataUrl: logo.dataUrl }));
+      setLogoMessage({ type: "info", text: `Logo ready to save. Optimised to ${logo.width} x ${logo.height}px, ${formatBytes(logo.bytes)}.` });
+    } catch (err) {
+      setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "The logo could not be processed. Try a different image." });
+    } finally {
+      setLogoBusy(false);
+    }
+  };
+  const removeLogo = () => {
+    if (!f.businessLogoDataUrl) return;
+    if (!confirm("Remove the saved business logo from Settings?")) return;
+    setF(p => ({ ...p, businessLogoDataUrl: "" }));
+    setLogoMessage({ type: "info", text: "Logo removed. Save Settings to keep this change." });
+  };
   const sym  = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[f.defaultCurrency] || "R";
   const isCustom = f.defaultOvertimeRule === "custom";
-  const TABS = [["profile", "My Business Details"], ["rates", "Default Rates"], ["overtime", "Overtime & Turnaround"], ["timesheet", "Timesheet"], ["banking", "Banking"]];
+  const sections: { id: SettingsTabId; label: string; desc: string; icon: React.ElementType }[] = [
+    { id: "profile", label: "My Business Details", desc: "Your name, role, company, and contact details.", icon: Users },
+    { id: "invoice", label: "Invoice settings", desc: "Invoice label, VAT details, and default payment terms.", icon: FileText },
+    { id: "rates", label: "Default Rates", desc: "Day rate, included hours, kit, per diem, currency, and VAT rate.", icon: Receipt },
+    { id: "overtime", label: "Overtime & Turnaround", desc: "Overtime preset, custom bands, and turnaround handling.", icon: Zap },
+    { id: "timesheet", label: "Timesheet", desc: "Default meal, travel, and equipment rules.", icon: Clock },
+    { id: "banking", label: "Banking", desc: "Payment details printed on invoices.", icon: Building2 },
+  ];
+  const activeSection = sections.find(s => s.id === tab) || sections[0];
+  const ActiveIcon = activeSection.icon;
 
   return (
-    <div className="max-w-2xl space-y-5">
-      <div className="flex items-start justify-between">
-        <div><h1 className="text-xl font-bold text-gray-900">Settings</h1><p className="text-sm text-gray-500 mt-0.5">Set your business details once so timesheets and invoices fill themselves in.</p></div>
-        {saved ? <span className="inline-flex items-center gap-1.5 px-3 py-2 bg-green-50 text-green-700 text-sm font-medium rounded-lg border border-green-200"><CheckCircle size={14} /> Saved</span>
-               : <Btn onClick={save}><Save size={14} /> Save Settings</Btn>}
-      </div>
+    <div className="space-y-5">
+      <PageHeader
+        title="Settings"
+        description="Set your business details once so timesheets and invoices fill themselves in."
+      />
 
-      <div className="flex border-b border-gray-200 overflow-x-auto">
-        {TABS.map(([id, lbl]) => (
-          <button key={id} onClick={() => setTab(id)}
-            className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors whitespace-nowrap ${tab === id ? "border-blue-600 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-800"}`}>
-            {lbl}
-          </button>
-        ))}
-      </div>
+      <div className="grid gap-5 lg:grid-cols-[232px_minmax(0,1fr)]">
+        <aside className="hidden lg:block">
+          <nav className="sticky top-0 space-y-1">
+            {sections.map(({ id, label, desc, icon: Icon }) => {
+              const active = tab === id;
+              return (
+                <button key={id} type="button" onClick={() => setTab(id)}
+                  className={`w-full rounded-lg px-3 py-3 text-left transition-colors ${UI.focus} ${active ? "bg-slate-900 text-white shadow-sm" : "text-slate-600 hover:bg-white hover:text-slate-950 hover:shadow-sm"}`}>
+                  <span className="flex items-center gap-2.5">
+                    <Icon size={16} className={active ? "text-blue-200" : "text-slate-400"} />
+                    <span className="text-sm font-semibold">{label}</span>
+                  </span>
+                  <span className={`mt-1 block pl-6 text-xs leading-relaxed ${active ? "text-slate-300" : "text-slate-500"}`}>{desc}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </aside>
 
-      <Card className="p-5">
-        {tab === "profile" && (
-          <div className="space-y-4">
-            <AlertBox type="info">These seller details appear on every invoice you create.</AlertBox>
-            <Inp label="Full Name"             value={f.fullName}    onChange={set("fullName")}    placeholder="Your full name" />
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label="Role"                 value={f.role}        onChange={set("role")}        placeholder="e.g. Sound Mixer" />
-              <Inp label="Trading / Company Name" value={f.companyName} onChange={set("companyName")} />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label="Email" type="email"   value={f.email}       onChange={set("email")} />
-              <Inp label="Phone" type="tel"     value={f.phone}       onChange={set("phone")} />
-            </div>
-            <TxInp label="Address"             value={f.address}     onChange={set("address")} rows={2} placeholder="Street, city, postal code" />
-            <div className="grid grid-cols-2 gap-4">
-              <SInp label="Invoice Label" value={f.invoiceLabel} onChange={set("invoiceLabel")}>
-                <option value="Invoice">Invoice</option>
-                <option value="Tax Invoice">Tax Invoice</option>
-              </SInp>
-              <Inp label="VAT / Tax Number" value={f.vatNumber} onChange={set("vatNumber")} placeholder="Your VAT registration number" />
-            </div>
-            <Tog checked={f.vatRegistered} onChange={setT("vatRegistered")} label="VAT registered" hint="When enabled, invoices show subtotal excluding VAT, VAT amount, and total including VAT" />
-            <TxInp label="Payment Terms"         value={f.paymentTerms} onChange={set("paymentTerms")} rows={2} placeholder="e.g. Payment due within 30 days" />
-          </div>
-        )}
-
-        {tab === "rates" && (
-          <div className="space-y-4">
-            <AlertBox type="info">These rates auto-fill every timesheet day. Overtime is calculated automatically from your day rate and included hours.</AlertBox>
-            <SInp label="Default Currency" value={f.defaultCurrency} onChange={set("defaultCurrency")}>
-              {[["ZAR","South African Rand"],["USD","US Dollar"],["GBP","British Pound"],["EUR","Euro"]].map(([k,n]) => <option key={k} value={k}>{k} — {n}</option>)}
+        <div className="min-w-0 max-w-[1100px] space-y-5">
+          <div className="lg:hidden">
+            <SInp label="Settings Section" value={tab} onChange={e => setTab(e.target.value as SettingsTabId)}>
+              {sections.map(s => <option key={s.id} value={s.id}>{s.label}</option>)}
             </SInp>
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label={`Day Rate (${sym})`}       type="number" value={f.defaultDayRate      || ""} onChange={setN("defaultDayRate")}      placeholder="0.00" min="0" />
-              <Inp label="Included Hours / Day"       type="number" value={f.defaultIncludedHours|| ""} onChange={setN("defaultIncludedHours")} placeholder="10"   min="1"
-                hint="Hours included in your day rate. Overtime starts after this." />
-            </div>
-            <div className="p-3 bg-blue-50 rounded-lg border border-blue-100 text-sm text-blue-800">
-              Base hourly rate: <strong>{fmtMoney(f.defaultDayRate && f.defaultIncludedHours ? f.defaultDayRate / f.defaultIncludedHours : 0, f.defaultCurrency)}/hr</strong>
-              {f.defaultDayRate > 0 && f.defaultIncludedHours > 0 && ` (${fmtMoney(f.defaultDayRate, f.defaultCurrency)} ÷ ${f.defaultIncludedHours}h)`}
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label={`Equipment / day (${sym})`} type="number" value={f.defaultEquipmentRental || ""} onChange={setN("defaultEquipmentRental")} placeholder="0.00" min="0" />
-              <Inp label={`Per Diem (${sym})`}        type="number" value={f.defaultPerDiem        || ""} onChange={setN("defaultPerDiem")}        placeholder="0.00" min="0" />
-            </div>
-            <Inp label="Default VAT %"               type="number" value={f.defaultVat           || ""} onChange={setN("defaultVat")}            placeholder="0"    min="0" max="100" />
           </div>
-        )}
 
-        {tab === "overtime" && (
-          <div className="space-y-5">
-            <div>
-              <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-2">Overtime Rule Preset</p>
-              <p className="text-xs text-gray-400 mb-3">Overtime is calculated automatically: Base rate = Day rate ÷ Included hours.</p>
-              <div className="space-y-2">
-                {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string; desc: string }][]).map(([id, preset]) => (
-                  <label key={id} className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${f.defaultOvertimeRule === id ? "border-blue-500 bg-blue-50" : "border-gray-200 hover:border-gray-300"}`}>
-                    <input type="radio" name="otRule" value={id} checked={f.defaultOvertimeRule === id}
-                      onChange={() => setF(p => ({ ...p, defaultOvertimeRule: id }))} className="mt-0.5 text-blue-600" />
-                    <div><p className="text-sm font-semibold text-gray-900">{preset.name}</p><p className="text-xs text-gray-500 mt-0.5">{preset.desc}</p></div>
-                  </label>
-                ))}
+          <div className="sticky top-0 z-20 -mx-1 rounded-lg border border-slate-200 bg-slate-50/95 p-3 shadow-sm backdrop-blur">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-50 text-blue-700"><ActiveIcon size={15}/></span>
+                  <div>
+                    <h2 className="text-base font-bold text-slate-950">{activeSection.label}</h2>
+                    <p className="text-xs text-slate-500">{activeSection.desc}</p>
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                {hasUnsavedChanges && <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 ring-1 ring-amber-200">Unsaved changes</span>}
+                {saved && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200"><CheckCircle size={13}/> Settings saved successfully.</span>}
+                <Btn onClick={save}><Save size={14} /> Save Settings</Btn>
               </div>
             </div>
+          </div>
 
-            {isCustom && (
-              <div className="p-4 bg-gray-50 rounded-lg border border-gray-200 space-y-3">
-                <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Custom Overtime Bands</p>
-                <div className="grid grid-cols-3 gap-3">
-                  <Inp label="Band 1 Length (hrs)" type="number" min="0" value={f.defaultOtBand1Hours || ""} onChange={setN("defaultOtBand1Hours")} placeholder="4" hint="First N OT hours" />
-                  <Inp label="Band 1 Multiplier"   type="number" min="0" step="0.1" value={f.defaultOtBand1Mult || ""} onChange={setN("defaultOtBand1Mult")} placeholder="1.5" />
-                  <Inp label="Band 2 Multiplier"   type="number" min="0" step="0.1" value={f.defaultOtBand2Mult || ""} onChange={setN("defaultOtBand2Mult")} placeholder="2.0" hint="After band 1" />
+          {tab === "profile" && (
+            <div className="space-y-5">
+              <SectionCard title="Business identity" description="These details identify you on timesheets and invoices.">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div className="md:col-span-2"><Inp label="Full Name" value={f.fullName} onChange={set("fullName")} placeholder="Your full name" /></div>
+                  <Inp label="Role" value={f.role} onChange={set("role")} placeholder="e.g. Sound Mixer" />
+                  <Inp label="Trading / Company Name" value={f.companyName} onChange={set("companyName")} />
                 </div>
-              </div>
-            )}
+              </SectionCard>
 
-            <div className="border-t border-gray-100 pt-4">
-              <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Turnaround</p>
-              <div className="grid grid-cols-2 gap-4 mb-4">
-                <Inp label="Minimum Turnaround Hours" type="number" min="0" value={f.defaultMinTurnaround || ""} onChange={setN("defaultMinTurnaround")} placeholder="10" />
-                <SInp label="When turnaround is short" value={f.defaultTurnaroundMode} onChange={set("defaultTurnaroundMode") as any}>
-                  <option value="warning">Show warning only</option>
-                  <option value="penalty">Charge penalty automatically</option>
-                  <option value="manual">Manual approval required</option>
-                </SInp>
-              </div>
-              {f.defaultTurnaroundMode === "penalty" && (
-                <div className="p-3 bg-amber-50 rounded-lg border border-amber-200 space-y-3">
-                  <p className="text-xs text-amber-800">Shortfall hours × base hourly rate × penalty multiplier will be added to the day.</p>
-                  <Inp label="Turnaround Penalty Multiplier" type="number" min="0" step="0.1" value={f.defaultTurnaroundPenMult || ""} onChange={setN("defaultTurnaroundPenMult")} placeholder="1.5" />
+              <SectionCard title="Contact details" description="Used as seller contact details on generated documents.">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <Inp label="Email" type="email" value={f.email} onChange={set("email")} />
+                  <Inp label="Phone" type="tel" value={f.phone} onChange={set("phone")} />
+                  <div className="md:col-span-2"><TxInp label="Address" value={f.address} onChange={set("address")} rows={3} placeholder="Street, city, postal code" /></div>
                 </div>
+              </SectionCard>
+            </div>
+          )}
+
+          {tab === "invoice" && (
+            <div className="space-y-5">
+              <SectionCard title="Business logo" description="Your logo will appear on invoice PDFs. PNG, JPG, or WebP. A transparent PNG works best.">
+                <div className="grid grid-cols-1 lg:grid-cols-[280px_minmax(0,1fr)] gap-5">
+                  <div>
+                    <div
+                      className="flex h-36 w-full max-w-[280px] items-center justify-center rounded-lg border border-slate-200 bg-white p-4"
+                      style={{ backgroundImage: "linear-gradient(45deg,#f8fafc 25%,transparent 25%),linear-gradient(-45deg,#f8fafc 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#f8fafc 75%),linear-gradient(-45deg,transparent 75%,#f8fafc 75%)", backgroundSize: "16px 16px", backgroundPosition: "0 0,0 8px,8px -8px,-8px 0" }}
+                    >
+                      {f.businessLogoDataUrl
+                        ? <img src={f.businessLogoDataUrl} alt="Current business logo preview" className="max-h-full max-w-full object-contain" />
+                        : <div className="text-center text-sm text-slate-400"><Building2 size={22} className="mx-auto mb-2 text-slate-300"/>No logo uploaded</div>}
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    <Fld label="Business Logo" hint={`Accepted formats: PNG, JPG, WebP. Original file limit: ${formatBytes(MAX_LOGO_FILE_BYTES)}. Stored logo limit: ${formatBytes(MAX_STORED_LOGO_BYTES)}.`}>
+                      <input
+                        id={logoInputId}
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        onChange={handleLogoFile}
+                        disabled={logoBusy}
+                        className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100`}
+                      />
+                    </Fld>
+                    <div className="flex flex-wrap gap-2">
+                      <Btn variant="secondary" onClick={() => document.getElementById(logoInputId)?.click()} disabled={logoBusy}>{logoBusy ? "Processing..." : "Replace Logo"}</Btn>
+                      <Btn variant="danger" onClick={removeLogo} disabled={!f.businessLogoDataUrl || logoBusy}>Remove Logo</Btn>
+                    </div>
+                    {logoMessage && (
+                      <div className={`rounded-lg border px-3 py-2 text-sm ${logoMessage.type === "error" ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"}`}>
+                        {logoMessage.text}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Invoice defaults" description="These settings appear on every invoice you create.">
+                <div className="space-y-5">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <SInp label="Invoice Label" value={f.invoiceLabel} onChange={set("invoiceLabel")}>
+                      <option value="Invoice">Invoice</option>
+                      <option value="Tax Invoice">Tax Invoice</option>
+                    </SInp>
+                    <Inp label="VAT / Tax Number" value={f.vatNumber} onChange={set("vatNumber")} placeholder="Your VAT registration number" />
+                  </div>
+                  <div className="rounded-lg border border-slate-200 px-4 py-2">
+                    <Tog checked={f.vatRegistered} onChange={setT("vatRegistered")} label="VAT registered" hint="When enabled, invoices show subtotal excluding VAT, VAT amount, and total including VAT." />
+                  </div>
+                  <TxInp label="Payment Terms" value={f.paymentTerms} onChange={set("paymentTerms")} rows={3} placeholder="e.g. Payment due within 30 days" />
+                </div>
+              </SectionCard>
+            </div>
+          )}
+
+          {tab === "rates" && (
+            <div className="space-y-5">
+              <SectionCard title="Default day rates" description="These rates auto-fill new timesheets and days.">
+                <div className="space-y-5">
+                  <SInp label="Default Currency" value={f.defaultCurrency} onChange={set("defaultCurrency")}>
+                    {[["ZAR","South African Rand"],["USD","US Dollar"],["GBP","British Pound"],["EUR","Euro"]].map(([k,n]) => <option key={k} value={k}>{k} - {n}</option>)}
+                  </SInp>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <Inp label={`Day Rate (${sym})`} type="number" value={f.defaultDayRate || ""} onChange={setN("defaultDayRate")} placeholder="0.00" min="0" />
+                    <Inp label="Included Hours / Day" type="number" value={f.defaultIncludedHours || ""} onChange={setN("defaultIncludedHours")} placeholder="10" min="1" hint="Hours included in your day rate. Overtime starts after this." />
+                  </div>
+                  <div className="rounded-lg border border-blue-100 bg-blue-50 p-4 text-sm text-blue-800">
+                    Base hourly rate: <strong>{fmtMoney(f.defaultDayRate && f.defaultIncludedHours ? f.defaultDayRate / f.defaultIncludedHours : 0, f.defaultCurrency)}/hr</strong>
+                    {f.defaultDayRate > 0 && f.defaultIncludedHours > 0 && ` (${fmtMoney(f.defaultDayRate, f.defaultCurrency)} / ${f.defaultIncludedHours}h)`}
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <Inp label={`Equipment / day (${sym})`} type="number" value={f.defaultEquipmentRental || ""} onChange={setN("defaultEquipmentRental")} placeholder="0.00" min="0" />
+                    <Inp label={`Per Diem (${sym})`} type="number" value={f.defaultPerDiem || ""} onChange={setN("defaultPerDiem")} placeholder="0.00" min="0" />
+                    <Inp label="Default VAT %" type="number" value={f.defaultVat || ""} onChange={setN("defaultVat")} placeholder="0" min="0" max="100" />
+                  </div>
+                </div>
+              </SectionCard>
+            </div>
+          )}
+
+          {tab === "overtime" && (
+            <div className="space-y-5">
+              <SectionCard title="Overtime rule preset" description="Overtime is calculated automatically from your day rate and included hours.">
+                <div className="space-y-3">
+                  {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string; desc: string }][]).map(([id, preset]) => (
+                    <label key={id} className={`flex items-start gap-3 rounded-lg border p-4 cursor-pointer transition-colors ${f.defaultOvertimeRule === id ? "border-blue-500 bg-blue-50" : "border-slate-200 hover:border-slate-300 hover:bg-slate-50"}`}>
+                      <input type="radio" name="otRule" value={id} checked={f.defaultOvertimeRule === id}
+                        onChange={() => setF(p => ({ ...p, defaultOvertimeRule: id }))} className="mt-1 h-4 w-4 text-blue-600 focus:ring-blue-500" />
+                      <div><p className="text-sm font-semibold text-slate-900">{preset.name}</p><p className="text-sm leading-relaxed text-slate-500 mt-0.5">{preset.desc}</p></div>
+                    </label>
+                  ))}
+                </div>
+              </SectionCard>
+
+              {isCustom && (
+                <SectionCard title="Custom overtime bands" description="Used only when the Custom Rule preset is selected.">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <Inp label="Band 1 Length (hrs)" type="number" min="0" value={f.defaultOtBand1Hours || ""} onChange={setN("defaultOtBand1Hours")} placeholder="4" hint="First N OT hours" />
+                    <Inp label="Band 1 Multiplier" type="number" min="0" step="0.1" value={f.defaultOtBand1Mult || ""} onChange={setN("defaultOtBand1Mult")} placeholder="1.5" />
+                    <Inp label="Band 2 Multiplier" type="number" min="0" step="0.1" value={f.defaultOtBand2Mult || ""} onChange={setN("defaultOtBand2Mult")} placeholder="2.0" hint="After band 1" />
+                  </div>
+                </SectionCard>
               )}
-            </div>
-          </div>
-        )}
 
-        {tab === "timesheet" && (
-          <div className="space-y-2">
-            <div className="divide-y divide-gray-100">
-              <Tog checked={f.mealBreaksDeducted}   onChange={setT("mealBreaksDeducted")}   label="Meal breaks are deducted"       hint="Meal break time is subtracted from on-set hours before calculating paid time" />
-              <Tog checked={f.travelTimePaid}       onChange={setT("travelTimePaid")}       label="Travel time is paid"            hint="Travel hours count toward paid hours for overtime calculation" />
-              <Tog checked={f.equipmentRentalDaily} onChange={setT("equipmentRentalDaily")} label="Equipment rental applies daily" hint="Your default equipment rental rate is added to every shoot day automatically" />
+              <SectionCard title="Turnaround" description="Control what happens when the gap between wrap and the next call is short.">
+                <div className="space-y-5">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <Inp label="Minimum Turnaround Hours" type="number" min="0" value={f.defaultMinTurnaround || ""} onChange={setN("defaultMinTurnaround")} placeholder="10" />
+                    <SInp label="When turnaround is short" value={f.defaultTurnaroundMode} onChange={set("defaultTurnaroundMode") as any}>
+                      <option value="warning">Show warning only</option>
+                      <option value="penalty">Charge penalty automatically</option>
+                      <option value="manual">Manual approval required</option>
+                    </SInp>
+                  </div>
+                  {f.defaultTurnaroundMode === "penalty" && (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 space-y-3">
+                      <p className="text-sm text-amber-900">Shortfall hours x base hourly rate x penalty multiplier will be added to the day.</p>
+                      <Inp label="Turnaround Penalty Multiplier" type="number" min="0" step="0.1" value={f.defaultTurnaroundPenMult || ""} onChange={setN("defaultTurnaroundPenMult")} placeholder="1.5" />
+                    </div>
+                  )}
+                </div>
+              </SectionCard>
             </div>
-          </div>
-        )}
+          )}
 
-        {tab === "banking" && (
-          <div className="space-y-4">
-            <AlertBox type="info">These details appear on every invoice you generate.</AlertBox>
-            <Inp label="Account Holder"      value={f.bankAccountName}   onChange={set("bankAccountName")} />
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label="Bank Name"          value={f.bankName}          onChange={set("bankName")} />
-              <Inp label="Account Number"     value={f.bankAccountNumber} onChange={set("bankAccountNumber")} />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label="Branch / Sort Code" value={f.bankBranchCode}   onChange={set("bankBranchCode")} />
-              <Inp label="SWIFT / BIC"        value={f.bankSwift}        onChange={set("bankSwift")} />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              <Inp label="IBAN"              value={f.bankIban}         onChange={set("bankIban")} />
-              <Inp label="Payment Reference" value={f.bankReference}    onChange={set("bankReference")} placeholder="e.g. Invoice number" />
-            </div>
-          </div>
-        )}
-      </Card>
-      <div className="flex justify-end"><Btn onClick={save} size="lg"><Save size={15} /> Save Settings</Btn></div>
+          {tab === "timesheet" && (
+            <SectionCard title="Timesheet defaults" description="These switches decide how new timesheet days behave by default.">
+              <div className="divide-y divide-slate-100">
+                <Tog checked={f.mealBreaksDeducted} onChange={setT("mealBreaksDeducted")} label="Meal breaks are deducted" hint="Meal break time is subtracted from on-set hours before calculating paid time." />
+                <Tog checked={f.travelTimePaid} onChange={setT("travelTimePaid")} label="Travel time is paid" hint="Travel hours count toward paid hours for overtime calculation." />
+                <Tog checked={f.equipmentRentalDaily} onChange={setT("equipmentRentalDaily")} label="Equipment rental applies daily" hint="Your default equipment rental rate is added to every shoot day automatically." />
+              </div>
+            </SectionCard>
+          )}
+
+          {tab === "banking" && (
+            <SectionCard title="Banking details" description="These payment details appear on invoices you generate.">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="md:col-span-2"><Inp label="Account Holder" value={f.bankAccountName} onChange={set("bankAccountName")} /></div>
+                <Inp label="Bank Name" value={f.bankName} onChange={set("bankName")} />
+                <Inp label="Account Number" value={f.bankAccountNumber} onChange={set("bankAccountNumber")} />
+                <Inp label="Branch / Sort Code" value={f.bankBranchCode} onChange={set("bankBranchCode")} />
+                <Inp label="SWIFT / BIC" value={f.bankSwift} onChange={set("bankSwift")} />
+                <Inp label="IBAN" value={f.bankIban} onChange={set("bankIban")} />
+                <Inp label="Payment Reference" value={f.bankReference} onChange={set("bankReference")} placeholder="e.g. Invoice number" />
+              </div>
+            </SectionCard>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -1101,22 +1376,22 @@ function ClientFields({ client, onChange }: { client: Client; onChange: (c: Clie
   const setPaymentTerms = (e: React.ChangeEvent<HTMLInputElement>) => onChange({ ...client, paymentTerms: e.target.value, defaultPaymentTerms: e.target.value });
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        <Inp label="Company / Client Name" value={client.companyName} onChange={set("companyName")} placeholder="e.g. Homebrew Films" />
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Inp label="Company / Client Name" value={client.companyName} onChange={set("companyName")} placeholder="e.g. Homebrew Films" required />
         <Inp label="Contact Person" value={client.contactPerson} onChange={set("contactPerson")} placeholder="Accounts or producer" />
       </div>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Inp label="Email" type="email" value={client.email} onChange={set("email")} />
         <Inp label="Phone" type="tel" value={client.phone} onChange={set("phone")} />
         <Inp label="Accounts Email" type="email" value={client.accountsEmail} onChange={set("accountsEmail")} placeholder="accounts@example.com" />
         <Inp label="Vendor Number" value={client.vendorNumber} onChange={set("vendorNumber")} placeholder="Optional" />
       </div>
       <TxInp label="Billing Address" value={client.billingAddress} onChange={set("billingAddress")} rows={2} placeholder="Registered billing address" />
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Inp label="VAT Number" value={client.vatNumber} onChange={set("vatNumber")} placeholder="Optional" />
         <Inp label="Payment Terms" value={client.paymentTerms || client.defaultPaymentTerms} onChange={setPaymentTerms} placeholder="Optional" />
       </div>
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <SInp label="Preferred Invoice Detail" value={client.preferredInvoiceDetailMode} onChange={e => onChange({ ...client, preferredInvoiceDetailMode: e.target.value as InvoiceDetailMode })}>
           <option value="summary">Summary</option>
           <option value="detailed">Detailed</option>
@@ -1160,19 +1435,20 @@ function ClientsPage({ clients, onSave, onShowToast }: {
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
-        <div><h1 className="text-xl font-bold text-gray-900">Clients</h1><p className="text-sm text-gray-500 mt-0.5">Saved bill-to companies and people for invoices.</p></div>
-        <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
-      </div>
+      <PageHeader
+        title="Clients"
+        description="Saved bill-to companies and people for invoices."
+        actions={<Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>}
+      />
 
       {draft && (
-        <Card className="p-5 max-w-3xl">
-          <div className="flex items-start justify-between mb-4">
+        <Card className="p-5 sm:p-6 max-w-5xl">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between mb-5">
             <div>
-              <p className="text-sm font-bold text-gray-900">{clients.some(c => c.id === draft.id) ? "Edit Client" : "Add Client"}</p>
-              <p className="text-xs text-gray-400 mt-0.5">Client records are for invoice recipients only.</p>
+              <p className="text-base font-bold text-slate-950">{clients.some(c => c.id === draft.id) ? "Edit Client" : "Add Client"}</p>
+              <p className="text-sm text-slate-500 mt-0.5">Client records are for invoice recipients only.</p>
             </div>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Btn variant="secondary" size="sm" onClick={cancel}>{"\u2190"} Back to Clients</Btn>
               <Btn size="sm" onClick={saveClient}><Save size={13}/> Save Client</Btn>
             </div>
@@ -1190,27 +1466,27 @@ function ClientsPage({ clients, onSave, onShowToast }: {
             <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead><tr className="border-b border-gray-200">{["Client","Contact","Email","Billing",""].map((h,i) => <th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i === 4 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
-              <tbody className="divide-y divide-gray-50">
+          <div className={UI.tableWrap}>
+            <table className={UI.table}>
+              <thead><tr>{["Client","Contact","Email","Billing",""].map((h,i) => <th key={i} className={`${UI.th} ${i === 4 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
+              <tbody className="divide-y divide-slate-100">
                 {[...clients].sort((a,b) => clientName(a).localeCompare(clientName(b))).map(client => {
                   const complete = clientBillingComplete(client);
                   return (
-                    <tr key={client.id} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-4 py-3.5">
+                    <tr key={client.id} role="button" tabIndex={0} className={UI.rowClickable} onClick={() => startEdit(client)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); startEdit(client); } }}>
+                      <td className={UI.td}>
                         <div className="flex items-center gap-2">
-                          <button onClick={() => startEdit(client)} className="text-sm font-semibold text-blue-600 hover:text-blue-800">{client.companyName || "Unnamed client"}</button>
+                          <span className="text-sm font-semibold text-blue-700 group-hover:text-blue-800">{client.companyName || "Unnamed client"}</span>
                           {!complete && <Badge color="amber">Incomplete</Badge>}
                         </div>
                         {client.vatNumber && <p className="text-xs text-gray-400 mt-0.5">VAT: {client.vatNumber}</p>}
                       </td>
-                      <td className="px-4 py-3.5 text-sm text-gray-600">{client.contactPerson || "—"}{client.phone && <p className="text-xs text-gray-400 mt-0.5">{client.phone}</p>}</td>
-                      <td className="px-4 py-3.5 text-sm text-gray-500">{client.email || "—"}</td>
-                      <td className="px-4 py-3.5 text-sm text-gray-500 max-w-xs truncate">{client.billingAddress || "Not set"}</td>
-                      <td className="px-4 py-3.5 text-right">
-                        <button onClick={() => startEdit(client)} className="p-1.5 rounded text-gray-300 hover:text-blue-600 transition-colors"><Pencil size={13}/></button>
-                        <button onClick={() => deleteClient(client.id)} className="p-1.5 rounded text-gray-300 hover:text-red-500 transition-colors"><Trash2 size={13}/></button>
+                      <td className={`${UI.td} text-slate-600`}>{client.contactPerson || "—"}{client.phone && <p className="text-xs text-slate-400 mt-0.5">{client.phone}</p>}</td>
+                      <td className={`${UI.td} text-slate-500`}>{client.email || "—"}</td>
+                      <td className={`${UI.td} max-w-xs truncate text-slate-500`}>{client.billingAddress || "Not set"}</td>
+                      <td className={`${UI.td} text-right`}>
+                        <IconButton label={`Edit ${client.companyName || "client"}`} variant="primary" onClick={e => { e.stopPropagation(); startEdit(client); }}><Pencil size={14}/></IconButton>
+                        <IconButton label={`Delete ${client.companyName || "client"}`} variant="danger" onClick={e => { e.stopPropagation(); deleteClient(client.id); }}><Trash2 size={14}/></IconButton>
                       </td>
                     </tr>
                   );
@@ -1231,13 +1507,19 @@ function ClientsPage({ clients, onSave, onShowToast }: {
 function LiveCalcPanel({ entry, profile, turnaround }: { entry: Partial<TimesheetEntry>; profile: Profile; turnaround: number | null }) {
   const cur    = profile.defaultCurrency || "ZAR";
   const c      = calcDay(entry, profile);
-  const trMin  = profile.defaultMinTurnaround || 10;
+  const trMin  = num(entry.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
+  const trMode = (entry.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
+  const trMult = num(entry.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult || 1.5);
   const trWarn = turnaround !== null && turnaround < trMin;
   const trShort = turnaround !== null ? trMin - turnaround : 0;
+  const turnaroundPenalty = trWarn && trMode === "penalty" ? Math.max(trShort, 0) * (c.baseHourly || 0) * trMult : 0;
+  const estimatedTotal = c.total + turnaroundPenalty;
+  const expenseLabel = entry.expenseDescription ? `Expenses (${entry.expenseDescription})` : "Expenses";
+  const dayRateOverridden = num(entry.dayRateUsed ?? entry.dayRate, profile.defaultDayRate) !== num(profile.defaultDayRate);
 
   return (
     <div className="rounded-xl border-2 border-blue-200 p-5 sticky top-5" style={{ background: "#F0F7FF" }}>
-      <div className="flex items-center gap-2 mb-4"><Zap size={14} className="text-blue-600" /><span className="text-xs font-bold text-blue-700 uppercase tracking-wider">Live Calculation</span></div>
+      <div className="flex items-center gap-2 mb-4"><Zap size={14} className="text-blue-600" /><span className="text-xs font-bold text-blue-700 uppercase tracking-wider">Estimated Day Total</span></div>
 
       {/* Hours */}
       <div className="space-y-1 mb-3 text-sm">
@@ -1251,7 +1533,7 @@ function LiveCalcPanel({ entry, profile, turnaround }: { entry: Partial<Timeshee
 
       {/* Base rate display */}
       <div className="text-xs text-blue-600 mb-2 font-medium">
-        Base rate: {fmtMoney(c.baseHourly, cur)}/hr ({fmtMoney(c.dayRate, cur)} ÷ {c.incH}h)
+        Day rate used: {fmtMoney(c.dayRate, cur)}{dayRateOverridden ? " override" : ""} · Base hourly: {fmtMoney(c.baseHourly, cur)}/hr ({c.incH}h included)
       </div>
 
       {/* OT breakdown */}
@@ -1268,15 +1550,18 @@ function LiveCalcPanel({ entry, profile, turnaround }: { entry: Partial<Timeshee
       {/* Cost breakdown */}
       <div className="space-y-0.5 border-t border-blue-100 pt-3 mb-3 text-sm">
         <SRow label="Day rate"   value={fmtMoney(c.dayRate,        cur)} />
-        {c.totalOtH > 0 && <SRow label="OT cost"    value={fmtMoney(c.totalOtCost, cur)} amber />}
-        {c.equip   > 0 && <SRow label="Equipment"   value={fmtMoney(c.equip,       cur)} />}
+        <SRow label="Paid hours" value={hoursToHM(c.paidH)} />
+        <SRow label="Overtime hours" value={c.totalOtH > 0 ? hoursToHM(c.totalOtH) : "0h"} amber={c.totalOtH > 0} />
+        <SRow label="Estimated OT cost" value={fmtMoney(c.totalOtCost, cur)} amber={c.totalOtCost > 0} />
+        <SRow label="Equipment rental" value={fmtMoney(c.equip,       cur)} />
         {c.perDiem > 0 && <SRow label="Per diem"    value={fmtMoney(c.perDiem,     cur)} />}
-        {c.expenses> 0 && <SRow label="Expenses"    value={fmtMoney(c.expenses,    cur)} />}
+        <SRow label={expenseLabel} value={fmtMoney(c.expenses,    cur)} />
+        {turnaroundPenalty > 0 && <SRow label="Turnaround penalty" value={fmtMoney(turnaroundPenalty, cur)} amber />}
       </div>
 
       <div className="border-t-2 border-blue-700 pt-3 flex justify-between items-baseline">
-        <span className="font-bold text-gray-900">Day Total</span>
-        <span className="text-xl font-bold text-gray-900 tabular-nums">{fmtMoney(c.total, cur)}</span>
+        <span className="font-bold text-gray-900">Estimated Total</span>
+        <span className="text-xl font-bold text-gray-900 tabular-nums">{fmtMoney(estimatedTotal, cur)}</span>
       </div>
 
       {/* Turnaround */}
@@ -1308,6 +1593,10 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
     setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
   };
   const updBool= (k: string) => (v: boolean) => setForm(p => ({ ...p, [k]: v, ...(usedKey[k] ? { [usedKey[k]]: v } : {}) }));
+  const updVat = (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, vatRateUsed: num(e.target.value) }));
+  const updTurnaroundMin = (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, turnaroundMinimumHoursUsed: num(e.target.value) }));
+  const updTurnaroundMult = (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, turnaroundPenaltyMultUsed: num(e.target.value) }));
+  const updTurnaroundRule = (e: React.ChangeEvent<HTMLSelectElement>) => setForm(p => ({ ...p, turnaroundRuleUsed: e.target.value as TurnaroundMode }));
   const prev = findPreviousEntryForTurnaround(timesheet.entries || [], form);
   const turnaround = prev ? calcTurnaround(prev, form) : null;
   const cur = profile.defaultCurrency || "ZAR";
@@ -1344,15 +1633,15 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
 
         <Card className="p-5">
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Day Details</p>
-          <div className="grid grid-cols-2 gap-4 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
             <Inp label="Date" type="date" value={form.date} onChange={upd("date")} />
             <Inp label="Location" value={form.location} onChange={upd("location")} placeholder="Set / studio / location" />
           </div>
-          <div className="grid grid-cols-2 gap-4 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
             <TInp label="Call Time (24h)" value={form.callTime} onChange={upd("callTime")} />
             <TInp label="Wrap Time (24h)" value={form.wrapTime} onChange={upd("wrapTime")} />
           </div>
-          <div className="w-48">
+          <div className="w-full sm:w-48">
             <Inp label="Meal Break (minutes)" type="number" min="0" value={form.mealBreakMinutes} onChange={updNum("mealBreakMinutes")}
               hint={form.mealDeducted ? "Deducted from working hours" : "Not deducted (see Timesheet settings)"} />
           </div>
@@ -1360,7 +1649,7 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
 
         <Card className="p-5">
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Travel <span className="normal-case font-normal text-gray-300 ml-1">(optional)</span></p>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <TInp label="Travel Start" value={form.travelStartTime} onChange={upd("travelStartTime")} />
             <TInp label="Travel End"   value={form.travelEndTime}   onChange={upd("travelEndTime")} />
             <Inp  label="Distance (km)" type="number" min="0" value={form.travelDistance} onChange={upd("travelDistance")} placeholder="0" />
@@ -1369,38 +1658,53 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
 
         <TxInp label="Notes" rows={2} value={form.notes} onChange={upd("notes")} placeholder="Shoot notes, special conditions…" />
 
-        {/* Rate override — hidden by default */}
+        {/* Rate and expense override — hidden by default */}
         <div>
-          <button onClick={() => setShowRates(!showRates)} className="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-600 transition-colors py-1">
+          <button type="button" onClick={() => setShowRates(!showRates)} className="flex items-center gap-2 text-sm text-gray-400 hover:text-gray-600 transition-colors py-1">
             {showRates ? <ChevronUp size={14}/> : <ChevronDown size={14}/>}
-            {showRates ? "Hide rate overrides" : "Override rates for this day"}
+            Override rates / expenses for this day
             <span className="text-gray-300 text-xs">({fmtMoney(profile.defaultDayRate, cur)}/day · {OT_PRESETS[profile.defaultOvertimeRule]?.name} from your profile)</span>
           </button>
 
           {showRates && (
-            <Card className="p-4 mt-2 space-y-3">
-              <div className="grid grid-cols-2 gap-4">
-                <Inp label={`Day Rate (${sym})`}   type="number" min="0" value={form.dayRate}       onChange={updNum("dayRate")} />
+            <Card className="p-4 mt-2 space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Inp label={`Day Rate Used (${sym})`} type="number" min="0" value={form.dayRate}       onChange={updNum("dayRate")} />
                 <Inp label="Included Hours"         type="number" min="1" value={form.includedHours} onChange={updNum("includedHours")} />
               </div>
-              <SInp label="Overtime Rule" value={form.overtimeRule} onChange={upd("overtimeRule") as any}>
-                {(Object.entries(OT_PRESETS) as [OTRuleId, {name:string}][]).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
-              </SInp>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <SInp label="Overtime Rule" value={form.overtimeRule} onChange={upd("overtimeRule") as any}>
+                  {(Object.entries(OT_PRESETS) as [OTRuleId, {name:string}][]).map(([k, v]) => <option key={k} value={k}>{v.name}</option>)}
+                </SInp>
+                <Inp label="VAT Rate %" type="number" min="0" max="100" value={form.vatRateUsed ?? profile.defaultVat} onChange={updVat} />
+              </div>
               {isCustom && (
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                   <Inp label="Band 1 hrs"  type="number" min="0" value={form.otBand1Hours} onChange={updNum("otBand1Hours")} />
                   <Inp label="Band 1 mult" type="number" min="0" step="0.1" value={form.otBand1Mult} onChange={updNum("otBand1Mult")} />
                   <Inp label="Band 2 mult" type="number" min="0" step="0.1" value={form.otBand2Mult} onChange={updNum("otBand2Mult")} />
                 </div>
               )}
-              <div className="grid grid-cols-2 gap-4">
-                <Inp label={`Equipment (${sym})`} type="number" min="0" value={form.equipmentRental} onChange={updNum("equipmentRental")} />
-                <Inp label={`Per Diem (${sym})`}  type="number" min="0" value={form.perDiem}         onChange={updNum("perDiem")} />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Inp label={`Equipment Rental for This Day (${sym})`} type="number" min="0" value={form.equipmentRental} onChange={updNum("equipmentRental")} />
+                <Inp label={`Per Diem for This Day (${sym})`}  type="number" min="0" value={form.perDiem}         onChange={updNum("perDiem")} />
               </div>
-              <Inp label={`Other Expenses (${sym})`} type="number" min="0" value={form.expenses} onChange={updNum("expenses")} placeholder="0.00" />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <Inp label="Expense Description" value={form.expenseDescription} onChange={upd("expenseDescription")} placeholder="Parking" />
+                <Inp label={`Expense Amount (${sym})`} type="number" min="0" value={form.expenses} onChange={updNum("expenses")} placeholder="0.00" />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <Inp label="Turnaround Min Hrs" type="number" min="0" value={form.turnaroundMinimumHoursUsed ?? profile.defaultMinTurnaround} onChange={updTurnaroundMin} />
+                <SInp label="Turnaround Rule" value={form.turnaroundRuleUsed || profile.defaultTurnaroundMode} onChange={updTurnaroundRule}>
+                  <option value="warning">Show warning only</option>
+                  <option value="penalty">Charge penalty automatically</option>
+                  <option value="manual">Manual approval required</option>
+                </SInp>
+                <Inp label="Penalty Multiplier" type="number" min="0" step="0.1" value={form.turnaroundPenaltyMultUsed ?? profile.defaultTurnaroundPenMult} onChange={updTurnaroundMult} />
+              </div>
               <div className="divide-y divide-gray-100">
-                <Tog checked={form.mealDeducted} onChange={updBool("mealDeducted")} label="Meal break deducted for this day" />
-                <Tog checked={form.travelPaid}   onChange={updBool("travelPaid")}   label="Travel time paid for this day" />
+                <Tog checked={form.travelPaid}   onChange={updBool("travelPaid")}   label="Travel paid for this day" />
+                <Tog checked={form.mealDeducted} onChange={updBool("mealDeducted")} label="Meal deducted for this day" />
               </div>
             </Card>
           )}
@@ -1470,11 +1774,11 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
         <div className="space-y-4">
           <Card className="p-4">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Day Details</p>
-            <div className="grid grid-cols-2 gap-4 mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
               <Inp label="Date" type="date" value={form.date} onChange={set("date")} />
               <Inp label="Location" value={form.location} onChange={set("location")} />
             </div>
-            <div className="grid grid-cols-2 gap-4 mb-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
               <TInp label="Call Time" value={form.callTime} onChange={set("callTime")} />
               <TInp label="Wrap Time" value={form.wrapTime} onChange={set("wrapTime")} />
             </div>
@@ -1483,7 +1787,7 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
 
           <Card className="p-4">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Travel</p>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <TInp label="Travel Start" value={form.travelStartTime} onChange={set("travelStartTime")} />
               <TInp label="Travel End" value={form.travelEndTime} onChange={set("travelEndTime")} />
               <Inp label="Distance (km)" type="number" min="0" value={form.travelDistance} onChange={set("travelDistance")} />
@@ -1499,7 +1803,7 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
             </button>
             {showRates && (
               <div className="p-4 border-t border-gray-100 space-y-4">
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <Inp label={`Day Rate (${sym})`} type="number" min="0" value={form.dayRate} onChange={setN("dayRate")} />
                   <Inp label="Included Hours" type="number" min="1" value={form.includedHours} onChange={setN("includedHours")} />
                 </div>
@@ -1507,18 +1811,21 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
                   {(Object.entries(OT_PRESETS) as [OTRuleId, { name: string }][]).map(([id, preset]) => <option key={id} value={id}>{preset.name}</option>)}
                 </SInp>
                 {form.overtimeRule === "custom" && (
-                  <div className="grid grid-cols-3 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <Inp label="Band 1 hrs" type="number" min="0" value={form.otBand1Hours} onChange={setN("otBand1Hours")} />
                     <Inp label="Band 1 mult" type="number" min="0" step="0.1" value={form.otBand1Mult} onChange={setN("otBand1Mult")} />
                     <Inp label="Band 2 mult" type="number" min="0" step="0.1" value={form.otBand2Mult} onChange={setN("otBand2Mult")} />
                   </div>
                 )}
-                <div className="grid grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <Inp label={`Equipment (${sym})`} type="number" min="0" value={form.equipmentRental} onChange={setN("equipmentRental")} />
                   <Inp label={`Per Diem (${sym})`} type="number" min="0" value={form.perDiem} onChange={setN("perDiem")} />
-                  <Inp label={`Expenses (${sym})`} type="number" min="0" value={form.expenses} onChange={setN("expenses")} />
                 </div>
-                <div className="grid grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <Inp label="Expense Description" value={form.expenseDescription} onChange={set("expenseDescription")} placeholder="Parking" />
+                  <Inp label={`Expense Amount (${sym})`} type="number" min="0" value={form.expenses} onChange={setN("expenses")} />
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <Inp label="VAT %" type="number" min="0" max="100" value={form.vatRateUsed ?? profile.defaultVat} onChange={setVat} />
                   <Inp label="Turnaround min hrs" type="number" min="0" value={form.turnaroundMinimumHoursUsed ?? profile.defaultMinTurnaround} onChange={e => setForm(p => ({ ...p, turnaroundMinimumHoursUsed: num(e.target.value) }))} />
                   <SInp label="Turnaround Rule" value={form.turnaroundRuleUsed || profile.defaultTurnaroundMode} onChange={e => setForm(p => ({ ...p, turnaroundRuleUsed: e.target.value as TurnaroundMode }))}>
@@ -1579,15 +1886,15 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
   const totExp    = rows.reduce((s, r) => s + (r.c.expenses  || 0), 0);
   const totDay    = rows.reduce((s, r) => s + (r.c.total     || 0), 0);
 
-  const thCls = "px-2 py-2.5 text-[10px] font-bold text-gray-400 uppercase tracking-wider whitespace-nowrap text-left";
+  const thCls = "px-2 py-2.5 text-[11px] font-semibold text-slate-500 uppercase whitespace-nowrap text-left bg-slate-50/80 border-b border-slate-200";
   const thR   = `${thCls} text-right`;
-  const tdCls = "px-2 py-2.5 text-sm";
+  const tdCls = "px-2 py-3 text-sm";
   const tdR   = `${tdCls} text-right tabular-nums`;
 
   return (
     <Card>
-      <div className="overflow-x-auto">
-        <table className="w-full">
+      <div className={UI.tableWrap}>
+        <table className="w-full min-w-[1080px]">
           <thead>
             <tr className="border-b border-gray-200">
               <th className={thCls}>Date</th>
@@ -1622,7 +1929,7 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
                     </td>
                   </tr>
                 )}
-                <tr className="hover:bg-gray-50 transition-colors border-b border-gray-50">
+                <tr className={`${UI.row} border-b border-slate-100`}>
                   <td className={`${tdCls} font-medium whitespace-nowrap`}>{fmtDate(e.date || "")}</td>
                   <td className={`${tdCls} text-gray-500 max-w-[100px] truncate`}>{e.productionName || "—"}</td>
                   <td className={`${tdCls} text-gray-500 max-w-[100px] truncate`}>{e.location || "—"}</td>
@@ -1638,9 +1945,9 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
                   <td className={`${tdR} font-semibold text-gray-900`}>{fmtMoney(c.total || 0, cur)}</td>
                   <td className={tdCls}>
                     <div className="flex justify-end gap-1">
-                      <button title="Edit" onClick={() => onEditEntry(e)} className="p-1 text-gray-300 hover:text-blue-600 rounded transition-colors"><Pencil size={13}/></button>
-                      <button title="Duplicate" onClick={() => onDuplicateEntry(e)} className="p-1 text-gray-300 hover:text-emerald-600 rounded transition-colors"><Copy size={13}/></button>
-                      <button title="Delete" onClick={() => { if (confirm("Delete this timesheet day? This cannot be undone.")) onDeleteEntry(e.id); }} className="p-1 text-gray-300 hover:text-red-500 rounded transition-colors"><Trash2 size={13}/></button>
+                      <IconButton label={`Edit day ${fmtDate(e.date || "")}`} variant="primary" onClick={() => onEditEntry(e)}><Pencil size={14}/></IconButton>
+                      <IconButton label={`Duplicate day ${fmtDate(e.date || "")}`} onClick={() => onDuplicateEntry(e)}><Copy size={14}/></IconButton>
+                      <IconButton label={`Delete day ${fmtDate(e.date || "")}`} variant="danger" onClick={() => { if (confirm("Delete this timesheet day? This cannot be undone.")) onDeleteEntry(e.id); }}><Trash2 size={14}/></IconButton>
                     </div>
                   </td>
                 </tr>
@@ -1740,7 +2047,10 @@ function buildDetailedTimesheetLines(sum: ReturnType<typeof calcSummary>): Invoi
     if (c.b2H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 2 (${hoursToHM(c.b2H)} @ ${c.bands.band2Mult}x)`, quantity: c.b2H, unitPrice: c.b2Cost / Math.max(c.b2H, 1), amount: c.b2Cost, taxable: true, category: "overtime" });
     if (c.equip > 0) lines.push({ id: uid(), description: `${d} — Equipment Rental`, quantity: 1, unitPrice: c.equip, amount: c.equip, taxable: true, category: "equipment" });
     if (c.travH > 0) lines.push({ id: uid(), description: `${d} — Travel (${hoursToHM(c.travH)}${entry.travelDistance ? `, ${entry.travelDistance} km` : ""})`, quantity: 1, unitPrice: 0, amount: 0, taxable: false, category: "travel" });
-    if (c.perDiem + c.expenses > 0) lines.push({ id: uid(), description: `${d} — Expenses`, quantity: 1, unitPrice: c.perDiem + c.expenses, amount: c.perDiem + c.expenses, taxable: true, category: "expenses" });
+    if (c.perDiem + c.expenses > 0) {
+      const expenseBits = [c.perDiem > 0 ? "per diem" : "", c.expenses > 0 ? (entry.expenseDescription || "expenses") : ""].filter(Boolean).join(" + ");
+      lines.push({ id: uid(), description: `${d} — Expenses${expenseBits ? ` (${expenseBits})` : ""}`, quantity: 1, unitPrice: c.perDiem + c.expenses, amount: c.perDiem + c.expenses, taxable: true, category: "expenses" });
+    }
     if (c.turnaroundPenalty > 0) lines.push({ id: uid(), description: `${d} — Turnaround penalty`, quantity: 1, unitPrice: c.turnaroundPenalty, amount: c.turnaroundPenalty, taxable: true, category: "turnaround" });
   });
   return lines;
@@ -1870,6 +2180,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     crewName: profile.fullName || "",
     role: timesheet.role || profile.role || "",
     companyName: profile.companyName || profile.fullName || "",
+    sellerLogoDataUrl: profile.businessLogoDataUrl || "",
     productionName: timesheet.productionName || "",
     timesheetNumber: timesheet.timesheetNumber || "",
     timesheetDates: timesheetDateRange(timesheet),
@@ -1925,16 +2236,15 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
 
   return (
     <div className="space-y-5">
-      <div className="space-y-3">
-        <Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>
-        <div className="flex items-start justify-between gap-4">
-          <div><h1 className="text-xl font-bold text-gray-900">Invoice Review</h1><p className="text-sm text-gray-400 mt-0.5">{timesheet.productionName || "Not set"} · {timesheet.timesheetNumber || "Not set"}</p></div>
-          <div className="flex items-center gap-2">
-            <Btn variant="secondary" onClick={openPDF}><FileText size={14}/> Export PDF</Btn>
-            <Btn variant="success" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
-          </div>
-        </div>
-      </div>
+      <PageHeader
+        title="Invoice Review"
+        description={`${timesheet.productionName || "Not set"} · ${timesheet.timesheetNumber || "Not set"}`}
+        secondaryActions={<Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>}
+        actions={<>
+          <Btn variant="secondary" onClick={openPDF}><FileText size={14}/> Export PDF</Btn>
+          <Btn variant="success" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
+        </>}
+      />
 
       {clientIncomplete && (
         <AlertBox type="warning">Client billing details are incomplete. Please add them before finalising this invoice.</AlertBox>
@@ -1948,10 +2258,13 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 space-y-5">
-          <Card className="p-5">
-            <div className="grid grid-cols-2 gap-6">
+          <Card className="p-5 sm:p-6">
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
               <div>
                 <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">From</p>
+                {profile.businessLogoDataUrl && (
+                  <img src={profile.businessLogoDataUrl} alt="Business logo" className="mb-4 max-h-20 max-w-[220px] object-contain" />
+                )}
                 <p className="font-semibold">{profile.companyName || profile.fullName || "Not set"}</p>
                 <p className="text-sm text-gray-500">{profile.fullName || "Not set"}</p>
                 <p className="text-sm text-gray-500">{profile.role || "Not set"}</p>
@@ -1969,9 +2282,9 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
             </div>
           </Card>
 
-          <Card className="p-5">
+          <Card className="p-5 sm:p-6">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Invoice Details</p>
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Inp label="Invoice Number" value={invoiceNumber} onChange={e => setInvoiceNumber(e.target.value)} />
               <Inp label="PO Number" value={poNumber} onChange={e => setPoNumber(e.target.value)} placeholder={clientDraft.poRequired ? "Required by client" : "Optional"} />
               <Inp label="Issue Date" type="date" value={issueDate} onChange={e => setIssueDate(e.target.value)} />
@@ -1988,7 +2301,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
             <div className="mt-3 text-sm text-gray-500">Balance due: <strong className="text-gray-900">{fmtMoney(balanceDue, cur)}</strong></div>
           </Card>
 
-          <Card className="p-5">
+          <Card className="p-5 sm:p-6">
             <div className="flex items-center justify-between mb-4">
               <div>
                 <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Timesheet Items</p>
@@ -2016,7 +2329,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
           </Card>
 
           {detailMode === "summary_timesheet" && (
-            <Card className="p-5">
+            <Card className="p-5 sm:p-6">
               <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-1">Attached Timesheet Breakdown</p>
               <p className="text-xs text-gray-400 mb-4">This will be included after the invoice summary in the PDF.</p>
               <div className="space-y-0">
@@ -2031,7 +2344,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
             </Card>
           )}
 
-          <Card className="p-5">
+          <Card className="p-5 sm:p-6">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Additional Items</p>
             {extras.length > 0 && (
               <div className="mb-4 space-y-0">
@@ -2041,7 +2354,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
                     <div className="col-span-2 text-sm text-right text-gray-400 tabular-nums">{l.quantity} × {sym}{l.unitPrice.toFixed(2)}</div>
                     <div className="col-span-2 text-xs text-right text-gray-400">{l.taxable === false ? "No VAT" : "VAT"}</div>
                     <div className="col-span-2 text-sm text-right font-medium tabular-nums">{fmtMoney(l.amount, cur)}</div>
-                    <div className="col-span-1 flex justify-end"><button onClick={() => removeExtra(l.id)} className="p-1 text-gray-300 hover:text-red-500 rounded"><Trash2 size={13}/></button></div>
+                    <div className="col-span-1 flex justify-end"><IconButton label={`Remove ${l.description}`} variant="danger" onClick={() => removeExtra(l.id)}><Trash2 size={14}/></IconButton></div>
                   </div>
                 ))}
               </div>
@@ -2109,10 +2422,12 @@ function printInvoice(inv: Invoice, profile: Profile) {
   const balanceDue = invoiceBalance(inv);
   const paidAmount = safe(inv.paidAmount, 0);
   const invoiceLabel = profile.vatRegistered ? (profile.invoiceLabel || "Tax Invoice") : (profile.invoiceLabel || "Invoice");
+  const logoDataUrl = invoiceLogoForDisplay(inv, profile);
+  const logoHtml = logoDataUrl ? `<img class="sellerLogo" src="${esc(logoDataUrl)}" alt="Business logo">` : "";
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(inv.invoiceNumber)}</title><style>
-*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:46px}.top{display:flex;justify-content:space-between;gap:32px;margin-bottom:30px}.title{font-size:30px;font-weight:750;letter-spacing:.02em;text-transform:uppercase}.muted{color:#6B7280}.tiny{font-size:10px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:.08em}.strong{font-weight:700}.boxgrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-bottom:24px}.meta{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;border:1px solid #E5E7EB;border-radius:10px;padding:14px;margin-bottom:24px}.meta div{min-width:0}.meta p:last-child{font-size:12px;margin-top:4px;font-weight:600}.party{line-height:1.5;font-size:12px}.party h2{font-size:15px;margin:6px 0 4px}table{width:100%;border-collapse:collapse;margin-top:8px}th{padding:9px 0;border-top:2px solid #111827;border-bottom:1px solid #E5E7EB;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left}td{padding:10px 0;border-bottom:1px solid #F3F4F6;font-size:12px;vertical-align:top}.num{text-align:right;white-space:nowrap}.pill{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;background:#F3F4F6;color:#6B7280;font-size:9px;font-weight:700;text-transform:uppercase}.totals{display:flex;justify-content:flex-end;margin-top:18px}.totals>div{width:280px}.row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:#6B7280}.due{font-size:17px;font-weight:750;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:10px}.section{margin-top:24px;padding-top:18px;border-top:1px solid #E5E7EB}.bank{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:10px}.bank div p:last-child{font-size:12px;font-weight:600;margin-top:2px}.notes{font-size:12px;color:#374151;line-height:1.55;margin-top:8px}@media print{.page{padding:30px}.meta{break-inside:avoid}.section{break-inside:avoid}}
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:820px;margin:0 auto;padding:46px}.top{display:flex;justify-content:space-between;gap:32px;margin-bottom:30px}.sellerHead{max-width:430px}.sellerLogo{display:block;max-width:55mm;max-height:25mm;object-fit:contain;margin-bottom:14px}.title{font-size:30px;font-weight:750;letter-spacing:.02em;text-transform:uppercase}.muted{color:#6B7280}.tiny{font-size:10px;font-weight:700;color:#9CA3AF;text-transform:uppercase;letter-spacing:.08em}.strong{font-weight:700}.boxgrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-bottom:24px}.meta{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;border:1px solid #E5E7EB;border-radius:10px;padding:14px;margin-bottom:24px}.meta div{min-width:0}.meta p:last-child{font-size:12px;margin-top:4px;font-weight:600}.party{line-height:1.5;font-size:12px}.party h2{font-size:15px;margin:6px 0 4px}table{width:100%;border-collapse:collapse;margin-top:8px}th{padding:9px 0;border-top:2px solid #111827;border-bottom:1px solid #E5E7EB;font-size:10px;font-weight:700;color:#6B7280;text-transform:uppercase;letter-spacing:.06em;text-align:left}td{padding:10px 0;border-bottom:1px solid #F3F4F6;font-size:12px;vertical-align:top}.num{text-align:right;white-space:nowrap}.pill{display:inline-block;margin-left:8px;padding:2px 6px;border-radius:999px;background:#F3F4F6;color:#6B7280;font-size:9px;font-weight:700;text-transform:uppercase}.totals{display:flex;justify-content:flex-end;margin-top:18px}.totals>div{width:280px}.row{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:#6B7280}.due{font-size:17px;font-weight:750;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:10px}.section{margin-top:24px;padding-top:18px;border-top:1px solid #E5E7EB}.bank{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:10px}.bank div p:last-child{font-size:12px;font-weight:600;margin-top:2px}.notes{font-size:12px;color:#374151;line-height:1.55;margin-top:8px}@media print{.page{padding:30px}.meta{break-inside:avoid}.section{break-inside:avoid}}
 </style></head><body><div class="page">
-<div class="top"><div><div class="title">${esc(invoiceLabel)}</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(inv.invoiceNumber || "Not set")}</div>${inv.poNumber?`<div class="muted" style="font-size:12px;margin-top:2px">PO: ${esc(inv.poNumber)}</div>`:""}</div><div style="text-align:right"><div style="font-size:17px;font-weight:750">${esc(inv.companyName || profile.companyName || profile.fullName || "Not set")}</div>${sellerRows.map(r=>`<div class="muted" style="font-size:12px">${block(r)}</div>`).join("")}</div></div>
+<div class="top"><div class="sellerHead">${logoHtml}<div style="font-size:17px;font-weight:750">${esc(inv.companyName || profile.companyName || profile.fullName || "Not set")}</div>${sellerRows.map(r=>`<div class="muted" style="font-size:12px">${block(r)}</div>`).join("")}</div><div style="text-align:right"><div class="title">${esc(invoiceLabel)}</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(inv.invoiceNumber || "Not set")}</div>${inv.poNumber?`<div class="muted" style="font-size:12px;margin-top:2px">PO: ${esc(inv.poNumber)}</div>`:""}<div class="tiny" style="margin-top:14px">Invoice Date</div><div style="font-size:13px;font-weight:700">${esc(fmtDate(inv.issueDate))}</div>${inv.dueDate?`<div class="tiny" style="margin-top:8px">Due Date</div><div style="font-size:13px;font-weight:700">${esc(fmtDate(inv.dueDate))}</div>`:""}</div></div>
 <div class="boxgrid"><div class="party"><div class="tiny">Bill To</div><h2>${esc(inv.clientName || "Not set")}</h2>${clientRows.length ? clientRows.map(r=>`<div class="muted">${block(r)}</div>`).join("") : `<div class="muted">Not set</div>`}</div><div class="party" style="text-align:right"><div class="tiny">Invoice Date</div><h2>${esc(fmtDate(inv.issueDate))}</h2>${inv.dueDate?`<div class="tiny" style="margin-top:10px">Due Date</div><div style="font-weight:700">${esc(fmtDate(inv.dueDate))}</div>`:""}</div></div>
 <div class="meta"><div><p class="tiny">Production</p><p>${esc(inv.productionName || "Not set")}</p></div><div><p class="tiny">PO Number</p><p>${esc(inv.poNumber || "Not set")}</p></div><div><p class="tiny">Timesheet</p><p>${esc(inv.timesheetNumber || "Not set")}</p></div><div><p class="tiny">Detail</p><p>${esc(invoiceDetailModeLabel(inv.detailMode))}</p></div><div><p class="tiny">Status</p><p>${esc(INVOICE_STATUS[normalizeInvoiceStatus(inv.status)].label)}</p></div></div>
 <table><thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">VAT</th><th class="num">Amount</th></tr></thead><tbody>${lineRows}</tbody></table>
@@ -2124,6 +2439,58 @@ ${inv.notes?`<div class="section"><div class="tiny">Notes</div><div class="notes
 </div><script>window.addEventListener('load',function(){setTimeout(function(){window.print()},500)})<\/script></body></html>`;
   const w = window.open("", "_blank", "width=960,height=720");
   if (!w) { alert("Allow pop-ups to export PDF"); return; }
+  w.document.write(html); w.document.close();
+}
+
+function printTimesheet(ts: Timesheet, profile: Profile) {
+  const entries = ts.entries || [];
+  if (!entries.length) { alert("Add at least one day before exporting a timesheet."); return; }
+
+  const esc = (s: unknown) => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const block = (s: unknown) => esc(s).replace(/\n/g, "<br/>");
+  const cur = ts.currency || profile.defaultCurrency || "ZAR";
+  const m = (n: unknown) => fmtMoney(n, cur);
+  const sum = calcSummary(entries, profile);
+  const sellerRows = ([["Name", profile.fullName],["Trading / Company", profile.companyName],["Email", profile.email],["Phone", profile.phone],profile.vatRegistered && profile.vatNumber && ["VAT / Tax", profile.vatNumber]] as [string,string][]).filter(r=>r&&r[1]);
+  const entryRows = sum.calcs.map(({ entry, c }) => {
+    const minTR = num(entry.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
+    const trMode = (entry.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
+    const trShort = c.turnaround !== null ? Math.max(minTR - c.turnaround, 0) : 0;
+    const turnaroundText = c.turnaround === null
+      ? "—"
+      : c.turnaroundPenalty > 0
+        ? `Penalty ${m(c.turnaroundPenalty)} (${hoursToHM(c.turnaround)})`
+        : trShort > 0
+          ? `${trMode === "manual" ? "Manual approval" : "Warning"} (${hoursToHM(c.turnaround)})`
+          : `OK (${hoursToHM(c.turnaround)})`;
+    const expenseNote = c.expenses > 0 ? `Expense: ${entry.expenseDescription || "Additional expenses"} ${m(c.expenses)}` : "";
+    const notes = [entry.notes, expenseNote].filter(Boolean).join("\n");
+    return `<tr>
+      <td>${esc(fmtDate(entry.date || ""))}</td>
+      <td>${esc(entry.location || "—")}</td>
+      <td class="mono">${esc(entry.callTime || "—")}</td>
+      <td class="mono">${esc(entry.wrapTime || "—")}</td>
+      <td class="num">${c.mealH > 0 ? esc(hoursToHM(c.mealH)) : "—"}</td>
+      <td class="num">${c.travH > 0 ? esc(hoursToHM(c.travH)) : "—"}</td>
+      <td class="num strong">${esc(hoursToHM(c.paidH || 0))}</td>
+      <td class="num">${c.totalOtH > 0 ? esc(hoursToHM(c.totalOtH)) : "—"}</td>
+      <td>${esc(turnaroundText)}</td>
+      <td>${notes ? block(notes) : "—"}</td>
+      <td class="num strong">${m(c.totalWithPenalty)}</td>
+    </tr>`;
+  }).join("");
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(ts.timesheetNumber || "Timesheet")}</title><style>
+*{margin:0;padding:0;box-sizing:border-box}body{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#111827;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}.page{max-width:1120px;margin:0 auto;padding:28px}.top{display:flex;justify-content:space-between;gap:28px;margin-bottom:22px}.title{font-size:26px;font-weight:800;letter-spacing:0;text-transform:uppercase}.brand{font-size:11px;font-weight:800;color:#6B7280;letter-spacing:0;text-transform:uppercase;margin-bottom:3px}.muted{color:#6B7280}.tiny{font-size:9.5px;font-weight:800;color:#6B7280;text-transform:uppercase;letter-spacing:0}.strong{font-weight:750}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.meta{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;border:1px solid #D1D5DB;border-radius:8px;padding:12px;margin-bottom:18px}.meta div{min-width:0}.meta p:last-child{font-size:12px;font-weight:650;margin-top:3px}.parties{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-bottom:18px}.party{font-size:12px;line-height:1.45}.party h2{font-size:15px;margin:4px 0 5px}.seller{display:grid;grid-template-columns:repeat(2,1fr);gap:7px 18px;margin-top:7px}.seller p:last-child{font-size:12px;font-weight:650;margin-top:2px}table{width:100%;border-collapse:collapse;table-layout:fixed}thead{display:table-header-group}th{padding:8px 5px;border-top:2px solid #111827;border-bottom:1px solid #D1D5DB;font-size:9.5px;font-weight:800;color:#4B5563;text-transform:uppercase;letter-spacing:0;text-align:left}td{padding:8px 5px;border-bottom:1px solid #E5E7EB;font-size:10.5px;line-height:1.35;vertical-align:top;overflow-wrap:anywhere}tr{break-inside:avoid}.num{text-align:right;white-space:nowrap}.totals{display:flex;justify-content:flex-end;margin-top:18px;break-inside:avoid}.totals>div{width:330px}.row{display:flex;justify-content:space-between;gap:16px;padding:4px 0;font-size:12.5px;color:#4B5563}.grand{font-size:16px;font-weight:800;color:#111827;border-top:2px solid #111827;margin-top:6px;padding-top:9px}.signoff{margin-top:30px;padding-top:18px;border-top:1px solid #D1D5DB;break-inside:avoid;page-break-inside:avoid}.siggrid{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:12px}.sigbox{border:1px solid #D1D5DB;border-radius:8px;padding:14px;min-height:155px}.line{border-bottom:1px solid #9CA3AF;height:28px;margin-top:12px}.comments{border:1px solid #D1D5DB;border-radius:8px;min-height:80px;margin-top:12px;padding:10px}.notes{font-size:12px;line-height:1.5;color:#374151}.w-date{width:10%}.w-place{width:11%}.w-time{width:6.5%}.w-small{width:7%}.w-turn{width:13%}.w-notes{width:17%}.w-total{width:9%}@page{size:A4 landscape;margin:12mm}@media print{.page{padding:0}.meta,.totals,.signoff{break-inside:avoid;page-break-inside:avoid}}
+</style></head><body><div class="page">
+<div class="top"><div><div class="brand">CrewQuote Pro / Timesheet</div><div class="title">Timesheet</div><div class="muted" style="font-size:13px;margin-top:4px">${esc(ts.timesheetNumber || "Not set")}</div></div><div style="text-align:right"><div style="font-size:17px;font-weight:800">${esc(profile.companyName || profile.fullName || "Not set")}</div><div class="muted" style="font-size:12px;margin-top:4px">Generated ${esc(fmtDate(todayStr()))}</div></div></div>
+<div class="meta"><div><p class="tiny">Production / Project</p><p>${esc(ts.productionName || "Not set")}</p></div><div><p class="tiny">Client / Bill To</p><p>${esc(ts.clientName || "Not set")}</p></div><div><p class="tiny">Crew Member</p><p>${esc(ts.crewName || profile.fullName || "Not set")}</p></div><div><p class="tiny">Role</p><p>${esc(ts.role || profile.role || "Not set")}</p></div><div><p class="tiny">Week / Date Range</p><p>${esc(timesheetDateRange(ts))}</p></div><div><p class="tiny">Reference</p><p>${esc(ts.timesheetNumber || "Not set")}</p></div><div><p class="tiny">Currency</p><p>${esc(cur)}</p></div><div><p class="tiny">Status</p><p>${esc(ts.status || "open")}</p></div></div>
+<div class="parties"><div class="party"><div class="tiny">Business / Freelancer Details</div><div class="seller">${sellerRows.length ? sellerRows.map(([k,v])=>`<div><p class="tiny">${esc(k)}</p><p>${block(v)}</p></div>`).join("") : `<div class="muted">Not set</div>`}</div></div><div class="party"><div class="tiny">Optional Timesheet Notes</div><div class="notes" style="margin-top:7px">${ts.notes ? block(ts.notes) : `<span class="muted">No notes</span>`}</div></div></div>
+<table><thead><tr><th class="w-date">Date</th><th class="w-place">Location</th><th class="w-time">Call</th><th class="w-time">Wrap</th><th class="num w-small">Meal</th><th class="num w-small">Travel</th><th class="num w-small">Paid</th><th class="num w-small">OT</th><th class="w-turn">Turnaround</th><th class="w-notes">Notes</th><th class="num w-total">Day Total</th></tr></thead><tbody>${entryRows}</tbody></table>
+<div class="totals"><div><div class="row"><span>Total days</span><span>${sum.totalDays}</span></div><div class="row"><span>Total paid hours</span><span>${esc(hoursToHM(sum.totalPaidH))}</span></div><div class="row"><span>Total overtime hours</span><span>${esc(hoursToHM(sum.totalOtH))}</span></div><div class="row"><span>Total equipment rental</span><span>${m(sum.totalEquip)}</span></div>${sum.totalPerDiem>0?`<div class="row"><span>Total per diem</span><span>${m(sum.totalPerDiem)}</span></div>`:""}<div class="row"><span>Total expenses</span><span>${m(sum.totalExp)}</span></div><div class="row"><span>Turnaround penalties</span><span>${m(sum.totalTurnaroundPenalty)}</span></div>${sum.vatAmt>0?`<div class="row"><span>${sum.mixedVat ? "VAT" : `VAT (${sum.vatPct}%)`}</span><span>${m(sum.vatAmt)}</span></div>`:""}<div class="row grand"><span>Grand total</span><span>${m(sum.grandTotal)}</span></div></div></div>
+<div class="signoff"><div class="tiny">Sign-off</div><div class="siggrid"><div class="sigbox"><h2 style="font-size:14px;margin-bottom:8px">Crew member signature</h2><p class="tiny">Name</p><div class="line"></div><p class="tiny" style="margin-top:10px">Signature</p><div class="line"></div><p class="tiny" style="margin-top:10px">Date</p><div class="line"></div></div><div class="sigbox"><h2 style="font-size:14px;margin-bottom:8px">Production / HOD sign-off</h2><p class="tiny">Name</p><div class="line"></div><p class="tiny" style="margin-top:10px">Position</p><div class="line"></div><p class="tiny" style="margin-top:10px">Signature</p><div class="line"></div><p class="tiny" style="margin-top:10px">Date</p><div class="line"></div></div></div><div class="comments"><p class="tiny">Optional notes / approval comments</p></div></div>
+</div><script>window.addEventListener('load',function(){setTimeout(function(){window.print()},500)})<\/script></body></html>`;
+  const w = window.open("", "_blank", "width=1120,height=760");
+  if (!w) { alert("Allow pop-ups to print timesheet"); return; }
   w.document.write(html); w.document.close();
 }
 
@@ -2142,6 +2509,7 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
   const effectiveProfile  = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
   const sum               = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
   const cur               = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
+  const hasEntries        = (timesheet.entries || []).length > 0;
   const linkedStatus      = linkedInvoice ? normalizeInvoiceStatus(linkedInvoice.status) : null;
   const linkedFinalised   = Boolean(linkedStatus && linkedStatus !== "draft");
   const addEntry          = (e: TimesheetEntry) => {
@@ -2187,26 +2555,24 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
     setShowProductionRates(false);
     onShowToast(choice === "1" ? "Production rates saved for future days." : "Production rates saved and matching days recalculated.");
   };
-  const statusColor       = ({ open: "blue", submitted: "purple", invoiced: "green" } as Record<string, string>)[timesheet.status] || "blue";
+  const statusColor       = ({ open: "gray", submitted: "blue", invoiced: "teal" } as Record<string, string>)[timesheet.status] || "gray";
   const statusLabel       = ({ open: "Open", submitted: "Submitted", invoiced: "Invoiced" } as Record<string, string>)[timesheet.status] || "Open";
   const TABS = [{ id: "add", label: "Add Day" }, { id: "weekly", label: `Weekly (${(timesheet.entries||[]).length})` }, { id: "summary", label: "Summary" }];
 
   return (
     <div className="space-y-5">
-      <div className="space-y-3">
-        <Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-bold text-gray-900">{timesheet.productionName || "Untitled"}</h1>
-            <p className="text-sm text-gray-400 mt-0.5">{timesheet.timesheetNumber} · Bill to {timesheet.clientName || "Unknown / add later"} · {(timesheet.entries||[]).length} day{(timesheet.entries||[]).length !== 1 ? "s" : ""} · {fmtMoney(sum.grandTotal, cur)}</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Btn variant="secondary" size="sm" onClick={openProductionRates}><Pencil size={13}/> Edit production rates</Btn>
-            <Badge color={statusColor}>{statusLabel}</Badge>
-            {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
-          </div>
-        </div>
-      </div>
+      <PageHeader
+        title={timesheet.productionName || "Untitled"}
+        description={`${timesheet.timesheetNumber} · Bill to ${timesheet.clientName || "Unknown / add later"} · ${(timesheet.entries||[]).length} day${(timesheet.entries||[]).length !== 1 ? "s" : ""} · ${fmtMoney(sum.grandTotal, cur)}`}
+        badge={<Badge color={statusColor}>{statusLabel}</Badge>}
+        secondaryActions={<Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>}
+        actions={<>
+          <Btn variant="secondary" size="sm" onClick={openProductionRates}><Pencil size={13}/> Edit production rates</Btn>
+          {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
+          <Btn variant="secondary" size="sm" disabled={!hasEntries} title={!hasEntries ? "Add at least one day before exporting a timesheet." : "Print or save this timesheet as PDF"} className={!hasEntries ? "opacity-50 cursor-not-allowed" : ""} onClick={() => hasEntries && printTimesheet(timesheet, effectiveProfile)}><FileText size={13}/> Print Timesheet</Btn>
+        </>}
+      />
+      {!hasEntries && <AlertBox type="info">Add at least one day before exporting a timesheet.</AlertBox>}
       {linkedInvoice && linkedFinalised && (
         <AlertBox type="warning">This timesheet is linked to an invoice. Editing it may require updating or recreating the invoice.</AlertBox>
       )}
@@ -2228,8 +2594,8 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
           <ProductionRateFields rates={productionRates} onChange={setProductionRates} currency={cur} />
         </Card>
       )}
-      <div className="flex border-b border-gray-200">
-        {TABS.map(t => <button key={t.id} onClick={() => setTab(t.id)} className={`px-4 py-2.5 text-sm font-medium border-b-2 -mb-px transition-colors ${tab === t.id ? "border-blue-600 text-blue-600" : "border-transparent text-gray-500 hover:text-gray-800"}`}>{t.label}</button>)}
+      <div className="flex flex-wrap gap-1 border-b border-slate-200">
+        {TABS.map(t => <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`rounded-t-lg px-4 py-2.5 text-sm font-semibold border-b-2 -mb-px transition-colors ${UI.focus} ${tab === t.id ? "border-blue-600 bg-white text-blue-700" : "border-transparent text-slate-500 hover:bg-white hover:text-slate-900"}`}>{t.label}</button>)}
       </div>
       {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={effectiveProfile} onAdd={addEntry} onShowToast={onShowToast} />}
       {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onEditEntry={entry => setEditingDay({ mode: "edit", entry })} onDuplicateEntry={duplicateEntryFromWeekly} onDeleteEntry={deleteEntry} />}
@@ -2393,10 +2759,11 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 
   return (
     <div className="space-y-5">
-      <div className="flex items-start justify-between">
-        <div><h1 className="text-xl font-bold text-gray-900">Timesheets</h1><p className="text-sm text-gray-500 mt-0.5">{(timesheets||[]).length} timesheet{(timesheets||[]).length !== 1 ? "s" : ""}</p></div>
-        <Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>
-      </div>
+      <PageHeader
+        title="Timesheets"
+        description={`${(timesheets||[]).length} timesheet${(timesheets||[]).length !== 1 ? "s" : ""}`}
+        actions={<Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>}
+      />
 
       {!profile.defaultDayRate && (
         <AlertBox type="warning">Your day rate is not set. <strong>Go to Settings → Default Rates</strong> to set your day rate and included hours — overtime will be calculated automatically.</AlertBox>
@@ -2404,15 +2771,15 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 
       {showNew && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={e => { if (e.target === e.currentTarget) { setShowNew(false); resetNewTimesheet(); } }}>
-          <div className="bg-white rounded-2xl p-6 w-full max-w-3xl shadow-2xl max-h-[90vh] overflow-y-auto">
+          <div className="bg-white rounded-xl p-5 sm:p-6 w-full max-w-4xl shadow-2xl max-h-[90vh] overflow-y-auto">
             <h2 className="text-base font-bold text-gray-900 mb-1">New Timesheet</h2>
             <p className="text-sm text-gray-400 mb-4">Production and bill-to client can be different. Rates and rules fill from your business profile.</p>
             <div className="space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <Inp label="Production / Project Name" value={newTs.productionName} onChange={e => setNewTs(p => ({ ...p, productionName: e.target.value }))} placeholder="e.g. Kokkedoor S4" autoFocus />
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <Inp label="Production / Project Name" value={newTs.productionName} onChange={e => setNewTs(p => ({ ...p, productionName: e.target.value }))} placeholder="e.g. Kokkedoor S4" autoFocus required />
                 <Inp label="Role" value={newTs.role} onChange={e => setNewTs(p => ({ ...p, role: e.target.value }))} placeholder="e.g. Sound Mixer" />
               </div>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <Inp label="Start Date" type="date" value={newTs.startDate} onChange={e => setNewTs(p => ({ ...p, startDate: e.target.value }))} />
                 <SInp label="Currency" value={newTs.currency} onChange={e => setNewTs(p => ({ ...p, currency: e.target.value }))}>
                   {["ZAR","USD","GBP","EUR"].map(c => <option key={c} value={c}>{c}</option>)}
@@ -2471,30 +2838,31 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
             <Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead><tr className="border-b border-gray-200">{["Timesheet","Production","Bill To","Days","Status","Total",""].map((h,i) => <th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i >= 5 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
-              <tbody className="divide-y divide-gray-50">
+          <div className={UI.tableWrap}>
+            <table className={UI.table}>
+              <thead><tr>{["Timesheet","Production","Bill To","Days","Status","Total",""].map((h,i) => <th key={i} className={`${UI.th} ${i >= 5 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
+              <tbody className="divide-y divide-slate-100">
                 {[...(timesheets||[])].sort((a,b) => new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime()).map(ts => {
                   const effectiveProfile = profileForTimesheet(profile, ts);
                   const s = calcSummary(ts.entries||[], effectiveProfile);
                   const billTo = getTimesheetClient(ts, clients);
-                  const col = ({ open:"blue", submitted:"purple", invoiced:"green" } as Record<string,string>)[ts.status]||"blue";
+                  const col = ({ open:"gray", submitted:"blue", invoiced:"teal" } as Record<string,string>)[ts.status]||"gray";
                   const lbl = ({ open:"Open", submitted:"Submitted", invoiced:"Invoiced" } as Record<string,string>)[ts.status]||"Open";
+                  const openTimesheet = () => { setSelected(ts); setView("detail"); };
                   return (
-                    <tr key={ts.id} className="hover:bg-gray-50 transition-colors">
-                      <td className="px-4 py-3.5"><button onClick={() => { setSelected(ts); setView("detail"); }} className="text-sm font-semibold text-blue-600 hover:text-blue-800">{ts.timesheetNumber}</button></td>
-                      <td className="px-4 py-3.5 text-sm font-medium text-gray-900">{ts.productionName||"—"}</td>
-                      <td className="px-4 py-3.5 text-sm text-gray-500">
+                    <tr key={ts.id} role="button" tabIndex={0} className={UI.rowClickable} onClick={openTimesheet} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTimesheet(); } }}>
+                      <td className={UI.td}><span className="text-sm font-semibold text-blue-700 group-hover:text-blue-800">{ts.timesheetNumber}</span></td>
+                      <td className={`${UI.td} max-w-xs truncate font-medium text-slate-950`}>{ts.productionName||"—"}</td>
+                      <td className={`${UI.td} text-slate-500`}>
                         <div className="flex items-center gap-2">
-                          <span>{clientName(billTo) || ts.clientName || "Unknown / add later"}</span>
+                          <span className="max-w-[220px] truncate">{clientName(billTo) || ts.clientName || "Unknown / add later"}</span>
                           {(!billTo || !clientBillingComplete(billTo)) && <Badge color="amber">Incomplete</Badge>}
                         </div>
                       </td>
-                      <td className="px-4 py-3.5 text-sm text-gray-500">{(ts.entries||[]).length}</td>
-                      <td className="px-4 py-3.5"><Badge color={col}>{lbl}</Badge></td>
-                      <td className="px-4 py-3.5 text-sm font-semibold text-gray-900 text-right tabular-nums">{fmtMoney(s.grandTotal, ts.currency||cur)}</td>
-                      <td className="px-4 py-3.5 text-right"><button onClick={() => deleteTS(ts.id)} className="p-1.5 rounded text-gray-300 hover:text-red-500 transition-colors"><Trash2 size={13}/></button></td>
+                      <td className={`${UI.td} text-slate-500`}>{(ts.entries||[]).length}</td>
+                      <td className={UI.td}><Badge color={col}>{lbl}</Badge></td>
+                      <td className={`${UI.td} text-right font-semibold text-slate-950 tabular-nums`}>{fmtMoney(s.grandTotal, ts.currency||cur)}</td>
+                      <td className={`${UI.td} text-right`}><IconButton label={`Delete ${ts.timesheetNumber}`} variant="danger" onClick={e => { e.stopPropagation(); deleteTS(ts.id); }}><Trash2 size={14}/></IconButton></td>
                     </tr>
                   );
                 })}
@@ -2540,6 +2908,7 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
     const paidAmount = safe(inv.paidAmount, 0);
     const balanceDue = invoiceBalance(inv);
     const statusMeta = INVOICE_STATUS[normalizeInvoiceStatus(inv.status)];
+    const displayLogo = invoiceLogoForDisplay(inv, profile);
 
     const savePatch = (patch: Partial<Invoice>) => {
       const next = normalizeInvoice({ ...inv, ...patch });
@@ -2564,49 +2933,45 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
     };
 
     const changeStatus = (status: InvoiceStatus) => {
+      const finalisingDraft = normalizeInvoiceStatus(inv.status) === "draft" && status !== "draft";
+      const logoPatch = finalisingDraft ? { sellerLogoDataUrl: profile.businessLogoDataUrl || inv.sellerLogoDataUrl || "" } : {};
       if (status === "paid") {
-        savePatch({ status, paidAmount: inv.total, paidDate: inv.paidDate || todayStr(), balanceDue: 0 });
+        savePatch({ status, paidAmount: inv.total, paidDate: inv.paidDate || todayStr(), balanceDue: 0, ...logoPatch });
         onShowToast("Invoice marked paid");
         return;
       }
-      savePatch({ status });
+      savePatch({ status, ...logoPatch });
     };
 
     const markPaid = () => changeStatus("paid");
 
     return (
       <div className="space-y-5">
-        <div className="space-y-3">
-          <Btn variant="secondary" size="sm" onClick={() => setSel(null)}>{"\u2190"} Back to Invoices</Btn>
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-xl font-bold text-gray-900">{inv.invoiceNumber || "Invoice not numbered"}</h1>
-                <Badge color={statusMeta.color}>{statusMeta.label}</Badge>
-              </div>
-              <p className="text-sm text-gray-500 mt-1">{inv.clientName || "No client set"}</p>
-              {inv.productionName && <p className="text-sm text-gray-400 mt-0.5">Production: {inv.productionName}</p>}
-              <div className="flex flex-wrap gap-x-6 gap-y-1 mt-3 text-sm">
-                <span className="text-gray-500">Total <strong className="text-gray-900 tabular-nums">{fmtMoney(inv.total, inv.currency)}</strong></span>
-                <span className="text-gray-500">Balance due <strong className={`tabular-nums ${balanceDue > 0 ? "text-red-700" : "text-green-700"}`}>{fmtMoney(balanceDue, inv.currency)}</strong></span>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-2 lg:justify-end">
-              <Btn variant="secondary" onClick={() => document.getElementById("invoice-edit-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}><Pencil size={14}/> Edit</Btn>
-              <Btn variant="secondary" onClick={exportInvoice}><FileText size={14}/> Download PDF</Btn>
-              <Btn variant="success" onClick={markPaid} disabled={normalizeInvoiceStatus(inv.status) === "paid"}><CheckCircle size={14}/> Mark Paid</Btn>
-            </div>
-          </div>
-        </div>
+        <PageHeader
+          title={inv.invoiceNumber || "Invoice not numbered"}
+          badge={<Badge color={statusMeta.color}>{statusMeta.label}</Badge>}
+          description={<>
+            <span>{inv.clientName || "No client set"}</span>
+            {inv.productionName && <span> · Production: {inv.productionName}</span>}
+            <span> · Total <strong className="text-slate-950 tabular-nums">{fmtMoney(inv.total, inv.currency)}</strong></span>
+            <span> · Balance due <strong className={`tabular-nums ${balanceDue > 0 ? "text-red-700" : "text-emerald-700"}`}>{fmtMoney(balanceDue, inv.currency)}</strong></span>
+          </>}
+          secondaryActions={<Btn variant="secondary" size="sm" onClick={() => setSel(null)}>{"\u2190"} Back to Invoices</Btn>}
+          actions={<>
+            <Btn variant="secondary" onClick={() => document.getElementById("invoice-edit-panel")?.scrollIntoView({ behavior: "smooth", block: "start" })}><Pencil size={14}/> Edit</Btn>
+            <Btn variant="secondary" onClick={exportInvoice}><FileText size={14}/> Download PDF</Btn>
+            <Btn variant="success" onClick={markPaid} disabled={normalizeInvoiceStatus(inv.status) === "paid"}><CheckCircle size={14}/> Mark Paid</Btn>
+          </>}
+        />
 
         <div id="invoice-edit-panel">
-        <Card className="p-5 max-w-3xl">
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <Card className="p-5 sm:p-6 max-w-5xl">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
             <div>
               <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Invoice #</p>
               <div className="flex items-center gap-2">
                 <p className="text-sm font-semibold">{inv.invoiceNumber || "Not set"}</p>
-                <button onClick={editInvoiceNumber} className="p-1 text-gray-300 hover:text-blue-600 rounded"><Pencil size={13}/></button>
+                <IconButton label="Edit invoice number" variant="primary" onClick={editInvoiceNumber}><Pencil size={14}/></IconButton>
               </div>
             </div>
             <SInp label="Status" value={inv.status} onChange={e => changeStatus(e.target.value as InvoiceStatus)}>
@@ -2631,16 +2996,23 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
         </Card>
         </div>
 
-        <Card className="p-8 max-w-3xl">
+        <Card className="p-5 sm:p-8 max-w-5xl">
           <div className="flex justify-between items-start mb-8">
-            <div><h2 className="text-3xl font-bold tracking-tight uppercase">{profile.invoiceLabel || "Invoice"}</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p>{inv.poNumber&&<p className="text-gray-400 text-xs mt-0.5">PO: {inv.poNumber}</p>}</div>
-            <div className="text-right"><p className="font-bold text-base">{inv.companyName||profile.companyName||profile.fullName}</p><p className="text-gray-500 text-sm">{inv.crewName || profile.fullName}</p><p className="text-gray-500 text-sm">{inv.role || profile.role}</p>{profile.email&&<p className="text-gray-500 text-sm">{profile.email}</p>}{profile.vatRegistered&&profile.vatNumber&&<p className="text-gray-500 text-sm">VAT: {profile.vatNumber}</p>}</div>
+            <div className="min-w-0">
+              {displayLogo && <img src={displayLogo} alt="Business logo" className="mb-4 max-h-20 max-w-[220px] object-contain" />}
+              <p className="font-bold text-base">{inv.companyName||profile.companyName||profile.fullName}</p>
+              <p className="text-gray-500 text-sm">{inv.crewName || profile.fullName}</p>
+              <p className="text-gray-500 text-sm">{inv.role || profile.role}</p>
+              {profile.email&&<p className="text-gray-500 text-sm">{profile.email}</p>}
+              {profile.vatRegistered&&profile.vatNumber&&<p className="text-gray-500 text-sm">VAT: {profile.vatNumber}</p>}
+            </div>
+            <div className="text-right"><h2 className="text-3xl font-bold tracking-tight uppercase">{profile.invoiceLabel || "Invoice"}</h2><p className="text-gray-400 mt-1 text-sm">{inv.invoiceNumber}</p>{inv.poNumber&&<p className="text-gray-400 text-xs mt-0.5">PO: {inv.poNumber}</p>}</div>
           </div>
-          <div className="grid grid-cols-2 gap-6 mb-8">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
             <div><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Bill To</p><p className="font-medium">{inv.clientName||"—"}</p>{c?.contactPerson&&<p className="text-sm text-gray-500">{c.contactPerson}</p>}{c?.billingAddress&&<p className="text-sm text-gray-500 whitespace-pre-line">{c.billingAddress}</p>}{c?.vatNumber&&<p className="text-sm text-gray-500">VAT: {c.vatNumber}</p>}</div>
             <div className="text-right"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Issue Date</p><p className="font-medium">{fmtDate(inv.issueDate)}</p>{inv.dueDate&&<><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1 mt-3">Due Date</p><p className="font-medium">{fmtDate(inv.dueDate)}</p></>}</div>
           </div>
-          <div className="grid grid-cols-3 gap-3 mb-6 p-3 rounded-lg border border-gray-100 bg-gray-50">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-6 p-3 rounded-lg border border-gray-100 bg-gray-50">
             <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Production</p><p className="text-sm font-medium">{inv.productionName || "Not set"}</p></div>
             <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Timesheet</p><p className="text-sm font-medium">{inv.timesheetNumber || "Not set"}</p></div>
             <div><p className="text-[10px] font-bold text-gray-300 uppercase tracking-wider">Dates</p><p className="text-sm font-medium">{inv.timesheetDates || "Not set"}</p></div>
@@ -2666,7 +3038,7 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
             </div>
           </div>
           {(inv.detailMode === "summary_timesheet" && (inv.timesheetBreakdown || []).length > 0)&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Attached Timesheet Breakdown</p>{(inv.timesheetBreakdown || []).map(item => <div key={item.id} className="grid grid-cols-12 gap-3 py-2 border-b border-gray-100"><div className="col-span-8 text-sm text-gray-700">{item.description}</div><div className="col-span-2 text-sm text-right text-gray-400">{item.quantity > 1 ? item.quantity : ""}</div><div className="col-span-2 text-sm text-right font-medium">{fmtMoney(item.amount, inv.currency)}</div></div>)}</div>}
-          {bankRows.length>0&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Banking Details</p><div className="grid grid-cols-2 gap-3">{bankRows.map(([k,v])=><div key={k}><p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">{k}</p><p className="text-sm font-medium mt-0.5">{v}</p></div>)}</div></div>}
+          {bankRows.length>0&&<div className="mt-8 pt-6 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-4">Banking Details</p><div className="grid grid-cols-1 sm:grid-cols-2 gap-3">{bankRows.map(([k,v])=><div key={k}><p className="text-xs font-semibold text-gray-300 uppercase tracking-wider">{k}</p><p className="text-sm font-medium mt-0.5">{v}</p></div>)}</div></div>}
           {(inv.paymentTerms || inv.paymentNotes)&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Payment Terms</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.paymentTerms || inv.paymentNotes}</p></div>}
           {inv.notes&&<div className="mt-6 pt-5 border-t border-gray-100"><p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-2">Notes</p><p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{inv.notes}</p></div>}
         </Card>
@@ -2676,29 +3048,16 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
 
   return (
     <div className="space-y-5">
-      <div><h1 className="text-xl font-bold text-gray-900">Invoices</h1><p className="text-sm text-gray-500 mt-0.5">{(invoices||[]).length} invoice{(invoices||[]).length !== 1 ? "s" : ""}</p></div>
+      <PageHeader
+        title="Invoices"
+        description={`${(invoices||[]).length} invoice${(invoices||[]).length !== 1 ? "s" : ""}`}
+      />
       {sortedInvoices.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-          <Card className="p-4">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Outstanding</p>
-            <p className="text-xl font-bold text-gray-900 mt-2 tabular-nums">{fmtMoney(outstandingTotal, summaryCurrency)}</p>
-            <p className="text-xs text-gray-400 mt-1">Unpaid balances</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Paid This Month</p>
-            <p className="text-xl font-bold text-green-700 mt-2 tabular-nums">{fmtMoney(paidThisMonth, summaryCurrency)}</p>
-            <p className="text-xs text-gray-400 mt-1">Invoices marked paid</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Overdue</p>
-            <p className="text-xl font-bold text-red-700 mt-2 tabular-nums">{fmtMoney(overdueTotal, summaryCurrency)}</p>
-            <p className="text-xs text-gray-400 mt-1">{overdueInvoices.length} invoice{overdueInvoices.length !== 1 ? "s" : ""}</p>
-          </Card>
-          <Card className="p-4">
-            <p className="text-xs font-bold text-gray-400 uppercase tracking-wider">Drafts</p>
-            <p className="text-xl font-bold text-gray-900 mt-2 tabular-nums">{draftCount}</p>
-            <p className="text-xs text-gray-400 mt-1">Waiting to send</p>
-          </Card>
+          <MetricCard label="Outstanding" value={fmtMoney(outstandingTotal, summaryCurrency)} detail="Unpaid balances" icon={Receipt} tone="blue" />
+          <MetricCard label="Paid This Month" value={fmtMoney(paidThisMonth, summaryCurrency)} detail="Invoices marked paid" icon={CheckCircle} tone="green" />
+          <MetricCard label="Overdue" value={fmtMoney(overdueTotal, summaryCurrency)} detail={`${overdueInvoices.length} invoice${overdueInvoices.length !== 1 ? "s" : ""}`} icon={AlertTriangle} tone="red" />
+          <MetricCard label="Drafts" value={draftCount} detail="Waiting to send" icon={FileText} tone="slate" />
         </div>
       )}
       <Card>
@@ -2709,9 +3068,9 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
             <p className="text-sm text-gray-400 max-w-sm mx-auto">Create invoices from completed timesheets. The review screen will pull in the client, production, PO, VAT, banking, and line-item totals before you download the PDF.</p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full"><thead><tr className="border-b border-gray-200">{["Invoice","Client / Production","PO","Due Date","Status","Total","Balance"].map((h,i)=><th key={i} className={`px-4 py-3 text-[10px] font-bold text-gray-400 uppercase tracking-wider ${i>=5?"text-right":"text-left"}`}>{h}</th>)}</tr></thead>
-            <tbody className="divide-y divide-gray-50">{sortedInvoices.map(i=>{const st=INVOICE_STATUS[normalizeInvoiceStatus(i.status)];const bal=invoiceBalance(i);return(<tr key={i.id} role="button" tabIndex={0} className="hover:bg-gray-50 cursor-pointer transition-colors focus:outline-none focus:bg-blue-50" onClick={()=>setSel(i.id)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSel(i.id); } }}><td className="px-4 py-3.5"><p className="text-sm font-semibold text-blue-600">{i.invoiceNumber || "Not set"}</p><p className="text-xs text-gray-400 mt-0.5">{fmtDate(i.issueDate)}</p></td><td className="px-4 py-3.5"><p className="text-sm font-medium text-gray-900">{i.clientName||"—"}</p><p className="text-xs text-gray-400 mt-0.5">{i.productionName || "No production set"}</p></td><td className="px-4 py-3.5 text-sm text-gray-400">{i.poNumber || "—"}</td><td className="px-4 py-3.5 text-sm text-gray-500">{i.dueDate ? fmtDate(i.dueDate) : "Not set"}</td><td className="px-4 py-3.5"><Badge color={st.color}>{st.label}</Badge></td><td className="px-4 py-3.5 text-sm font-semibold text-gray-900 text-right tabular-nums">{fmtMoney(i.total,i.currency)}</td><td className="px-4 py-3.5 text-sm font-semibold text-right tabular-nums">{fmtMoney(bal,i.currency)}</td></tr>);})}</tbody></table>
+          <div className={UI.tableWrap}>
+            <table className={UI.table}><thead><tr>{["Invoice","Client / Production","PO","Due Date","Status","Total","Balance"].map((h,i)=><th key={i} className={`${UI.th} ${i>=5?"text-right":"text-left"}`}>{h}</th>)}</tr></thead>
+            <tbody className="divide-y divide-slate-100">{sortedInvoices.map(i=>{const st=INVOICE_STATUS[normalizeInvoiceStatus(i.status)];const bal=invoiceBalance(i);return(<tr key={i.id} role="button" tabIndex={0} className={UI.rowClickable} onClick={()=>setSel(i.id)} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSel(i.id); } }}><td className={UI.td}><p className="text-sm font-semibold text-blue-700 group-hover:text-blue-800">{i.invoiceNumber || "Not set"}</p><p className="text-xs text-slate-400 mt-0.5">{fmtDate(i.issueDate)}</p></td><td className={UI.td}><p className="max-w-[280px] truncate text-sm font-medium text-slate-950">{i.clientName||"—"}</p><p className="max-w-[280px] truncate text-xs text-slate-400 mt-0.5">{i.productionName || "No production set"}</p></td><td className={`${UI.td} text-slate-400`}>{i.poNumber || "—"}</td><td className={`${UI.td} text-slate-500`}>{i.dueDate ? fmtDate(i.dueDate) : "Not set"}</td><td className={UI.td}><Badge color={st.color}>{st.label}</Badge></td><td className={`${UI.td} text-right font-semibold text-slate-950 tabular-nums`}>{fmtMoney(i.total,i.currency)}</td><td className={`${UI.td} text-right font-semibold tabular-nums ${bal > 0 ? "text-slate-950" : "text-emerald-700"}`}>{fmtMoney(bal,i.currency)}</td></tr>);})}</tbody></table>
           </div>
         )}
       </Card>
@@ -2728,7 +3087,7 @@ const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",la
 function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:string)=>void; profile:Profile; children:React.ReactNode }) {
   const initial = (profile.fullName||"?").charAt(0).toUpperCase();
   return (
-    <div className="flex h-screen bg-gray-50 overflow-hidden">
+    <div className="flex h-screen bg-slate-50 overflow-hidden">
       <aside className="w-52 flex flex-col flex-shrink-0 bg-slate-900">
         <div className="flex items-center gap-2.5 p-5 border-b border-slate-700/60">
           <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-sm flex-shrink-0"><Film size={14} className="text-white"/></div>
@@ -2736,7 +3095,7 @@ function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:
         </div>
         <nav className="flex-1 p-3 space-y-0.5">
           {NAV.map(({ id, label, icon: Icon }) => (
-            <button key={id} onClick={() => setPage(id)} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all ${page===id?"bg-blue-600 text-white":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
+            <button key={id} type="button" onClick={() => setPage(id)} className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-colors ${UI.focus} ${page===id?"bg-blue-600 text-white":"text-slate-400 hover:text-white hover:bg-slate-800"}`}>
               <Icon size={16}/>{label}
             </button>
           ))}
@@ -2749,7 +3108,9 @@ function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:
         </div>
       </aside>
       <div className="flex-1 flex flex-col overflow-hidden">
-        <div className="flex-1 overflow-auto p-5 lg:p-6">{children}</div>
+        <main className="flex-1 overflow-auto px-3 py-4 sm:px-5 lg:px-8 xl:px-9">
+          <div className="mx-auto w-full max-w-[1560px]">{children}</div>
+        </main>
       </div>
     </div>
   );

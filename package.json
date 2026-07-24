@@ -2,6 +2,7 @@
   "name": "crewquote-pro",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Freelancer Timesheet — Quotes, Invoices and Cost Calculations for Film & TV Professionals",
   "scripts": {
     "dev": "vite",

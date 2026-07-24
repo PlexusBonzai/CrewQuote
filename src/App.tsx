@@ -1,4 +1,4 @@
-import { Fragment, useState, useEffect, useMemo, useCallback } from "react";
+import { Component, Fragment, useState, useEffect, useMemo, useCallback } from "react";
 import {
   Clock, Receipt, Settings, Film, Plus, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
@@ -220,6 +220,23 @@ const INVOICE_STATUS: Record<InvoiceStatus, { label: string; color: string }> = 
   cancelled: { label: "Cancelled", color: "gray"  },
 };
 
+const APP_VERSION = "0.1.0";
+const CURRENT_DATA_VERSION = 1;
+const BACKUP_VERSION = 1;
+const FEEDBACK_EMAIL = "beta@crewquotepro.com";
+const IS_DEV_BUILD = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+
+const STORAGE_KEYS = {
+  dataVersion: "cqp-data-version",
+  profile: "cqp-profile",
+  clients: "cqp-clients",
+  timesheets: "cqp-timesheets",
+  invoices: "cqp-invoices",
+  onboardingDismissed: "cqp-onboarding-dismissed",
+} as const;
+
+const CREWQUOTE_STORAGE_KEYS = Object.values(STORAGE_KEYS);
+
 function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; band1Mult: number; band2Mult: number } {
   if (ruleId === "sa-film") return { band1Hours: 4,    band1Mult: 1.5, band2Mult: 2.0 };
   if (ruleId === "sa-bcea") return { band1Hours: 9999, band1Mult: 1.5, band2Mult: 1.5 };
@@ -257,16 +274,58 @@ const DEFAULT_PROFILE = {
 };
 type Profile = typeof DEFAULT_PROFILE;
 
+interface AppData {
+  dataVersion: number;
+  profile: Profile;
+  clients: Client[];
+  timesheets: Timesheet[];
+  invoices: Invoice[];
+  onboardingDismissed: boolean;
+}
+
+interface CrewQuoteBackup {
+  format: "crewquote-backup";
+  backupVersion: number;
+  appVersion: string;
+  dataVersion: number;
+  exportedAt: string;
+  data: {
+    profile: Profile;
+    clients: Client[];
+    timesheets: Timesheet[];
+    invoices: Invoice[];
+    onboardingDismissed: boolean;
+  };
+}
+
+interface ImportSummary {
+  exportedAt: string;
+  appVersion: string;
+  clients: number;
+  timesheets: number;
+  invoices: number;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // STORAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
 const Store = {
   async get(k: string) {
+    let localRaw: string | null = null;
     try {
-      const raw = window.localStorage?.getItem(k);
-      if (raw) return JSON.parse(raw);
-    } catch {}
+      localRaw = window.localStorage?.getItem(k) ?? null;
+      if (localRaw !== null) return JSON.parse(localRaw);
+    } catch (err) {
+      try {
+        const r = await (window as any).storage?.get?.(k);
+        if (r?.value) {
+          try { window.localStorage?.setItem(k, r.value); } catch {}
+          return JSON.parse(r.value);
+        }
+      } catch {}
+      throw new Error(storageReadMessage(k, err));
+    }
     try {
       const r = await (window as any).storage?.get?.(k);
       if (r?.value) {
@@ -276,12 +335,125 @@ const Store = {
     } catch {}
     return null;
   },
-  async set(k: string, v: unknown) {
+  set(k: string, v: unknown) {
     const raw = JSON.stringify(v);
-    try { window.localStorage?.setItem(k, raw); } catch {}
-    try { await (window as any).storage?.set?.(k, raw); } catch {}
+    writeRawStorage(k, raw);
+    try { void (window as any).storage?.set?.(k, raw); } catch {}
   },
 };
+
+function storageReadMessage(key: string, err: unknown) {
+  const label = storageLabel(key);
+  return `CrewQuote could not read saved ${label}. Your data has not been intentionally removed. Export an emergency backup before resetting the app.`;
+}
+
+function storageWriteMessage(err: unknown) {
+  const name = err instanceof DOMException ? err.name : "";
+  if (name === "QuotaExceededError" || name === "NS_ERROR_DOM_QUOTA_REACHED") {
+    return "CrewQuote could not save because this browser's local storage is full. Export a backup, then remove unused data or a large logo.";
+  }
+  return "CrewQuote could not save to this browser. Your current on-screen changes have not been written.";
+}
+
+function storageLabel(key: string) {
+  if (key === STORAGE_KEYS.profile) return "settings";
+  if (key === STORAGE_KEYS.clients) return "clients";
+  if (key === STORAGE_KEYS.timesheets) return "timesheets";
+  if (key === STORAGE_KEYS.invoices) return "invoices";
+  if (key === STORAGE_KEYS.onboardingDismissed) return "onboarding preference";
+  if (key === STORAGE_KEYS.dataVersion) return "data version";
+  return "CrewQuote data";
+}
+
+function writeRawStorage(key: string, raw: string) {
+  try {
+    window.localStorage?.setItem(key, raw);
+  } catch (err) {
+    throw new Error(storageWriteMessage(err));
+  }
+}
+
+function removeRawStorage(key: string) {
+  try {
+    window.localStorage?.removeItem(key);
+  } catch (err) {
+    throw new Error(storageWriteMessage(err));
+  }
+}
+
+function parseRawStorage(raw: string | null) {
+  if (raw === null || raw === "") return null;
+  return JSON.parse(raw);
+}
+
+function readCrewQuoteStorageRaw() {
+  const raw: Record<string, string | null> = {};
+  CREWQUOTE_STORAGE_KEYS.forEach(key => {
+    try { raw[key] = window.localStorage?.getItem(key) ?? null; }
+    catch { raw[key] = null; }
+  });
+  return raw;
+}
+
+function restoreCrewQuoteStorageRaw(raw: Record<string, string | null>) {
+  CREWQUOTE_STORAGE_KEYS.forEach(key => {
+    const value = raw[key] ?? null;
+    if (value === null) removeRawStorage(key);
+    else writeRawStorage(key, value);
+  });
+}
+
+function clearCrewQuoteStorage() {
+  CREWQUOTE_STORAGE_KEYS.forEach(key => removeRawStorage(key));
+}
+
+function writeAppDataToStorage(data: AppData) {
+  const payloads: Record<string, unknown> = {
+    [STORAGE_KEYS.dataVersion]: CURRENT_DATA_VERSION,
+    [STORAGE_KEYS.profile]: data.profile,
+    [STORAGE_KEYS.clients]: data.clients,
+    [STORAGE_KEYS.timesheets]: data.timesheets,
+    [STORAGE_KEYS.invoices]: data.invoices,
+    [STORAGE_KEYS.onboardingDismissed]: data.onboardingDismissed,
+  };
+  const raw = Object.fromEntries(Object.entries(payloads).map(([key, value]) => [key, JSON.stringify(value)])) as Record<string, string>;
+  Object.entries(raw).forEach(([key, value]) => writeRawStorage(key, value));
+}
+
+function backupTimestamp(d = new Date()) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+function createBackupPayload(data: AppData): CrewQuoteBackup {
+  return {
+    format: "crewquote-backup",
+    backupVersion: BACKUP_VERSION,
+    appVersion: APP_VERSION,
+    dataVersion: CURRENT_DATA_VERSION,
+    exportedAt: new Date().toISOString(),
+    data: {
+      profile: data.profile,
+      clients: data.clients,
+      timesheets: data.timesheets,
+      invoices: data.invoices,
+      onboardingDismissed: data.onboardingDismissed,
+    },
+  };
+}
+
+function downloadBackup(data: AppData, prefix = "crewquote-backup") {
+  const payload = createBackupPayload(data);
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${prefix}-${backupTimestamp()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CALCULATION ENGINE
@@ -639,6 +811,135 @@ function withEntrySnapshots(entry: TimesheetEntry, profile: Profile): TimesheetE
   };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function validStoredLogo(value: unknown) {
+  if (!value) return true;
+  if (typeof value !== "string") return false;
+  return /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$/i.test(value);
+}
+
+function validateLogoData(data: AppData) {
+  if (!validStoredLogo(data.profile.businessLogoDataUrl)) {
+    throw new Error("Backup contains a business logo that is not a supported PNG, JPG, or WebP data image.");
+  }
+  const badInvoiceLogo = data.invoices.some(inv => inv.sellerLogoDataUrl && !validStoredLogo(inv.sellerLogoDataUrl));
+  if (badInvoiceLogo) {
+    throw new Error("Backup contains an invoice logo snapshot that is not a supported PNG, JPG, or WebP data image.");
+  }
+}
+
+function migrateV0ToV1(raw: Record<string, unknown>): Record<string, unknown> {
+  const profileRaw = isRecord(raw.profile) ? raw.profile : {};
+  return {
+    ...raw,
+    dataVersion: 1,
+    profile: { ...DEFAULT_PROFILE, ...profileRaw, businessLogoDataUrl: typeof profileRaw.businessLogoDataUrl === "string" ? profileRaw.businessLogoDataUrl : "" },
+    onboardingDismissed: Boolean(raw.onboardingDismissed),
+  };
+}
+
+function migrateAppData(raw: Record<string, unknown>): Record<string, unknown> {
+  let version = Number(raw.dataVersion ?? 0);
+  if (!Number.isFinite(version) || version < 0) version = 0;
+  let next: Record<string, unknown> = { ...raw };
+  if (version === 0) next = migrateV0ToV1(next);
+  version = Number(next.dataVersion ?? version);
+  if (version > CURRENT_DATA_VERSION) {
+    throw new Error(`This data was created by a newer CrewQuote data version (${version}) and cannot be opened by this beta.`);
+  }
+  return { ...next, dataVersion: CURRENT_DATA_VERSION };
+}
+
+function normalizeAppData(rawInput: Record<string, unknown>, options: { strict?: boolean; validateLogos?: boolean } = {}): AppData {
+  const raw = migrateAppData(rawInput);
+  if (options.strict && Object.keys(rawInput).length === 0) throw new Error("Backup file does not contain CrewQuote data.");
+  if (raw.profile !== undefined && !isRecord(raw.profile)) throw new Error("Backup settings section is not valid.");
+  if (raw.clients !== undefined && !Array.isArray(raw.clients)) throw new Error("Backup clients section is not valid.");
+  if (raw.timesheets !== undefined && !Array.isArray(raw.timesheets)) throw new Error("Backup timesheets section is not valid.");
+  if (raw.invoices !== undefined && !Array.isArray(raw.invoices)) throw new Error("Backup invoices section is not valid.");
+
+  const data: AppData = {
+    dataVersion: CURRENT_DATA_VERSION,
+    profile: { ...DEFAULT_PROFILE, ...(isRecord(raw.profile) ? raw.profile : {}) },
+    clients: Array.isArray(raw.clients) ? raw.clients.map(c => normalizeClient((isRecord(c) ? c : {}) as Partial<Client>)) : [],
+    timesheets: Array.isArray(raw.timesheets) ? raw.timesheets.map(t => normalizeTimesheet((isRecord(t) ? t : {}) as Partial<Timesheet>)) : [],
+    invoices: Array.isArray(raw.invoices) ? raw.invoices.map(i => normalizeInvoice((isRecord(i) ? i : {}) as Partial<Invoice>)) : [],
+    onboardingDismissed: Boolean(raw.onboardingDismissed),
+  };
+  if (options.validateLogos !== false) validateLogoData(data);
+  return data;
+}
+
+async function loadStoredAppData(): Promise<AppData> {
+  const [version, p, c, t, i, onboardingDismissed] = await Promise.all([
+    Store.get(STORAGE_KEYS.dataVersion),
+    Store.get(STORAGE_KEYS.profile),
+    Store.get(STORAGE_KEYS.clients),
+    Store.get(STORAGE_KEYS.timesheets),
+    Store.get(STORAGE_KEYS.invoices),
+    Store.get(STORAGE_KEYS.onboardingDismissed),
+  ]);
+  return normalizeAppData({
+    dataVersion: Number(version ?? 0),
+    profile: p || undefined,
+    clients: c || undefined,
+    timesheets: t || undefined,
+    invoices: i || undefined,
+    onboardingDismissed: Boolean(onboardingDismissed),
+  }, { validateLogos: false });
+}
+
+function appDataFromRawStorage(validateLogos = false): AppData {
+  const raw = readCrewQuoteStorageRaw();
+  const parsed: Record<string, unknown> = {};
+  CREWQUOTE_STORAGE_KEYS.forEach(key => {
+    try { parsed[key] = parseRawStorage(raw[key]); }
+    catch { parsed[key] = null; }
+  });
+  return normalizeAppData({
+    dataVersion: Number(parsed[STORAGE_KEYS.dataVersion] ?? 0),
+    profile: parsed[STORAGE_KEYS.profile] || undefined,
+    clients: parsed[STORAGE_KEYS.clients] || undefined,
+    timesheets: parsed[STORAGE_KEYS.timesheets] || undefined,
+    invoices: parsed[STORAGE_KEYS.invoices] || undefined,
+    onboardingDismissed: Boolean(parsed[STORAGE_KEYS.onboardingDismissed]),
+  }, { validateLogos });
+}
+
+function validateBackupPayload(value: unknown): { data: AppData; summary: ImportSummary } {
+  if (!isRecord(value)) throw new Error("This is not a valid CrewQuote backup JSON file.");
+  if (value.format !== "crewquote-backup") throw new Error("This JSON file is not a CrewQuote backup.");
+  const backupVersion = Number(value.backupVersion);
+  if (!Number.isFinite(backupVersion)) throw new Error("This backup is missing a valid backup version.");
+  if (backupVersion > BACKUP_VERSION) throw new Error(`This backup was created by a newer CrewQuote backup format (version ${backupVersion}). This beta supports version ${BACKUP_VERSION}.`);
+  if (backupVersion < 1) throw new Error("This backup version is not supported.");
+  if (!isRecord(value.data)) throw new Error("This backup is missing its CrewQuote data section.");
+
+  const dataVersion = Number(value.dataVersion ?? value.data.dataVersion ?? 0);
+  const data = normalizeAppData({ ...value.data, dataVersion }, { strict: true, validateLogos: true });
+  return {
+    data,
+    summary: {
+      exportedAt: typeof value.exportedAt === "string" ? value.exportedAt : "",
+      appVersion: typeof value.appVersion === "string" ? value.appVersion : "Unknown",
+      clients: data.clients.length,
+      timesheets: data.timesheets.length,
+      invoices: data.invoices.length,
+    },
+  };
+}
+
+function hasMeaningfulCrewQuoteData(data: AppData) {
+  const p = data.profile;
+  return data.clients.length > 0
+    || data.timesheets.length > 0
+    || data.invoices.length > 0
+    || Boolean(p.fullName || p.companyName || p.email || p.phone || p.businessLogoDataUrl || p.bankAccountNumber || p.defaultDayRate);
+}
+
 /** Core per-day calculation — FULLY DEFENSIVE, never throws */
 function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
   try {
@@ -857,19 +1158,26 @@ const entryDefaults = (profile: Profile, prev?: TimesheetEntry, prodName?: strin
   isPublicHoliday:  false,
 });
 
-/** Duplicate previous day (keep rates/location, clear times/notes) */
-const duplicateEntry = (prev: TimesheetEntry, currentDate: string): Omit<TimesheetEntry, "id"> => ({
-  ...prev,
-  date:             currentDate,
-  callTime:         "08:00",
-  wrapTime:         "18:00",
-  notes:            "",
-  travelStartTime:  "",
-  travelEndTime:    "",
-  travelDistance:   "",
-  expenses:         0,
-  expenseDescription: "",
-});
+/** Prefill a new unsaved day from the previous saved day. */
+const duplicateEntry = (prev: TimesheetEntry, currentDate: string, includeExpenses = false): Omit<TimesheetEntry, "id"> => {
+  const {
+    id: _id,
+    calcOnSetHours: _calcOnSetHours,
+    calcMealHours: _calcMealHours,
+    calcTravelHours: _calcTravelHours,
+    calcPaidHours: _calcPaidHours,
+    calcOvertimeHours: _calcOvertimeHours,
+    calcOvertimeCost: _calcOvertimeCost,
+    calcDayTotal: _calcDayTotal,
+    ...copy
+  } = prev;
+  return {
+    ...copy,
+    date: currentDate,
+    expenses: includeExpenses ? num(prev.expenses) : 0,
+    expenseDescription: includeExpenses ? (prev.expenseDescription || "") : "",
+  };
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UI PRIMITIVES
@@ -1079,14 +1387,23 @@ function ToastContainer({ toasts }: { toasts: ToastMsg[] }) {
 // SETTINGS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking";
+type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking" | "backup";
 
-function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profile) => void }) {
+function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError }: {
+  profile: Profile;
+  appData: AppData;
+  onSave: (p: Profile) => void;
+  onExportBackup: () => void;
+  onImportBackup: (data: AppData) => void;
+  onTestError: () => void;
+}) {
   const [f, setF] = useState<Profile>({ ...DEFAULT_PROFILE, ...profile });
   const [tab, setTab] = useState<SettingsTabId>("profile");
   const [saved, setSaved] = useState(false);
   const [logoMessage, setLogoMessage] = useState<{ type: "error" | "info"; text: string } | null>(null);
   const [logoBusy, setLogoBusy] = useState(false);
+  const [importError, setImportError] = useState("");
+  const [importReady, setImportReady] = useState<{ fileName: string; summary: ImportSummary; data: AppData } | null>(null);
   const logoInputId = "business-logo-upload";
   const set  = (k: keyof Profile) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => setF(p => ({ ...p, [k]: e.target.value }));
   const setN = (k: keyof Profile) => (e: React.ChangeEvent<HTMLInputElement>) => setF(p => ({ ...p, [k]: parseFloat(e.target.value) || 0 }));
@@ -1095,15 +1412,42 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
   const hasUnsavedChanges = useMemo(() => JSON.stringify(f) !== JSON.stringify(savedProfile), [f, savedProfile]);
   const save = () => {
     try {
-      window.localStorage?.setItem("cqp-profile", JSON.stringify(f));
-    } catch {
-      setLogoMessage({ type: "error", text: "Settings could not be saved because browser storage is full. Try removing the logo or uploading a smaller image." });
+      onSave(f);
+    } catch (err) {
+      setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "Settings could not be saved. Try exporting a backup and freeing browser storage." });
       return;
     }
-    onSave(f);
     setSaved(true);
     setLogoMessage(null);
     setTimeout(() => setSaved(false), 2500);
+  };
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    setImportReady(null);
+    setImportError("");
+    if (!file) return;
+    try {
+      const text = await file.text();
+      if (!text.trim()) throw new Error("The selected backup file is empty.");
+      let parsed: unknown;
+      try { parsed = JSON.parse(text); }
+      catch { throw new Error("The selected file is not valid JSON."); }
+      const validated = validateBackupPayload(parsed);
+      setImportReady({ fileName: file.name, ...validated });
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "CrewQuote could not read this backup file.");
+    }
+  };
+  const confirmImport = () => {
+    if (!importReady) return;
+    const ok = confirm("Importing this backup will replace your current CrewQuote data. CrewQuote will first download an emergency backup of your current data.");
+    if (!ok) return;
+    try {
+      onImportBackup(importReady.data);
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : "CrewQuote could not import this backup. Your current data has been preserved.");
+    }
   };
   const handleLogoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1136,6 +1480,7 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
     { id: "overtime", label: "Overtime & Turnaround", desc: "Overtime preset, custom bands, and turnaround handling.", icon: Zap },
     { id: "timesheet", label: "Timesheet", desc: "Default meal, travel, and equipment rules.", icon: Clock },
     { id: "banking", label: "Banking", desc: "Payment details printed on invoices.", icon: Building2 },
+    { id: "backup", label: "Data & Backup", desc: "Export, import, version, and beta safety tools.", icon: Save },
   ];
   const activeSection = sections.find(s => s.id === tab) || sections[0];
   const ActiveIcon = activeSection.icon;
@@ -1361,6 +1706,78 @@ function SettingsPage({ profile, onSave }: { profile: Profile; onSave: (p: Profi
               </div>
             </SectionCard>
           )}
+
+          {tab === "backup" && (
+            <div className="space-y-5">
+              <SectionCard title="Data & Backup" description={`CrewQuote Pro Beta · Version ${APP_VERSION} · Data version ${CURRENT_DATA_VERSION}`}>
+                <div className="space-y-5">
+                  <AlertBox type="warning">
+                    CrewQuote currently stores data only in this browser on this device. It does not sync between devices. Clearing browser data may remove your records. Export regular backups.
+                  </AlertBox>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <MetricCard label="Clients" value={appData.clients.length} detail="Stored locally" icon={Users} tone="blue" />
+                    <MetricCard label="Timesheets" value={appData.timesheets.length} detail="Includes days, rates, and expenses" icon={Clock} tone="slate" />
+                    <MetricCard label="Invoices" value={appData.invoices.length} detail="Includes snapshots and payments" icon={Receipt} tone="green" />
+                  </div>
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Export Backup</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Download one JSON file containing CrewQuote-owned settings, logo, clients, timesheets, rate snapshots, expenses, invoices, payments, and numbering data.</p>
+                      </div>
+                      <Btn onClick={onExportBackup}><FileText size={14}/> Export Backup</Btn>
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <div className="flex flex-col gap-4">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">Import Backup</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Choose a CrewQuote backup JSON file. CrewQuote validates it and shows a summary before replacing anything.</p>
+                      </div>
+                      <Fld label="Backup JSON File" hint="Current data is preserved if validation fails or you cancel the import.">
+                        <input type="file" accept="application/json,.json" onChange={handleImportFile} className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100`} />
+                      </Fld>
+                      {importError && <AlertBox type="error">{importError}</AlertBox>}
+                      {importReady && (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+                          <p className="text-sm font-bold text-amber-950">Backup ready to import</p>
+                          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-amber-900">
+                            <SRow label="File" value={importReady.fileName} />
+                            <SRow label="Backup created" value={importReady.summary.exportedAt ? fmtDate(importReady.summary.exportedAt.slice(0, 10)) : "Unknown"} />
+                            <SRow label="App version" value={importReady.summary.appVersion} />
+                            <SRow label="Clients" value={importReady.summary.clients} />
+                            <SRow label="Timesheets" value={importReady.summary.timesheets} />
+                            <SRow label="Invoices" value={importReady.summary.invoices} />
+                          </div>
+                          <p className="mt-3 text-sm font-semibold text-amber-950">Importing this backup will replace your current CrewQuote data.</p>
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            <Btn variant="danger" onClick={confirmImport}>Confirm Replacement</Btn>
+                            <Btn variant="secondary" onClick={() => setImportReady(null)}>Cancel Import</Btn>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </SectionCard>
+
+              <SectionCard title="Beta support" description="Useful details for feedback and recovery.">
+                <div className="space-y-4">
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <p className="text-sm font-semibold text-slate-900">CrewQuote Pro Beta</p>
+                    <p className="mt-1 text-sm text-slate-500">Version {APP_VERSION}</p>
+                  </div>
+                  {IS_DEV_BUILD && (
+                    <div className="rounded-lg border border-slate-200 p-4">
+                      <p className="text-sm font-semibold text-slate-900">Test Recovery Screen</p>
+                      <p className="mt-1 text-sm leading-relaxed text-slate-500">Triggers a safe render error so you can confirm the recovery screen, emergency backup, and reset warning behave correctly.</p>
+                      <Btn variant="secondary" className="mt-3" onClick={() => { if (confirm("Trigger the recovery screen now?")) onTestError(); }}>Trigger Test Error</Btn>
+                    </div>
+                  )}
+                </div>
+              </SectionCard>
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -1407,8 +1824,8 @@ function ClientFields({ client, onChange }: { client: Client; onChange: (c: Clie
   );
 }
 
-function ClientsPage({ clients, onSave, onShowToast }: {
-  clients: Client[]; onSave: (clients: Client[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
+  clients: Client[]; timesheets: Timesheet[]; invoices: Invoice[]; onSave: (clients: Client[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const [draft, setDraft] = useState<Client | null>(null);
 
@@ -1428,7 +1845,14 @@ function ClientsPage({ clients, onSave, onShowToast }: {
 
   const deleteClient = (id: string) => {
     const client = clients.find(c => c.id === id);
-    if (!confirm(`Delete ${clientName(client) || "this client"}? Existing timesheets and invoices will keep their saved text.`)) return;
+    const name = clientName(client) || "this client";
+    const linkedTimesheets = (timesheets || []).filter(t => t.clientId === id);
+    const linkedInvoices = (invoices || []).filter(i => i.clientId === id);
+    if (linkedTimesheets.length || linkedInvoices.length) {
+      alert(`This client is used by ${linkedTimesheets.length} timesheet${linkedTimesheets.length !== 1 ? "s" : ""} and ${linkedInvoices.length} invoice${linkedInvoices.length !== 1 ? "s" : ""} and cannot be deleted. Archive support can be added later.`);
+      return;
+    }
+    if (!confirm(`Delete client "${name}"? This cannot be undone.`)) return;
     onSave(clients.filter(c => c.id !== id));
     onShowToast("Client deleted", "info");
   };
@@ -1461,8 +1885,8 @@ function ClientsPage({ clients, onSave, onShowToast }: {
         {clients.length === 0 ? (
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Building2 size={24} className="text-gray-300"/></div>
-            <h3 className="text-base font-semibold text-gray-900 mb-1">No invoice clients yet</h3>
-            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Save the companies and accounts contacts you bill most often. You can still create a timesheet with an unknown client and add billing details later.</p>
+            <h3 className="text-base font-semibold text-gray-900 mb-1">No clients yet</h3>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Add the company or production business you invoice.</p>
             <Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>
           </div>
         ) : (
@@ -1575,6 +1999,57 @@ function LiveCalcPanel({ entry, profile, turnaround }: { entry: Partial<Timeshee
   );
 }
 
+function CalculationBreakdown({ entry, profile, turnaround, title = "Calculation breakdown" }: {
+  entry: Partial<TimesheetEntry>;
+  profile: Profile;
+  turnaround?: number | null;
+  title?: string;
+}) {
+  const cur = profile.defaultCurrency || "ZAR";
+  const c = calcDay(entry, profile);
+  const trMin = num(entry.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
+  const trMode = (entry.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
+  const trMult = num(entry.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult || 1.5);
+  const trShort = turnaround !== undefined && turnaround !== null ? Math.max(trMin - turnaround, 0) : 0;
+  const turnaroundPenalty = trMode === "penalty" && trShort > 0 ? trShort * (c.baseHourly || 0) * trMult : 0;
+  const travelTimesEntered = Boolean(entry.travelStartTime && entry.travelEndTime);
+  const rows: { label: string; detail?: string; value: React.ReactNode; strong?: boolean }[] = [];
+  const add = (label: string, value: React.ReactNode, detail?: string, strong?: boolean) => rows.push({ label, value, detail, strong });
+
+  add("Day rate used", fmtMoney(c.dayRate, cur));
+  add("Included hours", hoursToHM(c.incH));
+  add("Base hourly rate", fmtMoney(c.baseHourly, cur), `${fmtMoney(c.dayRate, cur)} / ${hoursToHM(c.incH)}`);
+  add("On-set duration", hoursToHM(c.onSetH), `${entry.callTime || "08:00"} to ${entry.wrapTime || "18:00"}${c.overnight ? " overnight" : ""}`);
+  if (c.mealH > 0) add("Meal deduction", `-${hoursToHM(c.mealH)}`, entry.mealDeductedUsed ?? entry.mealDeducted ? "Deducted" : "Not deducted");
+  if (travelTimesEntered) add("Paid travel", c.travH > 0 ? hoursToHM(c.travH) : "Not paid", entry.travelDistance ? `${entry.travelDistance} km` : undefined);
+  add("Paid hours", hoursToHM(c.paidH), "On-set less meal plus paid travel");
+  if (c.totalOtH > 0) add("Overtime hours", hoursToHM(c.totalOtH));
+  if (c.b1H > 0) add("OT band 1 total", fmtMoney(c.b1Cost, cur), `${hoursToHM(c.b1H)} x ${fmtMoney(c.baseHourly, cur)} x ${c.bands.band1Mult}`);
+  if (c.b2H > 0) add("OT band 2 total", fmtMoney(c.b2Cost, cur), `${hoursToHM(c.b2H)} x ${fmtMoney(c.baseHourly, cur)} x ${c.bands.band2Mult}`);
+  if (c.equip > 0) add("Equipment rental", fmtMoney(c.equip, cur));
+  if (c.perDiem > 0) add("Per diem", fmtMoney(c.perDiem, cur));
+  if (c.expenses > 0) add(entry.expenseDescription ? `${entry.expenseDescription} expense` : "Expenses", fmtMoney(c.expenses, cur));
+  if (turnaroundPenalty > 0) add("Turnaround penalty", fmtMoney(turnaroundPenalty, cur), `${hoursToHM(trShort)} shortfall x ${fmtMoney(c.baseHourly, cur)} x ${trMult}`);
+  add("Day total", fmtMoney(c.total + turnaroundPenalty, cur), undefined, true);
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-4">
+      <p className="text-xs font-bold uppercase tracking-wider text-slate-400">{title}</p>
+      <div className="mt-3 divide-y divide-slate-100">
+        {rows.map((row, index) => (
+          <div key={`${row.label}-${index}`} className="grid grid-cols-[minmax(0,1fr)_auto] gap-4 py-2 text-sm">
+            <div className="min-w-0">
+              <p className={row.strong ? "font-bold text-slate-950" : "font-medium text-slate-700"}>{row.label}</p>
+              {row.detail && <p className="mt-0.5 text-xs text-slate-400">{row.detail}</p>}
+            </div>
+            <div className={`text-right tabular-nums ${row.strong ? "font-bold text-slate-950" : "font-semibold text-slate-800"}`}>{row.value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // ADD DAY FORM  — no manual OT rate, auto-filled from profile
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1583,6 +2058,7 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
   const defaultPrev = latestEntryForDefaults(timesheet.entries || []);
   const [form, setForm] = useState<Omit<TimesheetEntry, "id">>(() => entryDefaults(profile, defaultPrev, timesheet.productionName));
   const [showRates, setShowRates] = useState(false);
+  const [includePreviousExpenses, setIncludePreviousExpenses] = useState(false);
   const usedKey: Record<string, string> = { dayRate: "dayRateUsed", includedHours: "includedHoursUsed", overtimeRule: "overtimeRuleUsed", otBand1Hours: "otBand1HoursUsed", otBand1Mult: "otBand1MultUsed", otBand2Mult: "otBand2MultUsed", equipmentRental: "equipmentRentalUsed", perDiem: "perDiemUsed", travelPaid: "travelPaidUsed", mealDeducted: "mealDeductedUsed" };
   const upd    = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const v = e.target.value;
@@ -1604,11 +2080,14 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
   const isCustom = form.overtimeRule === "custom";
   const trMin = profile.defaultMinTurnaround || 10;
   const trWarn = turnaround !== null && turnaround < trMin;
+  const previousHasExpenses = Boolean(defaultPrev && (num(defaultPrev.expenses) > 0 || defaultPrev.expenseDescription));
 
   const handleDuplicate = () => {
-    if (!prev) return;
-    setForm(p => ({ ...duplicateEntry(prev, p.date) }));
-    onShowToast("Previous day duplicated — edit times as needed", "info");
+    if (!defaultPrev) return;
+    const nextDate = nextDayStr(defaultPrev.date || form.date);
+    setForm({ ...duplicateEntry(defaultPrev, nextDate, includePreviousExpenses) });
+    setShowRates(true);
+    onShowToast(includePreviousExpenses ? "Previous day duplicated with expenses — review before saving" : "Previous day duplicated without one-off expenses", "info");
   };
 
   const handleAdd = () => {
@@ -1710,14 +2189,21 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
           )}
         </div>
 
-        <div className="flex gap-3">
+        {defaultPrev && previousHasExpenses && (
+          <label className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-600">
+            <input type="checkbox" checked={includePreviousExpenses} onChange={e => setIncludePreviousExpenses(e.target.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" />
+            Include previous expenses
+          </label>
+        )}
+
+        <div className="flex flex-col gap-3 sm:flex-row">
           <button onClick={handleAdd}
             className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2">
             <Plus size={16}/> Add This Day
           </button>
-          {prev && (
-            <Btn variant="secondary" onClick={handleDuplicate} title="Copy rates and location from previous day">
-              <Copy size={14}/> Duplicate Previous
+          {defaultPrev && (
+            <Btn variant="secondary" onClick={handleDuplicate} title="Prefill a new day from the latest saved day">
+              <Copy size={14}/> Duplicate Previous Day
             </Btn>
           )}
         </div>
@@ -1861,6 +2347,7 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
   const entries = sortEntriesForTurnaround(timesheet?.entries || []);
   const cur     = profile?.defaultCurrency || "ZAR";
   const minTR   = profile?.defaultMinTurnaround || 10;
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   if (entries.length === 0)
     return <Card className="py-16 text-center"><p className="text-gray-400 text-sm">No days yet — use the "Add Day" tab to enter your first shoot day.</p></Card>;
@@ -1945,12 +2432,20 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
                   <td className={`${tdR} font-semibold text-gray-900`}>{fmtMoney(c.total || 0, cur)}</td>
                   <td className={tdCls}>
                     <div className="flex justify-end gap-1">
+                      <IconButton label={`${expandedId === e.id ? "Hide" : "Show"} calculation for ${fmtDate(e.date || "")}`} variant="primary" onClick={() => setExpandedId(p => p === e.id ? null : e.id)}><Info size={14}/></IconButton>
                       <IconButton label={`Edit day ${fmtDate(e.date || "")}`} variant="primary" onClick={() => onEditEntry(e)}><Pencil size={14}/></IconButton>
                       <IconButton label={`Duplicate day ${fmtDate(e.date || "")}`} onClick={() => onDuplicateEntry(e)}><Copy size={14}/></IconButton>
-                      <IconButton label={`Delete day ${fmtDate(e.date || "")}`} variant="danger" onClick={() => { if (confirm("Delete this timesheet day? This cannot be undone.")) onDeleteEntry(e.id); }}><Trash2 size={14}/></IconButton>
+                      <IconButton label={`Delete day ${fmtDate(e.date || "")}`} variant="danger" onClick={() => { if (confirm(`Delete timesheet day ${fmtDate(e.date || "")}? This cannot be undone.`)) onDeleteEntry(e.id); }}><Trash2 size={14}/></IconButton>
                     </div>
                   </td>
                 </tr>
+                {expandedId === e.id && (
+                  <tr className="border-b border-slate-100 bg-slate-50/70">
+                    <td colSpan={14} className="p-4">
+                      <CalculationBreakdown entry={e} profile={profile} turnaround={tr} title={`Calculation for ${fmtDate(e.date || "")}`} />
+                    </td>
+                  </tr>
+                )}
               </Fragment>
             ))}
           </tbody>
@@ -2113,6 +2608,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const [paidAmountStr, setPaidAmountStr] = useState("");
   const [paidDate, setPaidDate] = useState("");
   const [notes, setNotes] = useState(timesheet.notes || "");
+  const [showDayBreakdowns, setShowDayBreakdowns] = useState(false);
 
   const baseLines = useMemo(() => buildTimesheetLines(sum, detailMode), [sum, detailMode]);
   const timesheetBreakdown = useMemo(() => detailMode === "summary_timesheet" ? buildDetailedTimesheetLines(sum) : [], [sum, detailMode]);
@@ -2326,6 +2822,21 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
                 </div>
               ))}
             </div>
+            {sum.calcs.length > 0 && (
+              <div className="mt-4 border-t border-slate-100 pt-4">
+                <button type="button" onClick={() => setShowDayBreakdowns(v => !v)} className={`inline-flex items-center gap-2 rounded-md px-3 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-50 ${UI.focus}`}>
+                  {showDayBreakdowns ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}
+                  {showDayBreakdowns ? "Hide day calculations" : "Inspect day calculations"}
+                </button>
+                {showDayBreakdowns && (
+                  <div className="mt-3 space-y-3">
+                    {sum.calcs.map(({ entry, c }) => (
+                      <CalculationBreakdown key={entry.id} entry={entry} profile={effectiveProfile} turnaround={c.turnaround} title={`${fmtDate(entry.date)} · ${fmtMoney(c.totalWithPenalty, cur)}`} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
           </Card>
 
           {detailMode === "summary_timesheet" && (
@@ -2609,9 +3120,36 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
 // TIMESHEETS PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onSaveInvoices, onShowToast }: {
+function FirstRunOnboarding({ onSettings, onClients, onDismiss }: { onSettings: () => void; onClients: () => void; onDismiss: () => void }) {
+  return (
+    <Card className="p-5 sm:p-6">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-lg font-bold text-slate-950">Welcome to CrewQuote Pro Beta</h2>
+            <Badge color="blue">Version {APP_VERSION}</Badge>
+          </div>
+          <p className="mt-2 text-sm leading-relaxed text-slate-600">
+            Complete your business details, add a client, create a timesheet, add your work days, then generate an invoice.
+          </p>
+          <p className="mt-2 text-sm leading-relaxed text-amber-800">
+            CrewQuote currently stores data only in this browser on this device. It does not sync between devices. Clearing browser data may remove your records. Export regular backups.
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2 lg:justify-end">
+          <Btn onClick={onSettings}><Settings size={14}/> Set Up Business Details</Btn>
+          <Btn variant="secondary" onClick={onClients}><Users size={14}/> Add First Client</Btn>
+          <Btn variant="ghost" onClick={onDismiss}>Dismiss</Btn>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onSaveInvoices, onShowToast, showOnboarding, onDismissOnboarding, onNavigate }: {
   timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void;
   invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onSaveInvoices: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+  showOnboarding: boolean; onDismissOnboarding: () => void; onNavigate: (page: string) => void;
 }) {
   const [view, setView]           = useState<"list" | "detail" | "invoice-review">("list");
   const [selected, setSelected]   = useState<Timesheet | null>(null);
@@ -2724,7 +3262,18 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     setSelected(ts);
   }, [timesheets, invoices, clients, profile, onSave, onSaveInvoices, onSaveClients]);
 
-  const deleteTS = (id: string) => { if (!confirm("Delete this timesheet?")) return; onSave((timesheets||[]).filter(t => t.id !== id)); if (selected?.id === id) { setView("list"); setSelected(null); } };
+  const deleteTS = (id: string) => {
+    const ts = (timesheets || []).find(t => t.id === id);
+    const linked = (invoices || []).find(i => i.id === ts?.invoiceId || i.fromTimesheetId === id);
+    if (linked) {
+      alert(`This timesheet is linked to invoice ${linked.invoiceNumber || "not numbered"} and cannot be deleted while that invoice exists.`);
+      return;
+    }
+    const name = `${ts?.productionName || "Untitled timesheet"}${ts?.timesheetNumber ? ` - ${ts.timesheetNumber}` : ""}`;
+    if (!confirm(`Delete timesheet "${name}"? This cannot be undone.`)) return;
+    onSave((timesheets||[]).filter(t => t.id !== id));
+    if (selected?.id === id) { setView("list"); setSelected(null); }
+  };
 
   const startInvoice = useCallback((ts: Timesheet) => {
     updateTS(ts);
@@ -2764,6 +3313,14 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
         description={`${(timesheets||[]).length} timesheet${(timesheets||[]).length !== 1 ? "s" : ""}`}
         actions={<Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>}
       />
+
+      {showOnboarding && (
+        <FirstRunOnboarding
+          onSettings={() => onNavigate("settings")}
+          onClients={() => onNavigate("clients")}
+          onDismiss={onDismissOnboarding}
+        />
+      )}
 
       {!profile.defaultDayRate && (
         <AlertBox type="warning">Your day rate is not set. <strong>Go to Settings → Default Rates</strong> to set your day rate and included hours — overtime will be calculated automatically.</AlertBox>
@@ -2834,7 +3391,7 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Clock size={24} className="text-gray-300"/></div>
             <h3 className="text-base font-semibold text-gray-900 mb-1">No timesheets yet</h3>
-            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">{profile.defaultDayRate > 0 ? `Your ${fmtMoney(profile.defaultDayRate, cur)} day rate is ready. Start with the production name and bill-to client, then add shoot days as you go.` : "Set your rates in Settings, then create a timesheet for the production you are working on."}</p>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Create a timesheet to start tracking your work days and overtime.</p>
             <Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>
           </div>
         ) : (
@@ -2879,7 +3436,7 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 // INVOICES PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: Invoice[]; profile: Profile; onSave: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void }) {
+function InvoicesPage({ invoices, profile, onSave, onShowToast, onViewTimesheets }: { invoices: Invoice[]; profile: Profile; onSave: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void; onViewTimesheets: () => void }) {
   const [sel, setSel] = useState<string | null>(null);
   const sortedInvoices = [...(invoices||[])].sort((a,b)=>new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime());
   const inv = sel ? sortedInvoices.find(i => i.id === sel) || null : null;
@@ -3065,7 +3622,8 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Receipt size={24} className="text-gray-300"/></div>
             <h3 className="text-base font-semibold text-gray-900 mb-1">No invoices yet</h3>
-            <p className="text-sm text-gray-400 max-w-sm mx-auto">Create invoices from completed timesheets. The review screen will pull in the client, production, PO, VAT, banking, and line-item totals before you download the PDF.</p>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Invoices are generated from completed timesheets.</p>
+            <Btn variant="secondary" onClick={onViewTimesheets}><Clock size={14}/> View Timesheets</Btn>
           </div>
         ) : (
           <div className={UI.tableWrap}>
@@ -3084,14 +3642,50 @@ function InvoicesPage({ invoices, profile, onSave, onShowToast }: { invoices: In
 
 const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings }];
 
+function feedbackText(page: string) {
+  return [
+    "Feedback type:",
+    "[Bug / Calculation / Feature Request / Confusing Workflow / Other]",
+    "",
+    "What happened?",
+    "",
+    "What did you expect?",
+    "",
+    `Current page: /${page}`,
+    `App version: ${APP_VERSION}`,
+    `Browser: ${navigator.userAgent || "Unknown"}`,
+  ].join("\n");
+}
+
+function feedbackMailto(page: string) {
+  const subject = `CrewQuote Pro Beta Feedback - v${APP_VERSION}`;
+  return `mailto:${FEEDBACK_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(feedbackText(page))}`;
+}
+
 function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:string)=>void; profile:Profile; children:React.ReactNode }) {
   const initial = (profile.fullName||"?").charAt(0).toUpperCase();
+  const [feedbackCopied, setFeedbackCopied] = useState(false);
+  const copyFeedback = async () => {
+    try {
+      await navigator.clipboard?.writeText(feedbackText(page));
+      setFeedbackCopied(true);
+      setTimeout(() => setFeedbackCopied(false), 2000);
+    } catch {
+      window.prompt("Copy this feedback template", feedbackText(page));
+    }
+  };
   return (
     <div className="flex h-screen bg-slate-50 overflow-hidden">
       <aside className="w-52 flex flex-col flex-shrink-0 bg-slate-900">
         <div className="flex items-center gap-2.5 p-5 border-b border-slate-700/60">
           <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center shadow-sm flex-shrink-0"><Film size={14} className="text-white"/></div>
-          <div><p className="text-white font-bold text-[13px] leading-tight">CrewQuote Pro</p><p className="text-slate-500 text-[10px]">Freelancer Timesheet</p></div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <p className="text-white font-bold text-[13px] leading-tight">CrewQuote Pro</p>
+              <Badge color="blue">Beta</Badge>
+            </div>
+            <p className="text-slate-500 text-[10px]">Freelancer Timesheet</p>
+          </div>
         </div>
         <nav className="flex-1 p-3 space-y-0.5">
           {NAV.map(({ id, label, icon: Icon }) => (
@@ -3101,6 +3695,14 @@ function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:
           ))}
         </nav>
         <div className="p-4 border-t border-slate-700/60">
+          <div className="mb-3 rounded-lg border border-slate-700/70 bg-slate-800/45 p-3">
+            <p className="text-[11px] font-semibold text-slate-200">CrewQuote Pro Beta</p>
+            <p className="mt-0.5 text-[10px] text-slate-500">Version {APP_VERSION}</p>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <a href={feedbackMailto(page)} aria-label="Send CrewQuote Pro beta feedback" className={`inline-flex min-h-8 items-center justify-center rounded-md bg-slate-700 px-2.5 text-[11px] font-semibold text-slate-100 transition-colors hover:bg-slate-600 ${UI.focus}`}>Send Feedback</a>
+              <button type="button" aria-label="Copy beta feedback template" onClick={copyFeedback} className={`inline-flex min-h-8 items-center justify-center rounded-md px-2 text-[11px] font-semibold text-slate-400 transition-colors hover:bg-slate-700 hover:text-slate-100 ${UI.focus}`}>{feedbackCopied ? "Copied" : "Copy"}</button>
+            </div>
+          </div>
           <div className="flex items-center gap-2.5">
             <div className="w-7 h-7 rounded-full bg-blue-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">{initial}</div>
             <div className="min-w-0"><p className="text-white text-xs font-medium truncate">{profile.fullName||"Your Name"}</p><p className="text-slate-500 text-[10px] truncate">{profile.role||"Set role in Settings"}</p></div>
@@ -3116,27 +3718,126 @@ function Layout({ page, setPage, profile, children }: { page:string; setPage:(p:
   );
 }
 
+class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Error | null; componentStack: string; copied: boolean; detailsOpen: boolean }> {
+  state = { error: null as Error | null, componentStack: "", copied: false, detailsOpen: false };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error, componentStack: "", copied: false, detailsOpen: false };
+  }
+
+  componentDidCatch(_error: Error, info: React.ErrorInfo) {
+    this.setState({ componentStack: info.componentStack || "" });
+  }
+
+  exportEmergencyBackup = () => {
+    try {
+      downloadBackup(appDataFromRawStorage(false), "crewquote-emergency-backup");
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "CrewQuote could not export an emergency backup from this browser.");
+    }
+  };
+
+  copyErrorDetails = async () => {
+    const details = [
+      `CrewQuote Pro Beta ${APP_VERSION}`,
+      this.state.error?.name || "Error",
+      this.state.error?.message || "Unknown error",
+      this.state.componentStack,
+    ].filter(Boolean).join("\n\n");
+    try {
+      await navigator.clipboard?.writeText(details);
+      this.setState({ copied: true });
+      setTimeout(() => this.setState({ copied: false }), 2000);
+    } catch {
+      window.prompt("Copy these error details", details);
+    }
+  };
+
+  resetApp = () => {
+    const ok = confirm("This permanently removes CrewQuote data stored in this browser. Export a backup first.");
+    if (!ok) return;
+    try {
+      clearCrewQuoteStorage();
+      window.location.reload();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "CrewQuote could not reset local data.");
+    }
+  };
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="min-h-screen bg-slate-50 px-4 py-10">
+        <div className="mx-auto max-w-2xl">
+          <Card className="p-6 sm:p-8">
+            <div className="flex items-start gap-4">
+              <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-red-50 text-red-700"><AlertTriangle size={22}/></div>
+              <div className="min-w-0">
+                <p className="text-xl font-bold text-slate-950">CrewQuote encountered a problem</p>
+                <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                  The app hit an unexpected screen error. Saved data has not intentionally been removed. Reload first, or export an emergency backup before considering a reset.
+                </p>
+              </div>
+            </div>
+            <div className="mt-6 flex flex-wrap gap-2">
+              <Btn onClick={() => window.location.reload()}>Reload App</Btn>
+              <Btn variant="secondary" onClick={this.exportEmergencyBackup}><FileText size={14}/> Export Emergency Backup</Btn>
+              <Btn variant="secondary" onClick={this.copyErrorDetails}><Copy size={14}/> {this.state.copied ? "Copied" : "Copy Error Details"}</Btn>
+            </div>
+            <div className="mt-5 rounded-lg border border-slate-200 bg-slate-50">
+              <button type="button" className={`flex w-full items-center justify-between px-4 py-3 text-left text-sm font-semibold text-slate-700 ${UI.focus}`} onClick={() => this.setState(s => ({ detailsOpen: !s.detailsOpen }))}>
+                Error details
+                {this.state.detailsOpen ? <ChevronUp size={15}/> : <ChevronDown size={15}/>}
+              </button>
+              {this.state.detailsOpen && (
+                <pre className="max-h-64 overflow-auto border-t border-slate-200 p-4 text-xs leading-relaxed text-slate-600 whitespace-pre-wrap">
+                  {`${this.state.error.name}: ${this.state.error.message}\n\n${this.state.componentStack}`}
+                </pre>
+              )}
+            </div>
+            <div className="mt-6 border-t border-slate-200 pt-5">
+              <p className="text-sm font-semibold text-slate-800">Reset Application</p>
+              <p className="mt-1 text-sm leading-relaxed text-slate-500">Use this only after exporting a backup or when local browser data is intentionally disposable.</p>
+              <Btn variant="danger" className="mt-3" onClick={this.resetApp}>Reset Application</Btn>
+            </div>
+          </Card>
+        </div>
+      </div>
+    );
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════
 
-export default function App() {
+function AppShell() {
   const [page,       setPage]       = useState("timesheets");
   const [profile,    setProfile]    = useState<Profile>({ ...DEFAULT_PROFILE });
   const [clients,    setClients]    = useState<Client[]>([]);
   const [timesheets, setTimesheets] = useState<Timesheet[]>([]);
   const [invoices,   setInvoices]   = useState<Invoice[]>([]);
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
   const [ready,      setReady]      = useState(false);
   const [toasts,     setToasts]     = useState<ToastMsg[]>([]);
+  const [startupError, setStartupError] = useState("");
+  const [forceTestError, setForceTestError] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const [p, c, t, i] = await Promise.all([Store.get("cqp-profile"), Store.get("cqp-clients"), Store.get("cqp-timesheets"), Store.get("cqp-invoices")]);
-      if (p) setProfile({ ...DEFAULT_PROFILE, ...p });
-      if (c) setClients(Array.isArray(c) ? c.map(normalizeClient) : []);
-      if (t) setTimesheets(Array.isArray(t) ? t.map(normalizeTimesheet) : []);
-      if (i) setInvoices(Array.isArray(i) ? i.map(normalizeInvoice) : []);
-      setReady(true);
+      try {
+        const data = await loadStoredAppData();
+        setProfile(data.profile);
+        setClients(data.clients);
+        setTimesheets(data.timesheets);
+        setInvoices(data.invoices);
+        setOnboardingDismissed(data.onboardingDismissed);
+        try { Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION); } catch {}
+      } catch (err) {
+        setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
+      } finally {
+        setReady(true);
+      }
     })();
   }, []);
 
@@ -3146,11 +3847,69 @@ export default function App() {
     setTimeout(() => setToasts(p => p.filter(t => t.id !== id)), 3500);
   }, []);
 
-  const saveProfile    = (p: Profile)     => { setProfile(p);    Store.set("cqp-profile",    p); };
-  const saveClients    = (c: Client[])    => { setClients(c);    Store.set("cqp-clients",    c); };
-  const saveTimesheets = (t: Timesheet[]) => { setTimesheets(t); Store.set("cqp-timesheets", t); };
-  const saveInvoices   = (i: Invoice[])   => { setInvoices(i);   Store.set("cqp-invoices",   i); };
+  const currentAppData = useMemo<AppData>(() => ({
+    dataVersion: CURRENT_DATA_VERSION,
+    profile,
+    clients,
+    timesheets,
+    invoices,
+    onboardingDismissed,
+  }), [profile, clients, timesheets, invoices, onboardingDismissed]);
+
+  const persistValue = useCallback(<T,>(key: string, value: T, apply: (value: T) => void, throwOnError = false) => {
+    try {
+      Store.set(key, value);
+      Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION);
+      apply(value);
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "CrewQuote could not save to browser storage.";
+      showToast(msg, "error");
+      if (throwOnError) throw err;
+      return false;
+    }
+  }, [showToast]);
+
+  const saveProfile    = (p: Profile)     => { persistValue(STORAGE_KEYS.profile,    p, setProfile, true); };
+  const saveClients    = (c: Client[])    => { persistValue(STORAGE_KEYS.clients,    c, setClients); };
+  const saveTimesheets = (t: Timesheet[]) => { persistValue(STORAGE_KEYS.timesheets, t, setTimesheets); };
+  const saveInvoices   = (i: Invoice[])   => { persistValue(STORAGE_KEYS.invoices,   i, setInvoices); };
   const addInvoice     = (inv: Invoice)   => { const next = [...invoices, normalizeInvoice(inv)]; saveInvoices(next); };
+  const dismissOnboarding = () => {
+    persistValue(STORAGE_KEYS.onboardingDismissed, true, setOnboardingDismissed);
+  };
+  const exportBackup = () => {
+    try {
+      downloadBackup(currentAppData);
+      showToast("Backup exported", "success");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "CrewQuote could not export a backup.", "error");
+    }
+  };
+  const importBackup = (data: AppData) => {
+    const previousRaw = readCrewQuoteStorageRaw();
+    try {
+      downloadBackup(currentAppData, "crewquote-emergency-backup");
+    } catch (err) {
+      throw new Error(err instanceof Error ? `Import cancelled because CrewQuote could not create the emergency backup: ${err.message}` : "Import cancelled because CrewQuote could not create the emergency backup.");
+    }
+    try {
+      writeAppDataToStorage(data);
+      setProfile(data.profile);
+      setClients(data.clients);
+      setTimesheets(data.timesheets);
+      setInvoices(data.invoices);
+      setOnboardingDismissed(data.onboardingDismissed);
+      showToast("Backup imported successfully. Reloading CrewQuote...", "success");
+      setTimeout(() => window.location.reload(), 700);
+    } catch (err) {
+      try { restoreCrewQuoteStorageRaw(previousRaw); } catch {}
+      throw new Error(err instanceof Error ? `Import failed and your previous data was restored: ${err.message}` : "Import failed and your previous data was restored.");
+    }
+  };
+  const showOnboarding = !onboardingDismissed && !hasMeaningfulCrewQuoteData(currentAppData);
+
+  if (forceTestError) throw new Error("CrewQuote recovery screen test error.");
 
   if (!ready) return (
     <div className="h-screen flex items-center justify-center bg-slate-900">
@@ -3161,13 +3920,42 @@ export default function App() {
     </div>
   );
 
+  if (startupError) return (
+    <div className="min-h-screen bg-slate-50 px-4 py-10">
+      <div className="mx-auto max-w-2xl">
+        <Card className="p-6 sm:p-8">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-700"><AlertTriangle size={22}/></div>
+            <div>
+              <p className="text-xl font-bold text-slate-950">CrewQuote could not load saved data</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">{startupError}</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">CrewQuote has not intentionally reset your records. Export an emergency backup before taking destructive action.</p>
+            </div>
+          </div>
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Btn onClick={() => window.location.reload()}>Reload App</Btn>
+            <Btn variant="secondary" onClick={() => downloadBackup(appDataFromRawStorage(false), "crewquote-emergency-backup")}><FileText size={14}/> Export Emergency Backup</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
   return (
     <Layout page={page} setPage={setPage} profile={profile}>
       <ToastContainer toasts={toasts} />
-      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} />}
-      {page === "clients"    && <ClientsPage    clients={clients}         onSave={saveClients} onShowToast={showToast} />}
-      {page === "invoices"   && <InvoicesPage   invoices={invoices}     profile={profile} onSave={saveInvoices} onShowToast={showToast} />}
-      {page === "settings"   && <SettingsPage   profile={profile}       onSave={saveProfile} />}
+      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} showOnboarding={showOnboarding} onDismissOnboarding={dismissOnboarding} onNavigate={setPage} />}
+      {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} />}
+      {page === "invoices"   && <InvoicesPage   invoices={invoices} profile={profile} onSave={saveInvoices} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
+      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} />}
     </Layout>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppShell />
+    </ErrorBoundary>
   );
 }

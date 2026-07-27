@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { AlertTriangle, CheckCircle, LogOut, Save, UserCircle } from "lucide-react";
 import { useAuth } from "../../auth/AuthContext";
-import { getOwnProfile, updateOwnProfileFullName } from "../../services/authService";
+import { getCurrentProfile, updateCurrentProfile } from "../../services/profileService";
 
 const focus = "focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-500";
 const field = "w-full min-h-10 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm transition-colors placeholder:text-slate-300 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/25 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-400 aria-[invalid=true]:border-red-300 aria-[invalid=true]:focus:border-red-500 aria-[invalid=true]:focus:ring-red-500/20";
@@ -43,7 +43,7 @@ export function AccountPage() {
   const loadProfile = useCallback(async () => {
     setLoading(true);
     setError("");
-    const result = await getOwnProfile();
+    const result = await getCurrentProfile();
     setLoading(false);
 
     if (result.error || !result.data) {
@@ -71,7 +71,7 @@ export function AccountPage() {
     }
 
     setSaving(true);
-    const result = await updateOwnProfileFullName(fullName);
+    const result = await updateCurrentProfile({ fullName });
     setSaving(false);
 
     if (result.error || !result.data) {

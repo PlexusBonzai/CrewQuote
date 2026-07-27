@@ -1,6 +1,5 @@
 import type { AuthChangeEvent, Session, User } from "@supabase/supabase-js";
 import { isSupabaseConfigured, supabase } from "../lib/supabase";
-import type { Database } from "../types/database.types";
 
 export const MIN_PASSWORD_LENGTH = 6;
 
@@ -20,11 +19,6 @@ const AUTH_QUERY_KEYS = [
   "token_type",
   "type",
 ];
-
-type ProfileRow = Pick<
-  Database["public"]["Tables"]["profiles"]["Row"],
-  "id" | "full_name" | "email" | "created_at" | "updated_at"
->;
 
 export interface AuthServiceResult<T> {
   data: T | null;
@@ -229,90 +223,4 @@ export function subscribeToAuthChanges(callback: (event: AuthChangeEvent, sessio
 
   const { data } = client.auth.onAuthStateChange(callback);
   return data.subscription;
-}
-
-async function getSessionUser(client = getClient()) {
-  if (!client) return fail<User>(CONFIG_ERROR);
-
-  const { data, error } = await client.auth.getUser();
-  if (error) return fail<User>(normalizeAuthError(error));
-  if (!data.user) return fail<User>("You need to sign in again before updating your account.");
-  return ok(data.user);
-}
-
-function userEmail(user: User) {
-  return user.email || "";
-}
-
-function userFullName(user: User) {
-  const value = user.user_metadata?.full_name;
-  return typeof value === "string" ? value : "";
-}
-
-export async function getOwnProfile(): Promise<AuthServiceResult<ProfileRow>> {
-  const client = getClient();
-  if (!client) return fail(CONFIG_ERROR);
-
-  const userResult = await getSessionUser(client);
-  if (userResult.error || !userResult.data) return fail(userResult.error || "You need to sign in again.");
-
-  const { data, error } = await client
-    .from("profiles")
-    .select("id, full_name, email, created_at, updated_at")
-    .eq("id", userResult.data.id)
-    .maybeSingle();
-
-  if (error) return fail(normalizeAuthError(error));
-  if (data) return ok(data);
-
-  return upsertOwnProfile({
-    fullName: userFullName(userResult.data),
-    email: userEmail(userResult.data),
-  });
-}
-
-export async function upsertOwnProfile(input: { fullName: string; email?: string }): Promise<AuthServiceResult<ProfileRow>> {
-  const client = getClient();
-  if (!client) return fail(CONFIG_ERROR);
-
-  const userResult = await getSessionUser(client);
-  if (userResult.error || !userResult.data) return fail(userResult.error || "You need to sign in again.");
-
-  const user = userResult.data;
-  const { data, error } = await client
-    .from("profiles")
-    .upsert(
-      {
-        id: user.id,
-        full_name: input.fullName.trim(),
-        email: input.email?.trim() || userEmail(user),
-      },
-      { onConflict: "id" },
-    )
-    .select("id, full_name, email, created_at, updated_at")
-    .single();
-
-  if (error) return fail(normalizeAuthError(error));
-  return ok(data);
-}
-
-export async function updateOwnProfileFullName(fullName: string): Promise<AuthServiceResult<ProfileRow>> {
-  const client = getClient();
-  if (!client) return fail(CONFIG_ERROR);
-
-  const userResult = await getSessionUser(client);
-  if (userResult.error || !userResult.data) return fail(userResult.error || "You need to sign in again.");
-
-  const user = userResult.data;
-  const { data, error } = await client
-    .from("profiles")
-    .update({ full_name: fullName.trim(), email: userEmail(user) })
-    .eq("id", user.id)
-    .select("id, full_name, email, created_at, updated_at")
-    .maybeSingle();
-
-  if (error) return fail(normalizeAuthError(error));
-  if (data) return ok(data);
-
-  return upsertOwnProfile({ fullName, email: userEmail(user) });
 }

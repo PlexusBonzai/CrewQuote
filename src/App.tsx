@@ -4,7 +4,19 @@ import {
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
   Save, Zap, Copy, FileText, Info, Users, Building2, Pencil, UserCircle
 } from "lucide-react";
+import { useAuth } from "./auth/AuthContext";
 import { AccountPage } from "./components/account/AccountPage";
+import { claimLocalDataOwner, migrationCompletedForUser, readLocalDataOwnerId } from "./data/localCompatibilityStore";
+import {
+  hasPhase3MigrationSource,
+  migrateBrowserDataToCloud,
+  summarizePhase3MigrationSource,
+  type Phase3MigrationSummary,
+} from "./services/cloudMigrationService";
+import { buildCloudAwareBackupData } from "./services/cloudBackupService";
+import { getCurrentBusinessSettings, saveCurrentBusinessSettings } from "./services/businessSettingsService";
+import { getCurrentUserPreferences, saveCurrentUserPreferences } from "./services/userPreferencesService";
+import { createClient as createCloudClient, deleteClient as deleteCloudClient, listClients, updateClient as updateCloudClient } from "./services/clientService";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -241,6 +253,8 @@ const BACKUP_VERSION = 1;
 const FEEDBACK_EMAIL = "dbruning22@gmail.com";
 const DEFAULT_INVOICE_DETAIL_MODE: InvoiceDetailMode = "detailed";
 const IS_DEV_BUILD = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+const PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE =
+  "Cloud backup restore is paused during Phase 3 while settings and clients are stored in Supabase and timesheets/invoices remain in this browser. Export backup remains enabled and includes both cloud and local CrewQuote data.";
 
 const STORAGE_KEYS = {
   dataVersion: "cqp-data-version",
@@ -1506,13 +1520,17 @@ function ToastContainer({ toasts }: { toasts: ToastMsg[] }) {
 
 type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking" | "backup";
 
-function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError }: {
+function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError, cloudSaving, cloudError, migrationPanel, backupImportDisabledMessage }: {
   profile: Profile;
   appData: AppData;
-  onSave: (p: Profile) => void;
-  onExportBackup: () => void;
-  onImportBackup: (data: AppData) => void;
+  onSave: (p: Profile) => void | Promise<void>;
+  onExportBackup: () => void | Promise<void>;
+  onImportBackup: (data: AppData) => void | Promise<void>;
   onTestError: () => void;
+  cloudSaving?: boolean;
+  cloudError?: string;
+  migrationPanel?: React.ReactNode;
+  backupImportDisabledMessage?: string;
 }) {
   const [f, setF] = useState<Profile>({ ...DEFAULT_PROFILE, ...profile });
   const [tab, setTab] = useState<SettingsTabId>("profile");
@@ -1527,9 +1545,13 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
   const setT = (k: keyof Profile) => (v: boolean) => setF(p => ({ ...p, [k]: v }));
   const savedProfile = useMemo(() => ({ ...DEFAULT_PROFILE, ...profile }), [profile]);
   const hasUnsavedChanges = useMemo(() => JSON.stringify(f) !== JSON.stringify(savedProfile), [f, savedProfile]);
-  const save = () => {
+  useEffect(() => {
+    setF({ ...DEFAULT_PROFILE, ...profile });
+  }, [profile]);
+
+  const save = async () => {
     try {
-      onSave(f);
+      await onSave(f);
     } catch (err) {
       setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "Settings could not be saved. Try exporting a backup and freeing browser storage." });
       return;
@@ -1561,7 +1583,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
     const ok = confirm("Importing this backup will replace your current CrewQuote data. CrewQuote will first download an emergency backup of your current data.");
     if (!ok) return;
     try {
-      onImportBackup(importReady.data);
+      void Promise.resolve(onImportBackup(importReady.data)).catch(err => {
+        setImportError(err instanceof Error ? err.message : "CrewQuote could not import this backup. Your current data has been preserved.");
+      });
     } catch (err) {
       setImportError(err instanceof Error ? err.message : "CrewQuote could not import this backup. Your current data has been preserved.");
     }
@@ -1648,8 +1672,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
               </div>
               <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                 {hasUnsavedChanges && <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 ring-1 ring-amber-200">Unsaved changes</span>}
-                {saved && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200"><CheckCircle size={13}/> Settings saved successfully.</span>}
-                <Btn onClick={save}><Save size={14} /> Save Settings</Btn>
+                {cloudError && <span className="rounded-full bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 ring-1 ring-red-200">Cloud save unavailable</span>}
+                {saved && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200"><CheckCircle size={13}/> Saved to your CrewQuote account.</span>}
+                <Btn onClick={save} disabled={cloudSaving}><Save size={14} /> {cloudSaving ? "Saving..." : "Save Settings"}</Btn>
               </div>
             </div>
           </div>
@@ -1826,10 +1851,11 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
 
           {tab === "backup" && (
             <div className="space-y-5">
+              {migrationPanel}
               <SectionCard title="Data & Backup" description={`CrewQuote Pro Beta · Version ${APP_VERSION} · Data version ${CURRENT_DATA_VERSION}`}>
                 <div className="space-y-5">
                   <AlertBox type="warning">
-                    CrewQuote currently stores data only in this browser on this device. It does not sync between devices. Clearing browser data may remove your records. Export regular backups.
+                    CrewQuote now syncs business settings and clients to your account. Timesheets, invoices, invoice snapshots, and logo image data still remain in this browser during Phase 3.
                   </AlertBox>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <MetricCard label="Clients" value={appData.clients.length} detail="Stored locally" icon={Users} tone="blue" />
@@ -1840,7 +1866,7 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="text-sm font-semibold text-slate-900">Export Backup</p>
-                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Download one JSON file containing CrewQuote-owned settings, logo, clients, timesheets, rate snapshots, expenses, invoices, payments, and numbering data.</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Download one JSON file containing cloud settings and clients plus local logo data, timesheets, rate snapshots, expenses, invoices, payments, and numbering data.</p>
                       </div>
                       <Btn onClick={onExportBackup}><FileText size={14}/> Export Backup</Btn>
                     </div>
@@ -1849,10 +1875,11 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                     <div className="flex flex-col gap-4">
                       <div>
                         <p className="text-sm font-semibold text-slate-900">Import Backup</p>
-                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Choose a CrewQuote backup JSON file. CrewQuote validates it and shows a summary before replacing anything.</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Backup restore will return after the cloud import path is fully validated for mixed cloud/local data.</p>
                       </div>
+                      {backupImportDisabledMessage && <AlertBox type="warning">{backupImportDisabledMessage}</AlertBox>}
                       <Fld label="Backup JSON File" hint="Current data is preserved if validation fails or you cancel the import.">
-                        <input type="file" accept="application/json,.json" onChange={handleImportFile} className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100`} />
+                        <input type="file" accept="application/json,.json" onChange={handleImportFile} disabled={Boolean(backupImportDisabledMessage)} className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-400`} />
                       </Fld>
                       {importError && <AlertBox type="error">{importError}</AlertBox>}
                       {importReady && (
@@ -1868,7 +1895,7 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                           </div>
                           <p className="mt-3 text-sm font-semibold text-amber-950">Importing this backup will replace your current CrewQuote data.</p>
                           <div className="mt-4 flex flex-wrap gap-2">
-                            <Btn variant="danger" onClick={confirmImport}>Confirm Replacement</Btn>
+                            <Btn variant="danger" onClick={confirmImport} disabled={Boolean(backupImportDisabledMessage)}>Confirm Replacement</Btn>
                             <Btn variant="secondary" onClick={() => setImportReady(null)}>Cancel Import</Btn>
                           </div>
                         </div>
@@ -1946,17 +1973,26 @@ function ClientFields({ client, onChange, errors = {}, fieldPrefix = "client" }:
   );
 }
 
-function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
-  clients: Client[]; timesheets: Timesheet[]; invoices: Invoice[]; onSave: (clients: Client[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast, loading, loadError, saving, onRetry }: {
+  clients: Client[];
+  timesheets: Timesheet[];
+  invoices: Invoice[];
+  onSave: (clients: Client[]) => void | Promise<void>;
+  onShowToast: (msg: string, type?: ToastType) => void;
+  loading?: boolean;
+  loadError?: string;
+  saving?: boolean;
+  onRetry?: () => void;
 }) {
   const [draft, setDraft] = useState<Client | null>(null);
   const [clientErrors, setClientErrors] = useState<Partial<Record<keyof Client, string>>>({});
+  const [busy, setBusy] = useState(false);
 
   const startAdd = () => { setDraft(blankClient()); setClientErrors({}); };
   const startEdit = (client: Client) => { setDraft({ ...client }); setClientErrors({}); };
   const cancel = () => { setDraft(null); setClientErrors({}); };
 
-  const saveClient = () => {
+  const saveClient = async () => {
     if (!draft) return;
     const errors = clientBillingErrors(draft);
     if (Object.keys(errors).length) {
@@ -1968,13 +2004,20 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
     }
     const client = normalizeClient(draft);
     const exists = clients.some(c => c.id === client.id);
-    onSave(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
-    setDraft(null);
-    setClientErrors({});
-    onShowToast(`${client.companyName} saved`);
+    setBusy(true);
+    try {
+      await onSave(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+      setDraft(null);
+      setClientErrors({});
+      onShowToast(`${client.companyName} saved`);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const deleteClient = (id: string) => {
+  const deleteClient = async (id: string) => {
     const client = clients.find(c => c.id === id);
     const name = clientName(client) || "this client";
     const linkedTimesheets = (timesheets || []).filter(t => t.clientId === id);
@@ -1984,8 +2027,15 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
       return;
     }
     if (!confirm(`Delete client "${name}"? This cannot be undone.`)) return;
-    onSave(clients.filter(c => c.id !== id));
-    onShowToast("Client deleted", "info");
+    setBusy(true);
+    try {
+      await onSave(clients.filter(c => c.id !== id));
+      onShowToast("Client deleted", "info");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not delete this client from your account.", "error");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -1993,8 +2043,15 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
       <PageHeader
         title="Clients"
         description="Saved bill-to companies and people for invoices."
-        actions={<Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>}
+        actions={<Btn onClick={startAdd} disabled={loading || saving || busy}><Plus size={14}/> Add Client</Btn>}
       />
+      {loading && <AlertBox type="info">Loading clients from your CrewQuote account...</AlertBox>}
+      {loadError && (
+        <AlertBox type="error">
+          <span>{loadError}</span>
+          {onRetry && <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry</button>}
+        </AlertBox>
+      )}
 
       {draft && (
         <Card className="p-5 sm:p-6 max-w-5xl">
@@ -2004,8 +2061,8 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
               <p className="text-sm text-slate-500 mt-0.5">Client records are for invoice recipients only.</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Btn variant="secondary" size="sm" onClick={cancel}>{"\u2190"} Back to Clients</Btn>
-              <Btn size="sm" onClick={saveClient}><Save size={13}/> Save Client</Btn>
+              <Btn variant="secondary" size="sm" onClick={cancel} disabled={busy || saving}>{"\u2190"} Back to Clients</Btn>
+              <Btn size="sm" onClick={saveClient} disabled={busy || saving}><Save size={13}/> {busy || saving ? "Saving..." : "Save Client"}</Btn>
             </div>
           </div>
           <ClientFields client={draft} onChange={setDraft} errors={clientErrors} fieldPrefix="client" />
@@ -2040,8 +2097,8 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
                       <td className={`${UI.td} text-slate-500`}>{client.email || "—"}</td>
                       <td className={`${UI.td} max-w-xs truncate text-slate-500`}>{client.billingAddress || "Not set"}</td>
                       <td className={`${UI.td} text-right`}>
-                        <IconButton label={`Edit ${client.companyName || "client"}`} variant="primary" onClick={e => { e.stopPropagation(); startEdit(client); }}><Pencil size={14}/></IconButton>
-                        <IconButton label={`Delete ${client.companyName || "client"}`} variant="danger" onClick={e => { e.stopPropagation(); deleteClient(client.id); }}><Trash2 size={14}/></IconButton>
+                         <IconButton label={`Edit ${client.companyName || "client"}`} variant="primary" onClick={e => { e.stopPropagation(); if (!busy && !saving) startEdit(client); }}><Pencil size={14}/></IconButton>
+                         <IconButton label={`Delete ${client.companyName || "client"}`} variant="danger" onClick={e => { e.stopPropagation(); if (!busy && !saving) void deleteClient(client.id); }}><Trash2 size={14}/></IconButton>
                       </td>
                     </tr>
                   );
@@ -2717,7 +2774,7 @@ function rebuildDraftInvoiceFromTimesheet(inv: Invoice, timesheet: Timesheet, pr
 }
 
 function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoices, onSave, onUpdateTimesheet, onBack, onShowToast }: {
-  timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void; invoices: Invoice[];
+  timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void | Promise<void>; invoices: Invoice[];
   onSave: (inv: Invoice) => void; onUpdateTimesheet: (ts: Timesheet) => void; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
   const effectiveProfile = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
@@ -2764,7 +2821,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     setTimeout(() => first && document.getElementById(`invoice-client-${first}`)?.focus(), 120);
   };
 
-  const persistClientDetails = (notify = true) => {
+  const persistClientDetails = async (notify = true) => {
     const errors = clientBillingErrors(clientDraft);
     if (Object.keys(errors).length) {
       focusClientBilling(errors);
@@ -2773,7 +2830,12 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     }
     const client = normalizeClient(clientDraft);
     const exists = clients.some(c => c.id === client.id);
-    onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    try {
+      await onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+      return null;
+    }
     const updatedTS = {
       ...timesheet,
       clientId: client.id,
@@ -2789,7 +2851,7 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     return client;
   };
 
-  const saveClientDetails = () => { persistClientDetails(true); };
+  const saveClientDetails = () => { void persistClientDetails(true); };
 
   const addExtra = () => {
     const qty = parseFloat(newItem.quantity) || 1;
@@ -2882,9 +2944,10 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     return true;
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
+    const client = await persistClientDetails(false);
+    if (!client) return;
     const inv = makeInvoice();
     onSave(inv);
     onShowToast(`Invoice ${inv.invoiceNumber} saved`);
@@ -2892,7 +2955,8 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
 
   const downloadPdf = async () => {
     if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
+    const client = await persistClientDetails(false);
+    if (!client) return;
     try {
       await downloadInvoicePdf(makeInvoice(), profile);
       onShowToast("Invoice PDF downloaded");
@@ -2901,9 +2965,10 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     }
   };
 
-  const printCurrentInvoice = () => {
+  const printCurrentInvoice = async () => {
     if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
+    const client = await persistClientDetails(false);
+    if (!client) return;
     printInvoice(makeInvoice(), profile);
   };
 
@@ -3116,7 +3181,7 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
   profile: Profile;
   clients: Client[];
   invoices: Invoice[];
-  onSaveClients: (clients: Client[]) => void;
+  onSaveClients: (clients: Client[]) => void | Promise<void>;
   onSave: (invoice: Invoice) => void;
   onCancel: () => void;
   onShowToast: (msg: string, type?: ToastType) => void;
@@ -3215,7 +3280,7 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     setNewItem({ description: "", quantity: "1", unitPrice: "", taxable: true });
   };
 
-  const persistClientDetails = () => {
+  const persistClientDetails = async () => {
     const errors = clientBillingErrors(clientDraft);
     if (Object.keys(errors).length) {
       focusClientBilling(errors);
@@ -3224,7 +3289,12 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     }
     const client = normalizeClient(clientDraft);
     const exists = clients.some(c => c.id === client.id);
-    onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    try {
+      await onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+      return null;
+    }
     setClientDraft(client);
     setClientErrors({});
     if (client.paymentTerms || client.defaultPaymentTerms) setPaymentTerms(client.paymentTerms || client.defaultPaymentTerms);
@@ -3297,9 +3367,10 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     return true;
   };
 
-  const saveChanges = () => {
+  const saveChanges = async () => {
     if (!validateBeforeSave()) return;
-    persistClientDetails();
+    const client = await persistClientDetails();
+    if (!client) return;
     const next = makeEditedInvoice();
     onSave(next);
     onShowToast(`Invoice ${next.invoiceNumber} saved`);
@@ -4144,7 +4215,7 @@ function FirstRunOnboarding({ onSettings, onClients, onDismiss }: { onSettings: 
 }
 
 function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onSaveInvoices, onShowToast, showOnboarding, onDismissOnboarding, onNavigate }: {
-  timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void;
+  timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void | Promise<void>;
   invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onSaveInvoices: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
   showOnboarding: boolean; onDismissOnboarding: () => void; onNavigate: (page: string) => void;
 }) {
@@ -4187,24 +4258,34 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     setShowNewRates(false);
   };
 
-  const createTS = () => {
+  const createTS = async () => {
     if (!newTs.productionName.trim()) return;
 
     let chosenClient: Client | null = null;
     let nextClients = clients;
+    let clientsChanged = false;
 
     if (newTs.clientChoice === "new") {
       if (!newClient.companyName.trim()) { onShowToast("Enter the new client company name or choose Unknown / add later", "error"); return; }
       chosenClient = normalizeClient({ ...newClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
       nextClients = [...clients, chosenClient];
-      onSaveClients(nextClients);
+      clientsChanged = true;
     } else if (newTs.clientChoice !== "unknown") {
       chosenClient = clients.find(c => c.id === newTs.clientChoice) || null;
       if (chosenClient) {
         const remembered = normalizeClient({ ...chosenClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
         nextClients = clients.map(c => c.id === remembered.id ? remembered : c);
-        onSaveClients(nextClients);
         chosenClient = remembered;
+        clientsChanged = true;
+      }
+    }
+
+    if (clientsChanged) {
+      try {
+        await onSaveClients(nextClients);
+      } catch (err) {
+        onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+        return;
       }
     }
 
@@ -4253,7 +4334,9 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
       const client = clients.find(c => c.id === ts.clientId);
       if (client) {
         const remembered = normalizeClient({ ...client, rateMemory: memoryFromRateDraft(rateDraftFromTimesheet(ts, profile), ts.productionName) });
-        onSaveClients(clients.map(c => c.id === remembered.id ? remembered : c));
+        void Promise.resolve(onSaveClients(clients.map(c => c.id === remembered.id ? remembered : c))).catch(err => {
+          onShowToast(err instanceof Error ? err.message : "CrewQuote could not update the client rate memory.", "error");
+        });
       }
     }
     setSelected(ts);
@@ -4440,7 +4523,7 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
   profile: Profile;
   onSave: (invoices: Invoice[]) => void;
   onSaveTimesheets: (timesheets: Timesheet[]) => void;
-  onSaveClients: (clients: Client[]) => void;
+  onSaveClients: (clients: Client[]) => void | Promise<void>;
   onSaveProfile: (profile: Profile) => void;
   onShowToast: (msg: string, type?: ToastType) => void;
   onViewTimesheets: () => void;
@@ -5057,7 +5140,46 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════
 
+function Phase3MigrationPanel({ summary, busy, error, success, onImport, onDismiss }: {
+  summary: Phase3MigrationSummary;
+  busy: boolean;
+  error: string;
+  success: string;
+  onImport: () => void;
+  onDismiss?: () => void;
+}) {
+  return (
+    <Card className="p-5 sm:p-6 border-blue-200 bg-blue-50/40">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-base font-bold text-slate-950">Import browser data into your account?</p>
+          <p className="mt-1 max-w-3xl text-sm leading-relaxed text-slate-600">
+            CrewQuote found business settings and clients stored in this browser. Settings and clients will be copied into your account now. Timesheets and invoices remain stored in this browser until the next migration phase.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <MetricCard label="Business settings" value={summary.businessSettingsFound ? "Yes" : "No"} detail="Account import" icon={Settings} tone="blue" />
+            <MetricCard label="Clients" value={summary.clientCount} detail="Bill-to records" icon={Users} tone="slate" />
+            <MetricCard label="Rate memories" value={summary.rateMemoryCount} detail="Client last-used rates" icon={Zap} tone="slate" />
+            <MetricCard label="Timesheets" value={summary.timesheetCount} detail="Remain local" icon={Clock} tone="orange" />
+            <MetricCard label="Invoices" value={summary.invoiceCount} detail="Remain local" icon={Receipt} tone="orange" />
+          </div>
+          <p className="mt-4 text-sm leading-relaxed text-slate-600">
+            Existing browser data will not be deleted. CrewQuote will download a safety backup before cloud import starts and associate remaining local records in this browser with this account.
+          </p>
+          {error && <div className="mt-4"><AlertBox type="error">{error}</AlertBox></div>}
+          {success && <div className="mt-4"><AlertBox type="success">{success}</AlertBox></div>}
+        </div>
+        <div className="flex flex-shrink-0 flex-wrap gap-2 lg:justify-end">
+          <Btn onClick={onImport} disabled={busy}><Save size={14}/> {busy ? "Importing..." : "Import to My Account"}</Btn>
+          {onDismiss && <Btn variant="secondary" onClick={onDismiss} disabled={busy}>Not Now</Btn>}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
 function AppShell() {
+  const { signOut, user } = useAuth();
   const [page,       setPage]       = useState("timesheets");
   const [profile,    setProfile]    = useState<Profile>({ ...DEFAULT_PROFILE });
   const [clients,    setClients]    = useState<Client[]>([]);
@@ -5068,24 +5190,110 @@ function AppShell() {
   const [toasts,     setToasts]     = useState<ToastMsg[]>([]);
   const [startupError, setStartupError] = useState("");
   const [forceTestError, setForceTestError] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+  const [cloudSavingSettings, setCloudSavingSettings] = useState(false);
+  const [cloudSavingClients, setCloudSavingClients] = useState(false);
+  const [ownerMismatch, setOwnerMismatch] = useState(false);
+  const [ownershipClaimRequired, setOwnershipClaimRequired] = useState(false);
+  const [migrationSummary, setMigrationSummary] = useState<Phase3MigrationSummary | null>(null);
+  const [migrationDismissed, setMigrationDismissed] = useState(false);
+  const [migrationBusy, setMigrationBusy] = useState(false);
+  const [migrationError, setMigrationError] = useState("");
+  const [migrationSuccess, setMigrationSuccess] = useState("");
+
+  const loadCloudAwareData = useCallback(async () => {
+    if (!user?.id) return;
+    setReady(false);
+    setStartupError("");
+    setCloudError("");
+    setOwnerMismatch(false);
+    setOwnershipClaimRequired(false);
+    try {
+      const localData = await loadStoredAppData();
+      const localOwner = readLocalDataOwnerId();
+      const hasPrivateLocalData = hasMeaningfulCrewQuoteData(localData);
+      if (hasPrivateLocalData && localOwner && localOwner !== user.id) {
+        setProfile({ ...DEFAULT_PROFILE });
+        setClients([]);
+        setTimesheets([]);
+        setInvoices([]);
+        setOnboardingDismissed(false);
+        setMigrationSummary(null);
+        setOwnerMismatch(true);
+        return;
+      }
+      if ((localData.timesheets.length > 0 || localData.invoices.length > 0) && !localOwner) {
+        setProfile(localData.profile);
+        setClients(localData.clients);
+        setTimesheets(localData.timesheets);
+        setInvoices(localData.invoices);
+        setOnboardingDismissed(localData.onboardingDismissed);
+        setMigrationSummary(null);
+        setOwnershipClaimRequired(true);
+        return;
+      }
+
+      const migrationWasCompleted = migrationCompletedForUser(user.id);
+      const sourceSummary = summarizePhase3MigrationSource(localData);
+      const shouldHaveMigration = hasPhase3MigrationSource(localData) && !migrationWasCompleted;
+      if (shouldHaveMigration) {
+        setProfile(localData.profile);
+        setClients(localData.clients);
+        setTimesheets(localData.timesheets);
+        setInvoices(localData.invoices);
+        setOnboardingDismissed(localData.onboardingDismissed);
+        setMigrationSummary(sourceSummary);
+        setCloudError("");
+        return;
+      }
+
+      let nextProfile = localData.profile;
+      let nextClients = localData.clients;
+      let nextOnboardingDismissed = localData.onboardingDismissed;
+      let nextCloudError = "";
+
+      const [settingsResult, preferencesResult, clientsResult] = await Promise.all([
+        getCurrentBusinessSettings({ ...localData.profile, businessLogoDataUrl: localData.profile.businessLogoDataUrl || "" }),
+        getCurrentUserPreferences({ onboardingDismissed: localData.onboardingDismissed, uiPreferences: {} }),
+        listClients(),
+      ]);
+
+      if (settingsResult.error) nextCloudError = settingsResult.error;
+      else if (settingsResult.data?.exists) nextProfile = settingsResult.data.profile as Profile;
+
+      if (preferencesResult.error) nextCloudError = nextCloudError || preferencesResult.error;
+      else if (preferencesResult.data?.exists) nextOnboardingDismissed = preferencesResult.data.preferences.onboardingDismissed;
+
+      if (clientsResult.error) nextCloudError = nextCloudError || clientsResult.error;
+      else if (clientsResult.data && (clientsResult.data.length > 0 || migrationWasCompleted)) nextClients = clientsResult.data as Client[];
+
+      setProfile(nextProfile);
+      setClients(nextClients);
+      setTimesheets(localData.timesheets);
+      setInvoices(localData.invoices);
+      setOnboardingDismissed(nextOnboardingDismissed);
+
+      try {
+        Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION);
+        if (settingsResult.data?.exists) Store.set(STORAGE_KEYS.profile, nextProfile);
+        if (clientsResult.data && (clientsResult.data.length > 0 || migrationWasCompleted)) Store.set(STORAGE_KEYS.clients, nextClients);
+        if (preferencesResult.data?.exists) Store.set(STORAGE_KEYS.onboardingDismissed, nextOnboardingDismissed);
+      } catch (err) {
+        nextCloudError = nextCloudError || (err instanceof Error ? err.message : "CrewQuote could not refresh the local compatibility cache.");
+      }
+
+      setMigrationSummary(null);
+      setCloudError(nextCloudError);
+    } catch (err) {
+      setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
+    } finally {
+      setReady(true);
+    }
+  }, [migrationDismissed, user?.id]);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const data = await loadStoredAppData();
-        setProfile(data.profile);
-        setClients(data.clients);
-        setTimesheets(data.timesheets);
-        setInvoices(data.invoices);
-        setOnboardingDismissed(data.onboardingDismissed);
-        try { Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION); } catch {}
-      } catch (err) {
-        setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
-      } finally {
-        setReady(true);
-      }
-    })();
-  }, []);
+    void loadCloudAwareData();
+  }, [loadCloudAwareData]);
 
   const showToast = useCallback((msg: string, type: ToastType = "success") => {
     const id = uid();
@@ -5116,48 +5324,168 @@ function AppShell() {
     }
   }, [showToast]);
 
-  const saveProfile    = (p: Profile)     => { persistValue(STORAGE_KEYS.profile,    p, setProfile, true); };
-  const saveClients    = (c: Client[])    => { persistValue(STORAGE_KEYS.clients,    c, setClients); };
-  const saveTimesheets = (t: Timesheet[]) => { persistValue(STORAGE_KEYS.timesheets, t, setTimesheets); };
-  const saveInvoices   = (i: Invoice[])   => { persistValue(STORAGE_KEYS.invoices,   i, setInvoices); };
-  const addInvoice     = (inv: Invoice)   => {
+  const rememberLocalOwner = useCallback(() => {
+    if (user?.id) claimLocalDataOwner(user.id);
+  }, [user?.id]);
+
+  const saveProfile = useCallback(async (p: Profile) => {
+    setCloudSavingSettings(true);
+    setCloudError("");
+    try {
+      const result = await saveCurrentBusinessSettings(p, { ...profile, businessLogoDataUrl: p.businessLogoDataUrl });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not save business settings to your account.");
+      const savedProfile = { ...(result.data as Profile), businessLogoDataUrl: p.businessLogoDataUrl };
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.profile, savedProfile, setProfile, true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "CrewQuote could not save business settings to your account.";
+      setCloudError(msg);
+      throw new Error(msg);
+    } finally {
+      setCloudSavingSettings(false);
+    }
+  }, [persistValue, profile, rememberLocalOwner]);
+
+  const saveClients = useCallback(async (nextClientsInput: Client[]) => {
+    const nextClients = nextClientsInput.map(client => normalizeClient(client));
+    const previousById = new Map(clients.map(client => [client.id, client]));
+    const nextById = new Map(nextClients.map(client => [client.id, client]));
+    const removed = clients.find(client => !nextById.has(client.id));
+    const added = nextClients.find(client => !previousById.has(client.id));
+    const updated = nextClients.find(client => {
+      const previous = previousById.get(client.id);
+      return previous ? JSON.stringify(previous) !== JSON.stringify(client) : false;
+    });
+
+    if (!removed && !added && !updated) {
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.clients, nextClients, setClients);
+      return;
+    }
+
+    setCloudSavingClients(true);
+    setCloudError("");
+    try {
+      const result = removed
+        ? await deleteCloudClient(removed.id)
+        : added
+          ? await createCloudClient(added)
+          : await updateCloudClient(updated as Client);
+      if (result.error) throw new Error(result.error);
+
+      const refreshed = await listClients();
+      if (refreshed.error || !refreshed.data) throw new Error(refreshed.error || "CrewQuote could not refresh clients from your account.");
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.clients, refreshed.data as Client[], setClients, true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "CrewQuote could not save clients to your account.";
+      setCloudError(msg);
+      throw new Error(msg);
+    } finally {
+      setCloudSavingClients(false);
+    }
+  }, [clients, persistValue, rememberLocalOwner]);
+
+  const saveTimesheets = useCallback((t: Timesheet[]) => {
+    rememberLocalOwner();
+    persistValue(STORAGE_KEYS.timesheets, t, setTimesheets);
+  }, [persistValue, rememberLocalOwner]);
+
+  const saveInvoices = useCallback((i: Invoice[]) => {
+    rememberLocalOwner();
+    persistValue(STORAGE_KEYS.invoices, i, setInvoices);
+  }, [persistValue, rememberLocalOwner]);
+
+  const addInvoice = (inv: Invoice) => {
     const normalized = normalizeInvoice(inv);
     const next = [...invoices, normalized];
     saveInvoices(next);
-    saveProfile(rememberInvoiceNumber(profile, normalized.invoiceNumber));
+    void saveProfile(rememberInvoiceNumber(profile, normalized.invoiceNumber)).catch(err => {
+      showToast(err instanceof Error ? err.message : "CrewQuote could not save the invoice number history to your account.", "error");
+    });
   };
   const dismissOnboarding = () => {
-    persistValue(STORAGE_KEYS.onboardingDismissed, true, setOnboardingDismissed);
+    void (async () => {
+      const result = await saveCurrentUserPreferences({ onboardingDismissed: true, uiPreferences: {} });
+      if (result.error) {
+        setCloudError(result.error);
+        showToast(result.error, "error");
+        return;
+      }
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.onboardingDismissed, true, setOnboardingDismissed);
+    })();
   };
-  const exportBackup = () => {
+  const exportBackup = async () => {
     try {
-      downloadBackup(currentAppData);
+      const result = await buildCloudAwareBackupData(currentAppData);
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not assemble a cloud-aware backup.");
+      downloadBackup(result.data as AppData);
       showToast("Backup exported", "success");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "CrewQuote could not export a backup.", "error");
     }
   };
-  const importBackup = (data: AppData) => {
-    const previousRaw = readCrewQuoteStorageRaw();
-    try {
-      downloadBackup(currentAppData, "crewquote-emergency-backup");
-    } catch (err) {
-      throw new Error(err instanceof Error ? `Import cancelled because CrewQuote could not create the emergency backup: ${err.message}` : "Import cancelled because CrewQuote could not create the emergency backup.");
-    }
-    try {
-      writeAppDataToStorage(data);
-      setProfile(data.profile);
-      setClients(data.clients);
-      setTimesheets(data.timesheets);
-      setInvoices(data.invoices);
-      setOnboardingDismissed(data.onboardingDismissed);
-      showToast("Backup imported successfully. Reloading CrewQuote...", "success");
-      setTimeout(() => window.location.reload(), 700);
-    } catch (err) {
-      try { restoreCrewQuoteStorageRaw(previousRaw); } catch {}
-      throw new Error(err instanceof Error ? `Import failed and your previous data was restored: ${err.message}` : "Import failed and your previous data was restored.");
-    }
+  const importBackup = () => {
+    throw new Error(PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE);
   };
+
+  const runPhase3Migration = useCallback(async () => {
+    if (!migrationSummary) return;
+    setMigrationError("");
+    setMigrationSuccess("");
+    const ok = confirm("CrewQuote will first download a safety backup, then copy browser settings and clients into your account. Timesheets and invoices will remain in this browser and be associated with this account for temporary user-switch protection. Continue?");
+    if (!ok) return;
+    try {
+      downloadBackup(currentAppData, "crewquote-pre-cloud-import-backup");
+    } catch (err) {
+      setMigrationError(err instanceof Error ? `Import cancelled because CrewQuote could not create the safety backup: ${err.message}` : "Import cancelled because CrewQuote could not create the safety backup.");
+      return;
+    }
+
+    setMigrationBusy(true);
+    try {
+      const result = await migrateBrowserDataToCloud(currentAppData, APP_VERSION);
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not import browser data into your account.");
+      setMigrationSuccess(result.data.alreadyCompleted
+        ? "This browser data was already imported. CrewQuote refreshed your account data."
+        : `Imported settings, preferences, and ${result.data.counts.clients} client${result.data.counts.clients === 1 ? "" : "s"} into your account.`);
+      setMigrationSummary(null);
+      await loadCloudAwareData();
+    } catch (err) {
+      setMigrationError(err instanceof Error ? err.message : "CrewQuote could not import browser data into your account.");
+    } finally {
+      setMigrationBusy(false);
+    }
+  }, [currentAppData, loadCloudAwareData, migrationSummary]);
+
+  const topMigrationPanel = migrationSummary && !migrationDismissed ? (
+    <Phase3MigrationPanel
+      summary={migrationSummary}
+      busy={migrationBusy}
+      error={migrationError}
+      success={migrationSuccess}
+      onImport={() => void runPhase3Migration()}
+      onDismiss={() => setMigrationDismissed(true)}
+    />
+  ) : null;
+
+  const settingsMigrationPanel = migrationSummary ? (
+    <Phase3MigrationPanel
+      summary={migrationSummary}
+      busy={migrationBusy}
+      error={migrationError}
+      success={migrationSuccess}
+      onImport={() => void runPhase3Migration()}
+    />
+  ) : null;
+
+  const saveProfileFromLocalWorkflow = useCallback((nextProfile: Profile) => {
+    void saveProfile(nextProfile).catch(err => {
+      showToast(err instanceof Error ? err.message : "CrewQuote could not save settings to your account.", "error");
+    });
+  }, [saveProfile, showToast]);
+
   const showOnboarding = !onboardingDismissed && !hasMeaningfulCrewQuoteData(currentAppData);
 
   if (forceTestError) throw new Error("CrewQuote recovery screen test error.");
@@ -5192,13 +5520,65 @@ function AppShell() {
     </div>
   );
 
+  if (ownershipClaimRequired) return (
+    <div className="min-h-screen bg-slate-50 px-4 py-10">
+      <div className="mx-auto max-w-2xl">
+        <Card className="p-6 sm:p-8">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-700"><Info size={22}/></div>
+            <div>
+              <p className="text-xl font-bold text-slate-950">Use this account for browser-local CrewQuote records?</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                This browser contains local CrewQuote timesheets or invoices. To protect them from other sign-ins in this browser profile, associate the remaining local records with the current account before continuing.
+              </p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">
+                This does not upload timesheets or invoices. They remain in this browser until a later migration phase.
+              </p>
+            </div>
+          </div>
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Btn onClick={() => { if (user?.id) claimLocalDataOwner(user.id); setOwnershipClaimRequired(false); void loadCloudAwareData(); }}>Use This Account</Btn>
+            <Btn variant="secondary" onClick={() => void signOut()}>Sign Out</Btn>
+            <Btn variant="secondary" onClick={() => downloadBackup(appDataFromRawStorage(false), "crewquote-browser-ownership-backup")}><FileText size={14}/> Export Browser Backup</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
+  if (ownerMismatch) return (
+    <div className="min-h-screen bg-slate-50 px-4 py-10">
+      <div className="mx-auto max-w-2xl">
+        <Card className="p-6 sm:p-8">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-700"><AlertTriangle size={22}/></div>
+            <div>
+              <p className="text-xl font-bold text-slate-950">CrewQuote browser data belongs to another account</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                This browser contains CrewQuote records associated with another account. Sign in with the account that owns these records or use a separate browser profile.
+              </p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">
+                CrewQuote has stopped before loading any saved records on this screen.
+              </p>
+            </div>
+          </div>
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Btn onClick={() => void signOut()}>Sign Out</Btn>
+            <Btn variant="secondary" onClick={() => downloadBackup(appDataFromRawStorage(false), "crewquote-browser-owner-mismatch-backup")}><FileText size={14}/> Export Browser Backup</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
   return (
     <Layout page={page} setPage={setPage} profile={profile}>
       <ToastContainer toasts={toasts} />
+      {topMigrationPanel && page !== "settings" && <div className="mb-5">{topMigrationPanel}</div>}
       {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} showOnboarding={showOnboarding} onDismissOnboarding={dismissOnboarding} onNavigate={setPage} />}
-      {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} />}
-      {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveTimesheets={saveTimesheets} onSaveClients={saveClients} onSaveProfile={saveProfile} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
-      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} />}
+      {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} loadError={cloudError} saving={cloudSavingClients} onRetry={() => void loadCloudAwareData()} />}
+      {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveTimesheets={saveTimesheets} onSaveClients={saveClients} onSaveProfile={saveProfileFromLocalWorkflow} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
+      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} cloudSaving={cloudSavingSettings} cloudError={cloudError} migrationPanel={settingsMigrationPanel} backupImportDisabledMessage={PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE} />}
       {page === "account"    && <AccountPage />}
     </Layout>
   );

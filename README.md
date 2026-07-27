@@ -12,8 +12,9 @@ The active app is rendered by `src/main.tsx`, which imports `src/App.tsx` direct
 - Clients
 - Invoices
 - Settings
+- Account
 
-The app stores data in browser `localStorage` using `cqp-*` keys, with a fallback read/write path for `window.storage` when available. No backend is required for the current version.
+Phase 2 adds a Supabase authentication gate and Account screen. Timesheets, clients, invoices, settings, calculations, and PDF export still store data in browser `localStorage` using `cqp-*` keys, with a fallback read/write path for `window.storage` when available.
 
 ## Core Workflow
 
@@ -62,6 +63,10 @@ The production build checks the active app files and compile-safe support module
 
 - `src/main.tsx`
 - `src/App.tsx`
+- `src/auth/`
+- `src/components/auth/`
+- `src/components/account/`
+- `src/services/authService.ts`
 - `src/lib/supabase.ts`
 - `src/types/database.types.ts`
 
@@ -71,13 +76,20 @@ The archived modular files are intentionally excluded from TypeScript checking u
 
 Local Supabase scaffolding is documented in `docs/supabase-phase-1.md`. Phase 1 does not add auth screens, replace `localStorage`, connect the current UI to Supabase data, or apply changes to a hosted Supabase project.
 
+## Supabase Phase 2
+
+Authentication UI and dashboard setup notes are documented in `docs/supabase-phase-2-auth.md`. Phase 2 protects the existing app behind Supabase Auth, but does not migrate browser `localStorage` data or change the Phase 1 database schema.
+
 ## Project Structure
 
 ```text
 src/
   App.tsx       Active monolithic app
+  auth/         Supabase auth provider and protected app wrapper
+  components/   Auth and account UI
   lib/          Compile-safe support clients
   main.tsx      React entrypoint
+  services/     Supabase auth/profile service functions
   index.css     Tailwind/global styles
   types/        Generated type targets
 

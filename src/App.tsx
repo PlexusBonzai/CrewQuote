@@ -2,8 +2,9 @@ import { Component, Fragment, forwardRef, useState, useEffect, useMemo, useCallb
 import {
   Clock, Receipt, Settings, Film, Plus, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
-  Save, Zap, Copy, FileText, Info, Users, Building2, Pencil
+  Save, Zap, Copy, FileText, Info, Users, Building2, Pencil, UserCircle
 } from "lucide-react";
+import { AccountPage } from "./components/account/AccountPage";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -4772,7 +4773,7 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
 // LAYOUT
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings }];
+const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings },{ id:"account",label:"Account",icon:UserCircle }];
 
 type FeedbackType = "Bug" | "Calculation issue" | "Feature request" | "Confusing workflow" | "Other";
 
@@ -5198,6 +5199,7 @@ function AppShell() {
       {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} />}
       {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveTimesheets={saveTimesheets} onSaveClients={saveClients} onSaveProfile={saveProfile} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
       {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} />}
+      {page === "account"    && <AccountPage />}
     </Layout>
   );
 }

@@ -28,7 +28,7 @@ Copy `.env.example` to `.env.local` only when you want to test against a local S
 
 ```bash
 VITE_SUPABASE_URL=http://127.0.0.1:54321
-VITE_SUPABASE_ANON_KEY=replace-with-local-anon-key
+VITE_SUPABASE_PUBLISHABLE_KEY=replace-with-local-publishable-key
 ```
 
 The app still builds without these variables. `src/lib/supabase.ts` exports `supabase` as `null` when the variables are absent and exposes `getSupabaseBrowserClient()` for future code that wants a hard failure only at the point of use.

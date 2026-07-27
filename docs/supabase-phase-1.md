@@ -10,8 +10,9 @@ Included:
 - Supabase CLI dev dependency and local scripts
 - Local Supabase project config in `supabase/config.toml`
 - Versioned migration in `supabase/migrations/20260727120000_supabase_phase_1.sql`
+- Additive schema-completion migration in `supabase/migrations/20260727133000_supabase_phase_1_schema_completion.sql`
 - Typed browser client in `src/lib/supabase.ts`
-- Type-generation target in `src/types/supabase.generated.ts`
+- Type-generation target in `src/types/database.types.ts`
 - Private Storage bucket named `business-logos`
 
 Not included yet:
@@ -48,17 +49,26 @@ These commands are local-only. They require Docker through the Supabase CLI.
 The migration creates these owned application tables:
 
 - `profiles`
+- `business_settings`
+- `user_preferences`
 - `clients`
+- `rate_presets`
 - `timesheets`
 - `timesheet_entries`
+- `day_expenses`
 - `invoices`
 - `invoice_lines`
+- `payments`
+- `import_batches`
 
-Every user-owned table has either `id = auth.uid()` for `profiles` or a `user_id` column referencing `auth.users(id)`. Child relationships use composite foreign keys such as `(user_id, client_id)` and `(user_id, timesheet_id)` so rows cannot link to another user's parent records.
+Every user-owned table has either `id = auth.uid()` for `profiles` or a `user_id` column referencing `auth.users(id)`. Child relationships use composite foreign keys such as `(user_id, client_id)`, `(user_id, timesheet_id)`, `(user_id, timesheet_entry_id)`, and `(user_id, invoice_id)` so rows cannot link to another user's parent records.
 
 Important constraints include:
 
 - Per-user unique timesheet and invoice numbers
+- One business settings row and one preferences row per user
+- Idempotent localStorage import batches by per-user source fingerprint
+- Positive payment amounts
 - Enum-backed statuses, overtime rules, turnaround modes, invoice detail modes, currencies, and invoice line categories
 - Non-negative money, hour, multiplier, meal-break, and line-order checks
 - Due dates cannot be before issue dates
@@ -87,6 +97,8 @@ Objects must be stored under a user-id folder:
 
 Storage policies allow authenticated users to read, insert, update, and delete only objects whose first path segment matches their own user id. The `profiles.business_logo_path` and `invoices.seller_logo_path` constraints mirror that folder rule.
 
+The bucket allows original uploads up to 5 MB. The browser UI may still compress or resize logos later, but Phase 1 keeps the database/storage limit aligned with the original migration requirement.
+
 ## Type Generation
 
 After the local Supabase stack is running and migrations have been applied:
@@ -95,7 +107,7 @@ After the local Supabase stack is running and migrations have been applied:
 npm run supabase:types:local
 ```
 
-This overwrites `src/types/supabase.generated.ts` from the local database. Do not run remote type generation or link to a hosted project during Phase 1.
+This overwrites `src/types/database.types.ts` from the local database. Do not run remote type generation or link to a hosted project during Phase 1.
 
 ## Verification
 

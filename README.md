@@ -63,7 +63,7 @@ The production build checks the active app files and compile-safe support module
 - `src/main.tsx`
 - `src/App.tsx`
 - `src/lib/supabase.ts`
-- `src/types/supabase.generated.ts`
+- `src/types/database.types.ts`
 
 The archived modular files are intentionally excluded from TypeScript checking until that rewrite is ready to be resumed.
 

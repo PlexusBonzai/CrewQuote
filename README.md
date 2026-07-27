@@ -58,20 +58,28 @@ Open the URL printed by Vite, usually `http://127.0.0.1:5173`.
 npm run build
 ```
 
-The production build checks only the active app files:
+The production build checks the active app files and compile-safe support modules:
 
 - `src/main.tsx`
 - `src/App.tsx`
+- `src/lib/supabase.ts`
+- `src/types/supabase.generated.ts`
 
 The archived modular files are intentionally excluded from TypeScript checking until that rewrite is ready to be resumed.
+
+## Supabase Phase 1
+
+Local Supabase scaffolding is documented in `docs/supabase-phase-1.md`. Phase 1 does not add auth screens, replace `localStorage`, connect the current UI to Supabase data, or apply changes to a hosted Supabase project.
 
 ## Project Structure
 
 ```text
 src/
   App.tsx       Active monolithic app
+  lib/          Compile-safe support clients
   main.tsx      React entrypoint
   index.css     Tailwind/global styles
+  types/        Generated type targets
 
 archive/modular-wip/
   src/          Preserved modular rewrite work, not part of the active app

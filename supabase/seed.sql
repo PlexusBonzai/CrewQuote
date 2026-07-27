@@ -1,0 +1,2 @@
+-- Intentionally empty for Supabase Phase 1.
+-- Seed data will be added only after auth and data flows are wired intentionally.

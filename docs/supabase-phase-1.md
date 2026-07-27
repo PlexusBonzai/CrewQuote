@@ -63,6 +63,15 @@ The migration creates these owned application tables:
 
 Every user-owned table has either `id = auth.uid()` for `profiles` or a `user_id` column referencing `auth.users(id)`. Child relationships use composite foreign keys such as `(user_id, client_id)`, `(user_id, timesheet_id)`, `(user_id, timesheet_entry_id)`, and `(user_id, invoice_id)` so rows cannot link to another user's parent records.
 
+Client identity is transitional during the localStorage-to-cloud migration:
+
+- `clients.id` is the Supabase UUID primary key.
+- `clients.legacy_id` preserves the existing CrewQuote browser-facing client ID used by local timesheets and invoices.
+- Local timesheets and invoices continue referencing `legacy_id` during Phase 3.
+- `(user_id, legacy_id)` is unique when `legacy_id` is present; multiple null `legacy_id` values are allowed.
+- New cloud clients receive both a UUID and an app-facing legacy ID during Phase 3.
+- Historical local timesheet and invoice client references must not be rewritten during Phase 3.
+
 Important constraints include:
 
 - Per-user unique timesheet and invoice numbers

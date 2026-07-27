@@ -162,6 +162,7 @@ export type Database = {
           default_payment_terms: string
           email: string
           id: string
+          legacy_id: string | null
           notes: string
           payment_terms: string
           phone: string
@@ -182,6 +183,7 @@ export type Database = {
           default_payment_terms?: string
           email?: string
           id?: string
+          legacy_id?: string | null
           notes?: string
           payment_terms?: string
           phone?: string
@@ -202,6 +204,7 @@ export type Database = {
           default_payment_terms?: string
           email?: string
           id?: string
+          legacy_id?: string | null
           notes?: string
           payment_terms?: string
           phone?: string

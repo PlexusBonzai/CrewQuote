@@ -89,6 +89,15 @@ Cloud client reads map back to the existing frontend model with `Client.id = leg
 
 The current app has client-specific last-used rate memory embedded in `Client.rateMemory`; it does not yet expose independent reusable preset management. Phase 3 preserves client rate memory on `clients.rate_memory` and leaves `rate_presets` available for future standalone presets.
 
+## Timesheet Legacy IDs
+
+`timesheets.id` remains the Supabase UUID primary key. `timesheets.legacy_id` preserves the existing CrewQuote app-facing timesheet ID during the staged cloud migration.
+
+- Existing local invoices continue to reference the app-facing timesheet ID, not the cloud UUID.
+- `(user_id, legacy_id)` is unique when `legacy_id` is present; null legacy IDs remain valid for existing cloud rows.
+- New Phase 4 timesheets will receive both a cloud UUID and an app-facing legacy ID.
+- Historical local invoice references must not be rewritten.
+
 ## Import Batches
 
 Browser migration uses `import_batches` with:

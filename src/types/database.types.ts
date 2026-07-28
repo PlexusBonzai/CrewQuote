@@ -980,6 +980,7 @@ export type Database = {
           equipment_rental_daily: boolean | null
           id: string
           invoice_id: string | null
+          legacy_id: string | null
           meal_breaks_deducted: boolean | null
           notes: string | null
           payment_terms: string | null
@@ -987,6 +988,22 @@ export type Database = {
           role: string
           start_date: string | null
           status: Database["public"]["Enums"]["timesheet_status"]
+          summary_day_count: number
+          summary_day_rate_total: number
+          summary_equipment_total: number
+          summary_expense_total: number
+          summary_grand_total: number
+          summary_mixed_vat: boolean
+          summary_overtime_hours: number
+          summary_overtime_total: number
+          summary_paid_hours: number
+          summary_per_diem_total: number
+          summary_snapshot: Json
+          summary_subtotal: number
+          summary_travel_hours: number
+          summary_turnaround_penalty_total: number
+          summary_vat_amount: number
+          summary_vat_rate: number
           timesheet_number: string
           travel_time_paid: boolean | null
           updated_at: string
@@ -1018,6 +1035,7 @@ export type Database = {
           equipment_rental_daily?: boolean | null
           id?: string
           invoice_id?: string | null
+          legacy_id?: string | null
           meal_breaks_deducted?: boolean | null
           notes?: string | null
           payment_terms?: string | null
@@ -1025,6 +1043,22 @@ export type Database = {
           role?: string
           start_date?: string | null
           status?: Database["public"]["Enums"]["timesheet_status"]
+          summary_day_count?: number
+          summary_day_rate_total?: number
+          summary_equipment_total?: number
+          summary_expense_total?: number
+          summary_grand_total?: number
+          summary_mixed_vat?: boolean
+          summary_overtime_hours?: number
+          summary_overtime_total?: number
+          summary_paid_hours?: number
+          summary_per_diem_total?: number
+          summary_snapshot?: Json
+          summary_subtotal?: number
+          summary_travel_hours?: number
+          summary_turnaround_penalty_total?: number
+          summary_vat_amount?: number
+          summary_vat_rate?: number
           timesheet_number: string
           travel_time_paid?: boolean | null
           updated_at?: string
@@ -1056,6 +1090,7 @@ export type Database = {
           equipment_rental_daily?: boolean | null
           id?: string
           invoice_id?: string | null
+          legacy_id?: string | null
           meal_breaks_deducted?: boolean | null
           notes?: string | null
           payment_terms?: string | null
@@ -1063,6 +1098,22 @@ export type Database = {
           role?: string
           start_date?: string | null
           status?: Database["public"]["Enums"]["timesheet_status"]
+          summary_day_count?: number
+          summary_day_rate_total?: number
+          summary_equipment_total?: number
+          summary_expense_total?: number
+          summary_grand_total?: number
+          summary_mixed_vat?: boolean
+          summary_overtime_hours?: number
+          summary_overtime_total?: number
+          summary_paid_hours?: number
+          summary_per_diem_total?: number
+          summary_snapshot?: Json
+          summary_subtotal?: number
+          summary_travel_hours?: number
+          summary_turnaround_penalty_total?: number
+          summary_vat_amount?: number
+          summary_vat_rate?: number
           timesheet_number?: string
           travel_time_paid?: boolean | null
           updated_at?: string

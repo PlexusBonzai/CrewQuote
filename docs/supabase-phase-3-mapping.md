@@ -98,6 +98,32 @@ The current app has client-specific last-used rate memory embedded in `Client.ra
 - New Phase 4 timesheets will receive both a cloud UUID and an app-facing legacy ID.
 - Historical local invoice references must not be rewritten.
 
+## Timesheet Summary Snapshots
+
+`calcSummary` remains the only CrewQuote calculation authority. Phase 4 will run it in the application after a successful work-day change, then save its output on the owning `timesheets` row. PostgreSQL stores the already-calculated values and does not recalculate them with triggers.
+
+| `calcSummary` value | Persisted field |
+| --- | --- |
+| `totalDays` | `summary_day_count` |
+| `totalPaidH` | `summary_paid_hours` |
+| `totalOtH` | `summary_overtime_hours` |
+| `totalTravH` | `summary_travel_hours` |
+| `totalDayRates` | `summary_day_rate_total` |
+| `totalOtCost` | `summary_overtime_total` |
+| `totalEquip` | `summary_equipment_total` |
+| `totalPerDiem` | `summary_per_diem_total` |
+| `totalExp` | `summary_expense_total` |
+| `totalTurnaroundPenalty` | `summary_turnaround_penalty_total` |
+| `subtotal` | `summary_subtotal` |
+| `vatPct` | `summary_vat_rate` |
+| `mixedVat` | `summary_mixed_vat` |
+| `vatAmt` | `summary_vat_amount` |
+| `grandTotal` | `summary_grand_total` |
+
+`summary_snapshot` stores an object-form audit snapshot of the calculated summary, including the existing per-day calculation breakdown where Phase 4 supplies it. It is not a second calculation engine and contains no client, invoice, or authentication records.
+
+Work-day rate and calculation snapshots remain on `timesheet_entries`. Loading a timesheet must use saved snapshots rather than recalculating historical values from current Settings. Changing Settings alone must not rewrite summary fields. Invoices remain local during Phase 4 and continue using the existing saved timesheet/day data and invoice workflow.
+
 ## Import Batches
 
 Browser migration uses `import_batches` with:

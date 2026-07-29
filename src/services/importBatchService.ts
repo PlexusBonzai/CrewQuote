@@ -4,9 +4,9 @@ import { cloudFail, cloudOk, type CloudResult } from "../data/dataErrors";
 import type { ImportCounts } from "../data/crewquoteTypes";
 import type { Json } from "../types/database.types";
 
-const SOURCE = "localstorage-phase-3";
+const DEFAULT_SOURCE = "localstorage-phase-3";
 
-export async function findCompletedImportBatch(fingerprint: string): Promise<CloudResult<boolean>> {
+export async function findCompletedImportBatch(fingerprint: string, source = DEFAULT_SOURCE): Promise<CloudResult<boolean>> {
   try {
     const userIdResult = await getCurrentUserId();
     if (userIdResult.error || !userIdResult.data) return cloudFail(userIdResult.error);
@@ -15,7 +15,7 @@ export async function findCompletedImportBatch(fingerprint: string): Promise<Clo
       .from("import_batches")
       .select("id")
       .eq("user_id", userIdResult.data)
-      .eq("source", SOURCE)
+      .eq("source", source)
       .eq("source_fingerprint", fingerprint)
       .eq("status", "completed")
       .maybeSingle();
@@ -26,7 +26,7 @@ export async function findCompletedImportBatch(fingerprint: string): Promise<Clo
   }
 }
 
-export async function startImportBatch(fingerprint: string, appVersion: string, dataVersion: number): Promise<CloudResult<string>> {
+export async function startImportBatch(fingerprint: string, appVersion: string, dataVersion: number, source = DEFAULT_SOURCE): Promise<CloudResult<string>> {
   try {
     const userIdResult = await getCurrentUserId();
     if (userIdResult.error || !userIdResult.data) return cloudFail(userIdResult.error);
@@ -35,6 +35,7 @@ export async function startImportBatch(fingerprint: string, appVersion: string, 
       .from("import_batches")
       .select("id")
       .eq("user_id", userIdResult.data)
+      .eq("source", source)
       .eq("source_fingerprint", fingerprint)
       .maybeSingle();
     if (existing.error) return cloudFail(existing.error);
@@ -53,7 +54,7 @@ export async function startImportBatch(fingerprint: string, appVersion: string, 
       .from("import_batches")
       .insert({
         user_id: userIdResult.data,
-        source: SOURCE,
+        source,
         source_fingerprint: fingerprint,
         source_app_version: appVersion,
         source_data_version: dataVersion,
@@ -69,7 +70,7 @@ export async function startImportBatch(fingerprint: string, appVersion: string, 
   }
 }
 
-export async function completeImportBatch(id: string, counts: ImportCounts): Promise<CloudResult<true>> {
+export async function completeImportBatch(id: string, counts: ImportCounts | Record<string, number>): Promise<CloudResult<true>> {
   try {
     const client = getSupabaseBrowserClient();
     const { error } = await client
@@ -83,7 +84,7 @@ export async function completeImportBatch(id: string, counts: ImportCounts): Pro
   }
 }
 
-export async function failImportBatch(id: string, counts: Partial<ImportCounts> = {}): Promise<CloudResult<true>> {
+export async function failImportBatch(id: string, counts: ImportCounts | Record<string, number> = {}): Promise<CloudResult<true>> {
   try {
     const client = getSupabaseBrowserClient();
     const { error } = await client

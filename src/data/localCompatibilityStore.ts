@@ -1,5 +1,8 @@
 export const PHASE3_LOCAL_DATA_OWNER_KEY = "cqp-local-data-owner-user-id";
 const PHASE3_MIGRATION_COMPLETE_PREFIX = "cqp-phase3-migration-completed-";
+const PHASE4_MIGRATION_COMPLETE_PREFIX = "cqp-phase4-timesheets-migration-completed-";
+const PHASE4_TIMESHEET_MIRROR_PREFIX = "cqp-phase4-timesheet-mirror-";
+const CALCULATION_SNAPSHOTS_PREFIX = "cqp-timesheet-calculation-snapshots-v1-";
 
 function readString(key: string) {
   try {
@@ -29,3 +32,36 @@ export function markMigrationCompletedForUser(userId: string, fingerprint: strin
   writeString(`${PHASE3_MIGRATION_COMPLETE_PREFIX}${userId}`, "true");
   writeString(`${PHASE3_MIGRATION_COMPLETE_PREFIX}${userId}-fingerprint`, fingerprint);
 }
+
+export function phase4MigrationCompletedForUser(userId: string) {
+  return readString(`${PHASE4_MIGRATION_COMPLETE_PREFIX}${userId}`) === "true";
+}
+
+export function markPhase4MigrationCompletedForUser(userId: string, fingerprint: string) {
+  writeString(`${PHASE4_MIGRATION_COMPLETE_PREFIX}${userId}`, "true");
+  writeString(`${PHASE4_MIGRATION_COMPLETE_PREFIX}${userId}-fingerprint`, fingerprint);
+}
+
+export function phase4MigrationFingerprintForUser(userId: string) {
+  return readString(`${PHASE4_MIGRATION_COMPLETE_PREFIX}${userId}-fingerprint`);
+}
+
+export function writePhase4TimesheetMirror(userId: string, timesheets: unknown[]) {
+  window.localStorage?.setItem(`${PHASE4_TIMESHEET_MIRROR_PREFIX}${userId}`, JSON.stringify({ version: 1, timesheets }));
+}
+
+export function readPhase4TimesheetMirror(userId: string): unknown[] {
+  try {
+    const value = JSON.parse(readString(`${PHASE4_TIMESHEET_MIRROR_PREFIX}${userId}`));
+    return Array.isArray(value?.timesheets) ? value.timesheets : [];
+  } catch { return []; }
+}
+
+export function readCalculationSnapshots(ownerUserId: string) {
+  try { const value = JSON.parse(readString(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`)); return value && typeof value === "object" ? value as Record<string, unknown> : {}; } catch { return {}; }
+}
+export function getCalculationSnapshot(ownerUserId: string, timesheetLegacyId: string) { return readCalculationSnapshots(ownerUserId)[timesheetLegacyId]; }
+export function saveCalculationSnapshot(ownerUserId: string, snapshot: { ownerUserId: string; timesheetLegacyId: string }) { if (snapshot.ownerUserId !== ownerUserId) throw new Error("CrewQuote cannot save a calculation snapshot for another account."); const snapshots = readCalculationSnapshots(ownerUserId); snapshots[snapshot.timesheetLegacyId] = snapshot; writeString(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`, JSON.stringify(snapshots)); }
+export function removeCalculationSnapshot(ownerUserId: string, timesheetLegacyId: string) { const snapshots = readCalculationSnapshots(ownerUserId); delete snapshots[timesheetLegacyId]; writeString(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`, JSON.stringify(snapshots)); }
+export function clearCalculationSnapshotsForOwner(ownerUserId: string) { window.localStorage?.removeItem(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`); }
+export function validateCalculationSnapshotOwner(snapshot: unknown, ownerUserId: string) { return Boolean(snapshot && typeof snapshot === "object" && (snapshot as { ownerUserId?: string }).ownerUserId === ownerUserId); }

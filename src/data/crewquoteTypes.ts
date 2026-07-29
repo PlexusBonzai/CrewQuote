@@ -97,3 +97,88 @@ export interface ImportCounts {
   clients: number;
   rate_presets: number;
 }
+
+export interface CrewTimesheetEntry {
+  id: string;
+  date: string;
+  productionName: string;
+  location: string;
+  notes: string;
+  callTime: string;
+  wrapTime: string;
+  mealBreakMinutes: number;
+  mealDeducted: boolean;
+  travelStartTime: string;
+  travelEndTime: string;
+  travelDistance: string;
+  travelPaid: boolean;
+  dayRate: number;
+  includedHours: number;
+  overtimeRule: OTRuleId;
+  otBand1Hours: number;
+  otBand1Mult: number;
+  otBand2Mult: number;
+  equipmentRental: number;
+  perDiem: number;
+  expenses: number;
+  expenseDescription: string;
+  dayRateUsed?: number;
+  includedHoursUsed?: number;
+  overtimeRuleUsed?: OTRuleId;
+  otBand1HoursUsed?: number;
+  otBand1MultUsed?: number;
+  otBand2MultUsed?: number;
+  equipmentRentalUsed?: number;
+  perDiemUsed?: number;
+  vatRateUsed?: number;
+  travelPaidUsed?: boolean;
+  mealDeductedUsed?: boolean;
+  turnaroundRuleUsed?: TurnaroundMode;
+  turnaroundMinimumHoursUsed?: number;
+  turnaroundPenaltyMultUsed?: number;
+  calcOnSetHours?: number;
+  calcMealHours?: number;
+  calcTravelHours?: number;
+  calcPaidHours?: number;
+  calcOvertimeHours?: number;
+  calcOvertimeCost?: number;
+  calcDayTotal?: number;
+  calcSnapshot?: unknown;
+  isSunday: boolean;
+  isPublicHoliday: boolean;
+}
+
+export interface CrewTimesheet {
+  id: string;
+  timesheetNumber: string;
+  productionName: string;
+  clientId?: string;
+  clientName?: string;
+  clientIncomplete?: boolean;
+  crewName: string;
+  role: string;
+  startDate?: string;
+  notes?: string;
+  currency: string;
+  vat: number;
+  status: "open" | "submitted" | "invoiced";
+  entries: CrewTimesheetEntry[];
+  paymentTerms?: string;
+  defaultDayRate?: number;
+  defaultIncludedHours?: number;
+  defaultEquipmentRental?: number;
+  defaultPerDiem?: number;
+  defaultOvertimeRule?: OTRuleId;
+  defaultOtBand1Hours?: number;
+  defaultOtBand1Mult?: number;
+  defaultOtBand2Mult?: number;
+  defaultMinTurnaround?: number;
+  defaultTurnaroundMode?: TurnaroundMode;
+  defaultTurnaroundPenMult?: number;
+  mealBreaksDeducted?: boolean;
+  travelTimePaid?: boolean;
+  equipmentRentalDaily?: boolean;
+  summarySnapshot?: unknown;
+  invoiceId?: string;
+  createdAt: string;
+}

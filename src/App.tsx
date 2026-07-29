@@ -6,17 +6,27 @@ import {
 } from "lucide-react";
 import { useAuth } from "./auth/AuthContext";
 import { AccountPage } from "./components/account/AccountPage";
-import { claimLocalDataOwner, migrationCompletedForUser, readLocalDataOwnerId } from "./data/localCompatibilityStore";
+import { claimLocalDataOwner, getCalculationSnapshot, migrationCompletedForUser, phase4MigrationCompletedForUser, phase4MigrationFingerprintForUser, readCalculationSnapshots, readLocalDataOwnerId } from "./data/localCompatibilityStore";
 import {
   hasPhase3MigrationSource,
   migrateBrowserDataToCloud,
   summarizePhase3MigrationSource,
   type Phase3MigrationSummary,
 } from "./services/cloudMigrationService";
-import { buildCloudAwareBackupData } from "./services/cloudBackupService";
+import { buildCloudAwareBackupData, buildPhase4CloudBackupData } from "./services/cloudBackupService";
+import { migratePreparedTimesheets, preflightPhase4TimesheetMigration, type Phase4MigrationPreflight, type Phase4MigrationStage } from "./services/timesheetMigrationService";
 import { getCurrentBusinessSettings, saveCurrentBusinessSettings } from "./services/businessSettingsService";
 import { getCurrentUserPreferences, saveCurrentUserPreferences } from "./services/userPreferencesService";
 import { createClient as createCloudClient, deleteClient as deleteCloudClient, listClients, updateClient as updateCloudClient } from "./services/clientService";
+import { calcDay, calcSummary, calcTurnaround, entryCallDateTime, sortEntriesForTurnaround, num, profileForTimesheet } from "./domain/calculations/timesheetCalculations";
+import {
+  calculationSourceFingerprint,
+  confirmCurrentBaselineSnapshot,
+  evaluateCalculationSnapshot,
+  prepareCurrentBaselineSnapshot,
+  type LegacyTimesheetCalculationSnapshotV1,
+} from "./domain/calculations/timesheetCalculationSnapshots";
+import type { CrewTimesheet } from "./data/crewquoteTypes";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -267,12 +277,6 @@ const STORAGE_KEYS = {
 
 const CREWQUOTE_STORAGE_KEYS = Object.values(STORAGE_KEYS);
 
-function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; band1Mult: number; band2Mult: number } {
-  if (ruleId === "sa-film") return { band1Hours: 4,    band1Mult: 1.5, band2Mult: 2.0 };
-  if (ruleId === "sa-bcea") return { band1Hours: 9999, band1Mult: 1.5, band2Mult: 1.5 };
-  return { band1Hours: profile.defaultOtBand1Hours ?? 4, band1Mult: profile.defaultOtBand1Mult ?? 1.5, band2Mult: profile.defaultOtBand2Mult ?? 2.0 };
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // PROFILE DEFAULTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -326,6 +330,14 @@ interface CrewQuoteBackup {
     timesheets: Timesheet[];
     invoices: Invoice[];
     onboardingDismissed: boolean;
+    calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> };
+    phase4Recovery?: {
+      localOwnerUserId: string;
+      phase4MigrationFingerprint: string;
+      phase3MigrationCompleted: boolean;
+      phase4MigrationAlreadyCompleted: boolean;
+      cloudRecovery: unknown;
+    };
   };
 }
 
@@ -456,7 +468,7 @@ function backupTimestamp(d = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
 }
 
-function createBackupPayload(data: AppData): CrewQuoteBackup {
+function createBackupPayload(data: AppData, calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> }, phase4Recovery?: CrewQuoteBackup["data"]["phase4Recovery"]): CrewQuoteBackup {
   return {
     format: "crewquote-backup",
     backupVersion: BACKUP_VERSION,
@@ -469,12 +481,14 @@ function createBackupPayload(data: AppData): CrewQuoteBackup {
       timesheets: data.timesheets,
       invoices: data.invoices,
       onboardingDismissed: data.onboardingDismissed,
+      calculationSnapshots,
+      phase4Recovery,
     },
   };
 }
 
-function downloadBackup(data: AppData, prefix = "crewquote-backup") {
-  const payload = createBackupPayload(data);
+function downloadBackup(data: AppData, prefix = "crewquote-backup", calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> }, phase4Recovery?: CrewQuoteBackup["data"]["phase4Recovery"]) {
+  const payload = createBackupPayload(data, calculationSnapshots, phase4Recovery);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -490,11 +504,8 @@ function downloadBackup(data: AppData, prefix = "crewquote-backup") {
 // CALCULATION ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
 
-const toMins     = (t: string) => { if (!t) return 0; const [h = 0, m = 0] = (t + ":0").split(":").map(Number); return h * 60 + m; };
-const durH       = (s: string, e: string) => { let sm = toMins(s), em = toMins(e); if (em <= sm) em += 1440; return Math.max((em - sm) / 60, 0); };
 const hoursToHM  = (h: number) => { const n = Math.abs(h ?? 0); const hrs = Math.floor(n); const m = Math.round((n - hrs) * 60); return m > 0 ? `${hrs}h ${m}m` : `${hrs}h`; };
 const safe       = (v: unknown, def = 0) => parseFloat(String(v ?? def)) || def;
-const num        = (v: unknown, def = 0) => { const n = parseFloat(String(v ?? "")); return Number.isFinite(n) ? n : def; };
 const uid        = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const todayStr   = () => new Date().toISOString().split("T")[0];
 const nextDayStr = (d: string) => { try { const dt = new Date(d + "T12:00:00"); dt.setDate(dt.getDate() + 1); return dt.toISOString().split("T")[0]; } catch { return todayStr(); } };
@@ -504,38 +515,6 @@ const fmtMoney   = (n: unknown, cur = "ZAR") => {
   const locale = { ZAR: "en-ZA", USD: "en-US", GBP: "en-GB", EUR: "de-DE" }[cur] || "en-ZA";
   return `${sym} ${new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(parseFloat(String(n ?? 0)) || 0)}`;
 };
-const parseDateOnly = (d?: string) => {
-  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
-  const dt = new Date(`${d}T00:00:00`);
-  return Number.isNaN(dt.getTime()) ? null : dt;
-};
-const parseTimeParts = (t?: string) => {
-  if (!t) return null;
-  const [hRaw, mRaw = "0"] = t.split(":");
-  const h = Number(hRaw), m = Number(mRaw);
-  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
-  return { h, m };
-};
-const entryCallDateTime = (e: Partial<TimesheetEntry>) => {
-  const d = parseDateOnly(e.date);
-  const t = parseTimeParts(e.callTime);
-  if (!d || !t) return null;
-  d.setHours(t.h, t.m, 0, 0);
-  return d;
-};
-const entryWrapDateTime = (e: Partial<TimesheetEntry>) => {
-  const call = entryCallDateTime(e);
-  const t = parseTimeParts(e.wrapTime);
-  if (!call || !t) return null;
-  const wrap = new Date(call);
-  wrap.setHours(t.h, t.m, 0, 0);
-  if (wrap.getTime() <= call.getTime()) wrap.setDate(wrap.getDate() + 1);
-  return wrap;
-};
-const sortEntriesForTurnaround = <T extends Partial<TimesheetEntry>>(entries: T[]) =>
-  [...entries].map((entry, index) => ({ entry, index, start: entryCallDateTime(entry)?.getTime() }))
-    .sort((a, b) => (a.start ?? Number.POSITIVE_INFINITY) - (b.start ?? Number.POSITIVE_INFINITY) || a.index - b.index)
-    .map(({ entry }) => entry);
 const latestEntryForDefaults = (entries: TimesheetEntry[]) => {
   const sorted = sortEntriesForTurnaround(entries);
   return [...sorted].reverse().find(e => entryCallDateTime(e)) || entries[entries.length - 1];
@@ -548,12 +527,6 @@ const findPreviousEntryForTurnaround = (entries: TimesheetEntry[], next: Partial
     const start = entryCallDateTime(e)?.getTime();
     return start !== undefined && start < nextMs;
   }) || null;
-};
-const calcTurnaround = (prev: Partial<TimesheetEntry>, next: Partial<TimesheetEntry>) => {
-  const prevWrap = entryWrapDateTime(prev);
-  const nextCall = entryCallDateTime(next);
-  if (!prevWrap || !nextCall) return null;
-  return Math.max((nextCall.getTime() - prevWrap.getTime()) / 3600000, 0);
 };
 
 const blankClient = (overrides: Partial<Client> = {}): Client => ({
@@ -737,29 +710,6 @@ async function prepareBusinessLogo(file: File) {
 const protectedInvoiceStatus = (status?: string) => normalizeInvoiceStatus(status) !== "draft";
 const invoiceLogoForDisplay = (inv: Partial<Invoice>, profile: Profile) =>
   protectedInvoiceStatus(inv.status) ? (inv.sellerLogoDataUrl || "") : (profile.businessLogoDataUrl || inv.sellerLogoDataUrl || "");
-
-function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile {
-  if (!ts) return profile;
-  return {
-    ...profile,
-    defaultCurrency:          ts.currency || profile.defaultCurrency,
-    defaultDayRate:           num(ts.defaultDayRate, profile.defaultDayRate),
-    defaultIncludedHours:     num(ts.defaultIncludedHours, profile.defaultIncludedHours),
-    defaultEquipmentRental:   num(ts.defaultEquipmentRental, profile.defaultEquipmentRental),
-    defaultPerDiem:           num(ts.defaultPerDiem, profile.defaultPerDiem),
-    defaultVat:               num(ts.vat, profile.defaultVat),
-    defaultOvertimeRule:      (ts.defaultOvertimeRule || profile.defaultOvertimeRule) as OTRuleId,
-    defaultOtBand1Hours:      num(ts.defaultOtBand1Hours, profile.defaultOtBand1Hours),
-    defaultOtBand1Mult:       num(ts.defaultOtBand1Mult, profile.defaultOtBand1Mult),
-    defaultOtBand2Mult:       num(ts.defaultOtBand2Mult, profile.defaultOtBand2Mult),
-    defaultMinTurnaround:     num(ts.defaultMinTurnaround, profile.defaultMinTurnaround),
-    defaultTurnaroundMode:    (ts.defaultTurnaroundMode || profile.defaultTurnaroundMode) as TurnaroundMode,
-    defaultTurnaroundPenMult: num(ts.defaultTurnaroundPenMult, profile.defaultTurnaroundPenMult),
-    mealBreaksDeducted:       ts.mealBreaksDeducted ?? profile.mealBreaksDeducted,
-    travelTimePaid:           ts.travelTimePaid ?? profile.travelTimePaid,
-    equipmentRentalDaily:     ts.equipmentRentalDaily ?? profile.equipmentRentalDaily,
-  };
-}
 
 function timesheetDateRange(ts: Timesheet): string {
   const dates = (ts.entries || []).map(e => e.date).filter(Boolean).sort();
@@ -1049,76 +999,6 @@ function hasMeaningfulCrewQuoteData(data: AppData) {
     || data.timesheets.length > 0
     || data.invoices.length > 0
     || Boolean(p.fullName || p.companyName || p.email || p.phone || p.businessLogoDataUrl || p.bankAccountNumber || p.defaultDayRate);
-}
-
-/** Core per-day calculation — FULLY DEFENSIVE, never throws */
-function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
-  try {
-    const call  = e.callTime    || "08:00";
-    const wrap  = e.wrapTime    || "18:00";
-    const onSetH    = durH(call, wrap);
-    const overnight = toMins(wrap) <= toMins(call);
-    const mealDeducted = e.mealDeductedUsed ?? e.mealDeducted ?? profile.mealBreaksDeducted ?? true;
-    const travelPaid   = e.travelPaidUsed   ?? e.travelPaid   ?? profile.travelTimePaid     ?? true;
-    const mealH = mealDeducted ? Math.max(num(e.mealBreakMinutes) / 60, 0) : 0;
-    const workH = Math.max(onSetH - mealH, 0);
-    const travH = travelPaid && e.travelStartTime && e.travelEndTime ? durH(e.travelStartTime, e.travelEndTime) : 0;
-    const paidH = workH + travH;
-    const dayRate     = num(e.dayRateUsed ?? e.dayRate, profile.defaultDayRate ?? 0);
-    const incH        = Math.max(num(e.includedHoursUsed ?? e.includedHours, profile.defaultIncludedHours ?? 10), 1);
-    const baseHourly  = dayRate / incH;
-    const ruleId      = (e.overtimeRuleUsed || e.overtimeRule || profile.defaultOvertimeRule || "sa-film") as OTRuleId;
-    const ovEntry     = { defaultOtBand1Hours: num(e.otBand1HoursUsed ?? e.otBand1Hours, profile.defaultOtBand1Hours ?? 4), defaultOtBand1Mult: num(e.otBand1MultUsed ?? e.otBand1Mult, profile.defaultOtBand1Mult ?? 1.5), defaultOtBand2Mult: num(e.otBand2MultUsed ?? e.otBand2Mult, profile.defaultOtBand2Mult ?? 2.0) };
-    const bands       = getOTBands(ruleId, { ...profile, ...ovEntry } as Profile);
-    const totalOtH    = Math.max(paidH - incH, 0);
-    const b1H         = Math.min(totalOtH, bands.band1Hours);
-    const b2H         = Math.max(totalOtH - bands.band1Hours, 0);
-    const b1Cost      = b1H * baseHourly * bands.band1Mult;
-    const b2Cost      = b2H * baseHourly * bands.band2Mult;
-    const totalOtCost = b1Cost + b2Cost;
-    const equip    = num(e.equipmentRentalUsed ?? e.equipmentRental, profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0);
-    const perDiem  = num(e.perDiemUsed ?? e.perDiem, profile.defaultPerDiem ?? 0);
-    const expenses = num(e.expenses, 0);
-    const total    = dayRate + totalOtCost + equip + perDiem + expenses;
-    return { onSetH, overnight, mealH, workH, travH, paidH, incH, baseHourly, totalOtH, b1H, b1Cost, b2H, b2Cost, totalOtCost, equip, perDiem, expenses, dayRate, total, ruleId, bands };
-  } catch {
-    return { onSetH: 0, overnight: false, mealH: 0, workH: 0, travH: 0, paidH: 0, incH: 10, baseHourly: 0, totalOtH: 0, b1H: 0, b1Cost: 0, b2H: 0, b2Cost: 0, totalOtCost: 0, equip: 0, perDiem: 0, expenses: 0, dayRate: 0, total: 0, ruleId: "sa-film" as OTRuleId, bands: { band1Hours: 4, band1Mult: 1.5, band2Mult: 2.0 } };
-  }
-}
-
-function calcSummary(entries: TimesheetEntry[], profile: Profile) {
-  const sortedEntries = sortEntriesForTurnaround(entries || []);
-  const calcs        = sortedEntries.map((e, i) => {
-    const c = calcDay(e, profile);
-    const prev = i > 0 ? sortedEntries[i - 1] : undefined;
-    const turnaround = prev ? calcTurnaround(prev, e) : null;
-    const minTR = num(e.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
-    const trMode = (e.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
-    const shortfall = turnaround !== null ? Math.max(minTR - turnaround, 0) : 0;
-    const turnaroundPenalty = trMode === "penalty"
-      ? shortfall * (c.baseHourly || 0) * num(e.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult || 1)
-      : 0;
-    const vatRate = profile.vatRegistered ? num(e.vatRateUsed, profile.defaultVat) : 0;
-    const totalWithPenalty = c.total + turnaroundPenalty;
-    return { entry: e, c: { ...c, turnaround, turnaroundPenalty, totalWithPenalty, vatRate, vatAmount: totalWithPenalty * (vatRate / 100) } };
-  });
-  const totalDays    = calcs.length;
-  const totalDayRates = calcs.reduce((s, { c }) => s + (c.dayRate    || 0), 0);
-  const totalOtCost  = calcs.reduce((s, { c }) => s + (c.totalOtCost || 0), 0);
-  const totalOtH     = calcs.reduce((s, { c }) => s + (c.totalOtH    || 0), 0);
-  const totalEquip   = calcs.reduce((s, { c }) => s + (c.equip       || 0), 0);
-  const totalPerDiem = calcs.reduce((s, { c }) => s + (c.perDiem     || 0), 0);
-  const totalExp     = calcs.reduce((s, { c }) => s + (c.expenses    || 0), 0);
-  const totalTurnaroundPenalty = calcs.reduce((s, { c }) => s + (c.turnaroundPenalty || 0), 0);
-  const totalPaidH   = calcs.reduce((s, { c }) => s + (c.paidH       || 0), 0);
-  const totalTravH   = calcs.reduce((s, { c }) => s + (c.travH       || 0), 0);
-  const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp + totalTurnaroundPenalty;
-  const vatRates     = [...new Set(calcs.map(({ c }) => c.vatRate || 0))];
-  const vatPct       = vatRates.length === 1 ? vatRates[0] : (profile.vatRegistered ? num(profile.defaultVat) : 0);
-  const mixedVat     = vatRates.length > 1;
-  const vatAmt       = calcs.reduce((s, { c }) => s + (c.vatAmount || 0), 0);
-  const grandTotal   = subtotal + vatAmt;
-  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, mixedVat, vatAmt, grandTotal };
 }
 
 const genTSNum  = (list: Timesheet[]) => { const yr = new Date().getFullYear(); return `T-${yr}-${String((list || []).filter(t => t?.timesheetNumber?.startsWith(`T-${yr}`)).length + 1).padStart(4, "0")}`; };
@@ -1520,7 +1400,113 @@ function ToastContainer({ toasts }: { toasts: ToastMsg[] }) {
 
 type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking" | "backup";
 
-function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError, cloudSaving, cloudError, migrationPanel, backupImportDisabledMessage }: {
+function TimesheetCalculationReview({ timesheets, profile, ownerUserId }: {
+  timesheets: Timesheet[];
+  profile: Profile;
+  ownerUserId?: string;
+}) {
+  const [candidates, setCandidates] = useState<Record<string, LegacyTimesheetCalculationSnapshotV1>>({});
+  const [states, setStates] = useState<Record<string, string>>({});
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+
+  useEffect(() => {
+    if (!ownerUserId) { setStates({}); return; }
+    let active = true;
+    void Promise.all(timesheets.map(async timesheet => {
+      const snapshot = getCalculationSnapshot(ownerUserId, timesheet.id);
+      const state = await evaluateCalculationSnapshot(ownerUserId, timesheet as CrewTimesheet, snapshot);
+      return [timesheet.id, state] as const;
+    })).then(entries => {
+      if (active) setStates(Object.fromEntries(entries));
+    }).catch(() => {
+      if (active) setError("CrewQuote could not read the local calculation review state.");
+    });
+    return () => { active = false; };
+  }, [ownerUserId, revision, timesheets]);
+
+  const prepare = async (timesheet: Timesheet) => {
+    if (!ownerUserId) return;
+    setBusyId(timesheet.id);
+    setError("");
+    try {
+      const snapshot = await prepareCurrentBaselineSnapshot(ownerUserId, timesheet as CrewTimesheet, profile);
+      setCandidates(current => ({ ...current, [timesheet.id]: snapshot }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "CrewQuote could not prepare this calculation review.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const confirmBaseline = async (timesheet: Timesheet) => {
+    if (!ownerUserId) return;
+    const candidate = candidates[timesheet.id];
+    if (!candidate) return;
+    setBusyId(timesheet.id);
+    setError("");
+    try {
+      const sourceFingerprint = await calculationSourceFingerprint(timesheet as CrewTimesheet);
+      confirmCurrentBaselineSnapshot(ownerUserId, candidate, sourceFingerprint);
+      setCandidates(current => { const { [timesheet.id]: _, ...remaining } = current; return remaining; });
+      setRevision(current => current + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "CrewQuote could not confirm this calculation baseline.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  if (!ownerUserId) {
+    return <AlertBox type="info">Sign in to review browser-local timesheet calculations for the owning CrewQuote account.</AlertBox>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-sm font-semibold text-slate-900">Timesheet Calculation Review</p>
+        <p className="mt-1 text-sm leading-relaxed text-slate-500">Review freezes the displayed work-day and summary values in this browser for the signed-in account. It does not upload or migrate anything.</p>
+      </div>
+      {error && <AlertBox type="error">{error}</AlertBox>}
+      {!timesheets.length && <p className="text-sm text-slate-500">No browser-local timesheets need review.</p>}
+      {timesheets.map(timesheet => {
+        const candidate = candidates[timesheet.id];
+        const status = candidate ? "review-ready" : (states[timesheet.id] || "checking");
+        const summary = candidate?.databaseSummaryPayload;
+        return (
+          <div key={timesheet.id} className="rounded-lg border border-slate-200 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-900">{timesheet.timesheetNumber || "Untitled timesheet"}</p>
+                <p className="mt-1 text-sm text-slate-500">{timesheet.productionName || "No production name"} · {timesheet.entries.length} work day{timesheet.entries.length === 1 ? "" : "s"}</p>
+                <p className={`mt-2 text-xs font-semibold ${status === "valid" ? "text-emerald-700" : status === "review-ready" ? "text-amber-800" : "text-slate-500"}`}>Calculation state: {status.replace(/-/g, " ")}</p>
+              </div>
+              {!candidate && <Btn size="sm" variant="secondary" disabled={busyId === timesheet.id} onClick={() => void prepare(timesheet)}><FileText size={13}/>{busyId === timesheet.id ? "Preparing..." : "Review Values"}</Btn>}
+            </div>
+            {candidate && summary && (
+              <div className="mt-4 border-t border-slate-200 pt-4">
+                <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                  <SRow label="Paid hours" value={Number(summary.summary_paid_hours).toFixed(2)} />
+                  <SRow label="Overtime" value={Number(summary.summary_overtime_hours).toFixed(2)} />
+                  <SRow label="VAT" value={fmtMoney(Number(summary.summary_vat_amount), timesheet.currency)} />
+                  <SRow label="Total" value={fmtMoney(Number(summary.summary_grand_total), timesheet.currency)} />
+                </div>
+                <AlertBox type="warning"><span>The original record does not persist every historical calculation setting. Confirming stores this displayed baseline locally and makes it eligible for a later, separate migration step.</span></AlertBox>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Btn size="sm" disabled={busyId === timesheet.id} onClick={() => void confirmBaseline(timesheet)}><CheckCircle size={13}/>{busyId === timesheet.id ? "Confirming..." : "Confirm Frozen Baseline"}</Btn>
+                  <Btn size="sm" variant="secondary" disabled={busyId === timesheet.id} onClick={() => void prepare(timesheet)}>Recalculate Review</Btn>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError, cloudSaving, cloudError, migrationPanel, phase4MigrationPanel, backupImportDisabledMessage, calculationOwnerUserId, phase4Completed }: {
   profile: Profile;
   appData: AppData;
   onSave: (p: Profile) => void | Promise<void>;
@@ -1530,7 +1516,10 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
   cloudSaving?: boolean;
   cloudError?: string;
   migrationPanel?: React.ReactNode;
+  phase4MigrationPanel?: React.ReactNode;
   backupImportDisabledMessage?: string;
+  calculationOwnerUserId?: string;
+  phase4Completed?: boolean;
 }) {
   const [f, setF] = useState<Profile>({ ...DEFAULT_PROFILE, ...profile });
   const [tab, setTab] = useState<SettingsTabId>("profile");
@@ -1855,7 +1844,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
               <SectionCard title="Data & Backup" description={`CrewQuote Pro Beta · Version ${APP_VERSION} · Data version ${CURRENT_DATA_VERSION}`}>
                 <div className="space-y-5">
                   <AlertBox type="warning">
-                    CrewQuote now syncs business settings and clients to your account. Timesheets, invoices, invoice snapshots, and logo image data still remain in this browser during Phase 3.
+                    {phase4Completed
+                      ? "Settings and clients are cloud-backed. Reviewed timesheets have been safely copied to your account, while this Timesheets workspace remains browser-local until final cloud activation. Invoices and payments remain browser-local."
+                      : "Settings and clients are cloud-backed. Timesheets remain in this browser while awaiting reviewed migration. Invoices and payments remain browser-local."}
                   </AlertBox>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <MetricCard label="Clients" value={appData.clients.length} detail="Stored locally" icon={Users} tone="blue" />
@@ -1871,6 +1862,10 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                       <Btn onClick={onExportBackup}><FileText size={14}/> Export Backup</Btn>
                     </div>
                   </div>
+                  <div className="rounded-lg border border-slate-200 p-4">
+                    <TimesheetCalculationReview timesheets={appData.timesheets} profile={profile} ownerUserId={calculationOwnerUserId} />
+                  </div>
+                  {phase4MigrationPanel}
                   <div className="rounded-lg border border-slate-200 p-4">
                     <div className="flex flex-col gap-4">
                       <div>
@@ -2724,7 +2719,7 @@ function buildSummaryTimesheetLines(sum: ReturnType<typeof calcSummary>): Invoic
 function buildDetailedTimesheetLines(sum: ReturnType<typeof calcSummary>): InvoiceLine[] {
   const lines: InvoiceLine[] = [];
   sum.calcs.forEach(({ entry, c }) => {
-    const d = fmtDate(entry.date);
+    const d = fmtDate(entry.date || "");
     if (c.dayRate > 0) lines.push({ id: uid(), description: `${d} — Day Rate`, quantity: 1, unitPrice: c.dayRate, amount: c.dayRate, taxable: true, category: "day-rate" });
     if (c.b1H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 1 (${hoursToHM(c.b1H)} @ ${c.bands.band1Mult}x)`, quantity: c.b1H, unitPrice: c.b1Cost / Math.max(c.b1H, 1), amount: c.b1Cost, taxable: true, category: "overtime" });
     if (c.b2H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 2 (${hoursToHM(c.b2H)} @ ${c.bands.band2Mult}x)`, quantity: c.b2H, unitPrice: c.b2Cost / Math.max(c.b2H, 1), amount: c.b2Cost, taxable: true, category: "overtime" });
@@ -5178,6 +5173,78 @@ function Phase3MigrationPanel({ summary, busy, error, success, onImport, onDismi
   );
 }
 
+const PHASE4_STAGE_LABELS: Record<string, string> = {
+  preparing: "Preparing migration",
+  "creating-backup": "Creating safety backup",
+  validating: "Validating calculation snapshots",
+  "checking-previous": "Checking previous migration",
+  "resolving-clients": "Resolving clients",
+  "importing-timesheets": "Importing timesheets",
+  "importing-work-days": "Importing work days",
+  "importing-expenses": "Importing expenses",
+  verifying: "Verifying cloud records",
+  "updating-compatibility": "Updating local compatibility data",
+  complete: "Migration complete",
+  "already-migrated": "Already migrated",
+  failed: "Migration failed",
+};
+
+function Phase4MigrationPanel({ preflight, invoiceCount, paymentCount, busy, stage, counts, error, success, completed, confirming, onValidate, onOpenConfirmation, onCancelConfirmation, onStart }: {
+  preflight: Phase4MigrationPreflight | null;
+  invoiceCount: number;
+  paymentCount: number;
+  busy: boolean;
+  stage: string;
+  counts: { timesheets: number; timesheet_entries: number; day_expenses: number };
+  error: string;
+  success: string;
+  completed: boolean;
+  confirming: boolean;
+  onValidate: () => void;
+  onOpenConfirmation: () => void;
+  onCancelConfirmation: () => void;
+  onStart: () => void;
+}) {
+  const summary = preflight?.summary;
+  const progress = stage ? PHASE4_STAGE_LABELS[stage] || "Preparing migration" : "Review calculation snapshots before migration.";
+  return (
+    <div className="rounded-lg border border-blue-200 bg-blue-50/40 p-4">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-bold text-slate-950">Copy reviewed timesheets to your account</p>
+          <p className="mt-1 max-w-3xl text-sm leading-relaxed text-slate-600">This one-time Phase 4A action copies only reviewed browser-local timesheets, work days, and day expenses. The normal Timesheets workspace stays on its browser source until Phase 4B.</p>
+          {summary && <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <MetricCard label="Timesheets" value={summary.timesheetCount} detail="Reviewed records" icon={Clock} tone="blue" />
+            <MetricCard label="Work days" value={summary.entryCount} detail="Frozen values" icon={Zap} tone="slate" />
+            <MetricCard label="Expenses" value={summary.expenseCount} detail="Derived rows" icon={Receipt} tone="slate" />
+            <MetricCard label="Invoices" value={invoiceCount} detail="Remain local" icon={FileText} tone="orange" />
+            <MetricCard label="Payments" value={paymentCount} detail="Remain local" icon={Building2} tone="orange" />
+          </div>}
+          <p className="mt-4 text-sm font-medium text-slate-700">{progress}</p>
+          {busy && summary && <p className="mt-1 text-xs text-slate-500">Timesheets imported: {counts.timesheets} of {summary.timesheetCount} · Work days imported: {counts.timesheet_entries} of {summary.entryCount} · Expenses imported: {counts.day_expenses} of {summary.expenseCount}</p>}
+          {error && <div className="mt-3"><AlertBox type="error">{error}</AlertBox></div>}
+          {success && <div className="mt-3"><AlertBox type="success">{success}</AlertBox></div>}
+          {completed && !success && <div className="mt-3"><AlertBox type="success">This browser has a verified Phase 4A migration marker. The current Timesheets workspace still uses browser-local records.</AlertBox></div>}
+          {confirming && summary && (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+              <p className="font-bold">Start reviewed timesheet migration?</p>
+              <p className="mt-1 leading-relaxed">Your reviewed timesheets and work days will be copied to your CrewQuote account. A complete safety backup will download before migration begins. Invoices and payments will remain stored in this browser. Local source records will not be deleted.</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Btn onClick={onStart} disabled={busy}><Save size={14}/> Start Migration</Btn>
+                <Btn variant="secondary" onClick={onCancelConfirmation} disabled={busy}>Cancel</Btn>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex flex-shrink-0 flex-wrap gap-2 lg:justify-end">
+          {!confirming && <Btn variant="secondary" onClick={onValidate} disabled={busy}><CheckCircle size={14}/>{busy && stage === "preparing" ? "Checking..." : preflight ? "Recheck Readiness" : "Check Migration Readiness"}</Btn>}
+          {preflight && !confirming && <Btn onClick={onOpenConfirmation} disabled={busy}><Save size={14}/> Start Migration</Btn>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AppShell() {
   const { signOut, user } = useAuth();
   const [page,       setPage]       = useState("timesheets");
@@ -5200,6 +5267,13 @@ function AppShell() {
   const [migrationBusy, setMigrationBusy] = useState(false);
   const [migrationError, setMigrationError] = useState("");
   const [migrationSuccess, setMigrationSuccess] = useState("");
+  const [phase4Preflight, setPhase4Preflight] = useState<Phase4MigrationPreflight | null>(null);
+  const [phase4Busy, setPhase4Busy] = useState(false);
+  const [phase4Stage, setPhase4Stage] = useState("");
+  const [phase4Counts, setPhase4Counts] = useState({ timesheets: 0, timesheet_entries: 0, day_expenses: 0 });
+  const [phase4Error, setPhase4Error] = useState("");
+  const [phase4Success, setPhase4Success] = useState("");
+  const [phase4Confirming, setPhase4Confirming] = useState(false);
 
   const loadCloudAwareData = useCallback(async () => {
     if (!user?.id) return;
@@ -5284,6 +5358,8 @@ function AppShell() {
 
       setMigrationSummary(null);
       setCloudError(nextCloudError);
+      setPhase4Preflight(null);
+      setPhase4Confirming(false);
     } catch (err) {
       setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
     } finally {
@@ -5420,12 +5496,96 @@ function AppShell() {
     try {
       const result = await buildCloudAwareBackupData(currentAppData);
       if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not assemble a cloud-aware backup.");
-      downloadBackup(result.data as AppData);
+      const calculationSnapshots = user?.id
+        ? { ownerUserId: user.id, records: readCalculationSnapshots(user.id) }
+        : undefined;
+      downloadBackup(result.data as AppData, "crewquote-backup", calculationSnapshots);
       showToast("Backup exported", "success");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "CrewQuote could not export a backup.", "error");
     }
   };
+
+  const runPhase4Preflight = useCallback(async () => {
+    if (!user?.id) return;
+    setPhase4Busy(true);
+    setPhase4Stage("preparing");
+    setPhase4Counts({ timesheets: 0, timesheet_entries: 0, day_expenses: 0 });
+    setPhase4Error("");
+    setPhase4Success("");
+    setPhase4Confirming(false);
+    try {
+      const result = await preflightPhase4TimesheetMigration({
+        ownerUserId: readLocalDataOwnerId(),
+        authenticatedUserId: user.id,
+        localTimesheets: timesheets as CrewTimesheet[],
+        storedSnapshots: readCalculationSnapshots(user.id),
+        invoiceCount: invoices.length,
+      });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not validate the reviewed timesheets.");
+      setPhase4Preflight(result.data);
+      setPhase4Stage("validating");
+    } catch (err) {
+      setPhase4Preflight(null);
+      setPhase4Stage("failed");
+      setPhase4Error(err instanceof Error ? err.message : "CrewQuote could not validate the reviewed timesheets.");
+    } finally {
+      setPhase4Busy(false);
+    }
+  }, [invoices.length, timesheets, user?.id]);
+
+  const runPhase4Migration = useCallback(async () => {
+    if (!user?.id || !phase4Preflight) return;
+    setPhase4Busy(true);
+    setPhase4Stage("creating-backup");
+    setPhase4Error("");
+    setPhase4Success("");
+    try {
+      const refreshedPreflight = await preflightPhase4TimesheetMigration({
+        ownerUserId: readLocalDataOwnerId(),
+        authenticatedUserId: user.id,
+        localTimesheets: timesheets as CrewTimesheet[],
+        storedSnapshots: readCalculationSnapshots(user.id),
+        invoiceCount: invoices.length,
+      });
+      if (refreshedPreflight.error || !refreshedPreflight.data) throw new Error(refreshedPreflight.error || "CrewQuote could not revalidate the reviewed timesheets.");
+      if (refreshedPreflight.data.fingerprint !== phase4Preflight.fingerprint) {
+        setPhase4Preflight(refreshedPreflight.data);
+        throw new Error("A local timesheet or confirmed calculation changed after readiness was checked. Review the updated record, then confirm migration again.");
+      }
+      const completeBackup = await buildPhase4CloudBackupData(currentAppData);
+      if (completeBackup.error || !completeBackup.data) throw new Error(completeBackup.error || "CrewQuote could not create the complete safety backup.");
+      const snapshots = { ownerUserId: user.id, records: readCalculationSnapshots(user.id) };
+      downloadBackup(
+        completeBackup.data.appData as AppData,
+        "crewquote-pre-phase4-timesheet-migration-backup",
+        snapshots,
+        {
+          localOwnerUserId: readLocalDataOwnerId(),
+          phase4MigrationFingerprint: phase4Preflight.fingerprint,
+          phase3MigrationCompleted: migrationCompletedForUser(user.id),
+          phase4MigrationAlreadyCompleted: phase4MigrationCompletedForUser(user.id),
+          cloudRecovery: completeBackup.data.cloudRecovery,
+        },
+      );
+      const result = await migratePreparedTimesheets(
+        refreshedPreflight.data.records,
+        APP_VERSION,
+        CURRENT_DATA_VERSION,
+        (stage: Phase4MigrationStage, counts) => { setPhase4Stage(stage); setPhase4Counts(counts); },
+      );
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not migrate the reviewed timesheets.");
+      setPhase4Confirming(false);
+      setPhase4Success(result.data.alreadyCompleted
+        ? "Already migrated. CrewQuote verified the reviewed cloud records and refreshed the local compatibility data."
+        : `Migration complete. Copied ${result.data.counts.timesheets} timesheet${result.data.counts.timesheets === 1 ? "" : "s"}, ${result.data.counts.timesheet_entries} work day${result.data.counts.timesheet_entries === 1 ? "" : "s"}, and ${result.data.counts.day_expenses} day expense${result.data.counts.day_expenses === 1 ? "" : "s"}.`);
+    } catch (err) {
+      setPhase4Stage("failed");
+      setPhase4Error(err instanceof Error ? err.message : "CrewQuote could not migrate the reviewed timesheets.");
+    } finally {
+      setPhase4Busy(false);
+    }
+  }, [currentAppData, invoices.length, phase4Preflight, timesheets, user?.id]);
   const importBackup = () => {
     throw new Error(PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE);
   };
@@ -5477,6 +5637,25 @@ function AppShell() {
       error={migrationError}
       success={migrationSuccess}
       onImport={() => void runPhase3Migration()}
+    />
+  ) : null;
+
+  const phase4MigrationPanel = user?.id ? (
+    <Phase4MigrationPanel
+      preflight={phase4Preflight}
+      invoiceCount={invoices.length}
+      paymentCount={invoices.filter(invoice => Number(invoice.paidAmount) > 0 || Boolean(invoice.paidDate)).length}
+      busy={phase4Busy}
+      stage={phase4Stage}
+      counts={phase4Counts}
+      error={phase4Error}
+      success={phase4Success}
+      completed={phase4MigrationCompletedForUser(user.id)}
+      confirming={phase4Confirming}
+      onValidate={() => void runPhase4Preflight()}
+      onOpenConfirmation={() => { setPhase4Error(""); setPhase4Confirming(true); }}
+      onCancelConfirmation={() => setPhase4Confirming(false)}
+      onStart={() => void runPhase4Migration()}
     />
   ) : null;
 
@@ -5578,7 +5757,7 @@ function AppShell() {
       {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} showOnboarding={showOnboarding} onDismissOnboarding={dismissOnboarding} onNavigate={setPage} />}
       {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} loadError={cloudError} saving={cloudSavingClients} onRetry={() => void loadCloudAwareData()} />}
       {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveTimesheets={saveTimesheets} onSaveClients={saveClients} onSaveProfile={saveProfileFromLocalWorkflow} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
-      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} cloudSaving={cloudSavingSettings} cloudError={cloudError} migrationPanel={settingsMigrationPanel} backupImportDisabledMessage={PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE} />}
+      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} cloudSaving={cloudSavingSettings} cloudError={cloudError} migrationPanel={settingsMigrationPanel} phase4MigrationPanel={phase4MigrationPanel} backupImportDisabledMessage={PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE} calculationOwnerUserId={user?.id} phase4Completed={user?.id ? phase4MigrationCompletedForUser(user.id) : false} />}
       {page === "account"    && <AccountPage />}
     </Layout>
   );

@@ -25,7 +25,21 @@ export async function saveEntry(value: CrewTimesheetEntry, timesheetUuid: string
 
 export async function deleteEntry(appId: string): Promise<CloudResult<true>> {
   try { const user = await getCurrentUserId(); if (user.error || !user.data) return cloudFail(user.error);
-    const { error } = await getSupabaseBrowserClient().from("timesheet_entries").delete().eq("user_id", user.data).eq("legacy_id", appId);
+    const db = getSupabaseBrowserClient();
+    const existing = await db.from("timesheet_entries").select("id").eq("user_id", user.data).eq("legacy_id", appId).maybeSingle();
+    if (existing.error) return cloudFail(existing.error);
+    if (!existing.data) return cloudOk(true);
+    const expenseDelete = await db.from("day_expenses").delete().eq("user_id", user.data).eq("timesheet_entry_id", existing.data.id);
+    if (expenseDelete.error) return cloudFail(expenseDelete.error);
+    const { error } = await db.from("timesheet_entries").delete().eq("user_id", user.data).eq("id", existing.data.id);
     return error ? cloudFail(error) : cloudOk(true);
+  } catch (error) { return cloudFail(error); }
+}
+
+export async function getEntryCloudId(appId: string): Promise<CloudResult<string>> {
+  try {
+    const user = await getCurrentUserId(); if (user.error || !user.data) return cloudFail(user.error);
+    const { data, error } = await getSupabaseBrowserClient().from("timesheet_entries").select("id").eq("user_id", user.data).eq("legacy_id", appId).maybeSingle();
+    return error || !data ? cloudFail(error || "CrewQuote could not resolve the saved work day.") : cloudOk(data.id);
   } catch (error) { return cloudFail(error); }
 }

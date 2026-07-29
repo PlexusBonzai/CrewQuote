@@ -1,5 +1,5 @@
 import type { CrewTimesheet } from "../../data/crewquoteTypes";
-import type { CalculationProfile } from "./timesheetCalculations";
+import { calcDay, calcSummary, type CalculationProfile } from "./timesheetCalculations";
 import {
   assertFrozenSummaryPayload,
   auditTimesheetCalculationContext,
@@ -7,6 +7,7 @@ import {
   evaluateCalculationSnapshot,
   prepareTimesheetMigrationRecords,
   prepareCurrentBaselineSnapshot,
+  summaryToDatabasePayload,
 } from "./timesheetCalculationSnapshots";
 
 const profile: CalculationProfile = {
@@ -91,6 +92,43 @@ function fixture(): CrewTimesheet {
 // This is intentionally framework-free so it remains compile-checked until a
 // project test runner is introduced. A future test can call this async function.
 export async function runTimesheetCalculationSnapshotRegressionHarness() {
+  const phase4Profile: CalculationProfile = {
+    ...profile,
+    defaultDayRate: 4000,
+    defaultIncludedHours: 10,
+    defaultEquipmentRental: 1500,
+    defaultVat: 0,
+    mealBreaksDeducted: true,
+    equipmentRentalDaily: true,
+    vatRegistered: false,
+  };
+  const phase4Entry = {
+    ...fixture().entries[0],
+    id: "day-phase4b-regression",
+    callTime: "07:00",
+    wrapTime: "20:00",
+    mealBreakMinutes: 60,
+    mealDeducted: true,
+    dayRate: 4000,
+    includedHours: 10,
+    equipmentRental: 1500,
+    expenses: 150,
+    expenseDescription: "Parking",
+    vatRateUsed: 0,
+  };
+  const phase4Day = calcDay(phase4Entry, phase4Profile);
+  const phase4Summary = calcSummary([phase4Entry], phase4Profile);
+  const phase4Payload = summaryToDatabasePayload(phase4Summary);
+  if (phase4Day.paidH !== 12 || phase4Day.totalOtH !== 2 || phase4Day.totalOtCost !== 1200 || phase4Day.total !== 6850) {
+    throw new Error("Expected the Phase 4B day regression to remain 12 paid hours, 2 overtime hours, ZAR 1,200 overtime, and ZAR 6,850 total.");
+  }
+  if (phase4Payload.summary_paid_hours !== 12 || phase4Payload.summary_overtime_hours !== 2 || phase4Payload.summary_grand_total !== 6850) {
+    throw new Error("Expected the Phase 4B persisted summary regression to retain the saved day values.");
+  }
+  if (phase4Payload.summary_travel_hours !== phase4Summary.totalTravH || "summary_travel_total" in phase4Payload) {
+    throw new Error("Expected totalTravH to map only to summary_travel_hours.");
+  }
+
   const sheet = fixture();
   const audit = auditTimesheetCalculationContext(sheet);
   if (audit.status !== "needs-review" || !audit.missingHistoricalFields.includes("vatRegistered")) {

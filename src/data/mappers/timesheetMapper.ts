@@ -1,4 +1,4 @@
-import type { Database, Json } from "../../types/database.types";
+import type { Database } from "../../types/database.types";
 import type { CrewTimesheet } from "../crewquoteTypes";
 import { assertFrozenSummaryPayload, type FrozenTimesheetDatabaseSummaryPayload } from "../../domain/calculations/timesheetCalculationSnapshots";
 
@@ -26,7 +26,12 @@ export function timesheetRowToModel(row: Row, clientId?: string): CrewTimesheet 
   };
 }
 
-export function timesheetModelToInsert(value: CrewTimesheet, userId: string, clientUuid: string | null, summary: Json = {}): Insert {
+export function timesheetModelToInsert(
+  value: CrewTimesheet,
+  userId: string,
+  clientUuid: string | null,
+  summary: Partial<FrozenTimesheetDatabaseSummaryPayload> = {},
+): Insert {
   return { user_id: userId, legacy_id: value.id, timesheet_number: value.timesheetNumber, production_name: value.productionName,
     client_id: clientUuid, client_name: value.clientName || "", client_incomplete: Boolean(value.clientIncomplete), crew_name: value.crewName,
     role: value.role, start_date: value.startDate || null, notes: value.notes || "", currency: value.currency as Insert["currency"], vat: value.vat,
@@ -37,10 +42,14 @@ export function timesheetModelToInsert(value: CrewTimesheet, userId: string, cli
     default_ot_band2_mult: nullable(value.defaultOtBand2Mult), default_min_turnaround: nullable(value.defaultMinTurnaround),
     default_turnaround_mode: value.defaultTurnaroundMode || null, default_turnaround_pen_mult: nullable(value.defaultTurnaroundPenMult),
     meal_breaks_deducted: value.mealBreaksDeducted ?? null, travel_time_paid: value.travelTimePaid ?? null,
-    equipment_rental_daily: value.equipmentRentalDaily ?? null, summary_snapshot: summary };
+    equipment_rental_daily: value.equipmentRentalDaily ?? null, ...summary, summary_snapshot: summary.summary_snapshot ?? {} };
 }
 
-export function timesheetModelToUpdate(value: CrewTimesheet, clientUuid: string | null, summary: Json = {}): Update {
+export function timesheetModelToUpdate(
+  value: CrewTimesheet,
+  clientUuid: string | null,
+  summary: Partial<FrozenTimesheetDatabaseSummaryPayload> = {},
+): Update {
   const { user_id, ...update } = timesheetModelToInsert(value, "00000000-0000-0000-0000-000000000000", clientUuid, summary);
   void user_id;
   return update;
@@ -48,5 +57,5 @@ export function timesheetModelToUpdate(value: CrewTimesheet, clientUuid: string 
 
 export function timesheetImportToInsert(value: CrewTimesheet, userId: string, clientUuid: string | null, frozenSummaryPayload: FrozenTimesheetDatabaseSummaryPayload): Insert {
   assertFrozenSummaryPayload(frozenSummaryPayload);
-  return { ...timesheetModelToInsert(value, userId, clientUuid, frozenSummaryPayload.summary_snapshot), ...frozenSummaryPayload };
+  return timesheetModelToInsert(value, userId, clientUuid, frozenSummaryPayload);
 }

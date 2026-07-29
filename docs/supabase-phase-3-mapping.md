@@ -1,16 +1,17 @@
 # Supabase Phase 3 Mapping
 
-Phase 3 makes Supabase authoritative for account profile, business settings, user preferences, clients, and reusable rate presets where they exist. Timesheets, timesheet entries, day expenses, invoices, invoice lines, payments, and logo files remain local until later phases.
+Phase 3 made Supabase authoritative for account profile, business settings, user preferences, clients, and reusable rate presets. Phase 4B additionally makes activated Timesheets, timesheet entries, and day expenses authoritative in Supabase. Invoices, invoice lines, payments, and logo files remain browser-local.
 
 ## Local Storage Keys
 
 - `cqp-profile`: current CrewQuote business/settings object.
 - `cqp-clients`: app-facing client records.
-- `cqp-timesheets`: browser-local timesheets and entries.
+- `cqp-timesheets`: original Timesheet migration/recovery source; not authoritative for the active UI after Phase 4B activation.
 - `cqp-invoices`: browser-local invoices, line items, payment snapshots, and invoice snapshots.
 - `cqp-onboarding-dismissed`: onboarding preference compatibility cache.
 - `cqp-data-version`: local data-version marker.
 - `cqp-local-data-owner-user-id`: Phase 3 temporary owner marker for remaining local records. It is written only after an explicit ownership confirmation, a confirmed Phase 3 import, or a new authenticated local write.
+- `cqp-phase4-timesheet-mirror-{userId}`: owner-scoped mapped compatibility mirror written only after complete successful cloud reads/writes; never a general offline source.
 
 ## Profile
 

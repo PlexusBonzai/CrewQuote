@@ -29,10 +29,16 @@ export function entryRowToModel(row: Row): CrewTimesheetEntry {
 }
 
 export function entryModelToInsert(entry: CrewTimesheetEntry, userId: string, timesheetUuid: string, order: number): Insert {
+  const calculation = entry.calcSnapshot && typeof entry.calcSnapshot === "object" && !Array.isArray(entry.calcSnapshot)
+    ? entry.calcSnapshot as Record<string, unknown>
+    : {};
   const rateSnapshot: Json = { dayRateUsed: entry.dayRateUsed ?? entry.dayRate, includedHoursUsed: entry.includedHoursUsed ?? entry.includedHours,
     overtimeRuleUsed: entry.overtimeRuleUsed ?? entry.overtimeRule, otBand1HoursUsed: entry.otBand1HoursUsed ?? entry.otBand1Hours,
     otBand1MultUsed: entry.otBand1MultUsed ?? entry.otBand1Mult, otBand2MultUsed: entry.otBand2MultUsed ?? entry.otBand2Mult,
-    equipmentRentalUsed: entry.equipmentRentalUsed ?? entry.equipmentRental, perDiemUsed: entry.perDiemUsed ?? entry.perDiem, vatRateUsed: entry.vatRateUsed ?? 0 };
+    equipmentRentalUsed: entry.equipmentRentalUsed ?? entry.equipmentRental, perDiemUsed: entry.perDiemUsed ?? entry.perDiem, vatRateUsed: entry.vatRateUsed ?? 0,
+    mealDeductedUsed: entry.mealDeductedUsed ?? entry.mealDeducted, travelPaidUsed: entry.travelPaidUsed ?? entry.travelPaid,
+    turnaroundMinimumHoursUsed: entry.turnaroundMinimumHoursUsed ?? 0, turnaroundRuleUsed: entry.turnaroundRuleUsed ?? "warning",
+    turnaroundPenaltyMultUsed: entry.turnaroundPenaltyMultUsed ?? 0 };
   return { user_id: userId, legacy_id: entry.id, timesheet_id: timesheetUuid, entry_order: order, date: entry.date,
     production_name: entry.productionName, location: entry.location, notes: entry.notes, call_time: entry.callTime || null, wrap_time: entry.wrapTime || null,
     meal_break_minutes: entry.mealBreakMinutes, meal_deducted: entry.mealDeducted, travel_start_time: entry.travelStartTime || null,
@@ -41,9 +47,14 @@ export function entryModelToInsert(entry: CrewTimesheetEntry, userId: string, ti
     ot_band2_mult: entry.otBand2Mult, equipment_rental: entry.equipmentRental, per_diem: entry.perDiem, expenses: entry.expenses,
     expense_description: entry.expenseDescription, vat_rate: entry.vatRateUsed ?? 0, min_turnaround: entry.turnaroundMinimumHoursUsed ?? 0,
     turnaround_mode: entry.turnaroundRuleUsed ?? "warning", turnaround_pen_mult: entry.turnaroundPenaltyMultUsed ?? 0,
-    on_set_hours: entry.calcOnSetHours ?? 0, meal_hours: entry.calcMealHours ?? 0, travel_hours: entry.calcTravelHours ?? 0,
-    paid_hours: entry.calcPaidHours ?? 0, overtime_hours: entry.calcOvertimeHours ?? 0, day_subtotal: entry.calcDayTotal ?? 0,
-    day_total: entry.calcDayTotal ?? 0, rate_snapshot: rateSnapshot, calc_snapshot: {} };
+    on_set_hours: n(calculation.onSetH ?? entry.calcOnSetHours), meal_hours: n(calculation.mealH ?? entry.calcMealHours),
+    travel_hours: n(calculation.travH ?? entry.calcTravelHours), paid_hours: n(calculation.paidH ?? entry.calcPaidHours),
+    overtime_hours: n(calculation.totalOtH ?? entry.calcOvertimeHours), ot_band1_worked_hours: n(calculation.b1H),
+    ot_band1_amount: n(calculation.b1Cost), ot_band2_worked_hours: n(calculation.b2H), ot_band2_amount: n(calculation.b2Cost),
+    turnaround_hours: n(calculation.turnaround), turnaround_penalty: n(calculation.turnaroundPenalty),
+    overnight: Boolean(calculation.overnight), day_subtotal: n(calculation.total ?? entry.calcDayTotal),
+    day_total: n(calculation.totalWithPenalty ?? calculation.total ?? entry.calcDayTotal), rate_snapshot: rateSnapshot,
+    calc_snapshot: calculation as Json, is_sunday: entry.isSunday, is_public_holiday: entry.isPublicHoliday };
 }
 
 export function entryModelToUpdate(entry: CrewTimesheetEntry, timesheetUuid: string, order: number): Update {

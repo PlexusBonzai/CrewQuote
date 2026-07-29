@@ -5,6 +5,7 @@ import type { CrewTimesheet } from "../data/crewquoteTypes";
 import { timesheetModelToInsert, timesheetModelToUpdate, timesheetRowToModel } from "../data/mappers/timesheetMapper";
 import { getClient } from "./clientService";
 import { entryRowToModel } from "../data/mappers/timesheetEntryMapper";
+import type { FrozenTimesheetDatabaseSummaryPayload } from "../domain/calculations/timesheetCalculationSnapshots";
 
 async function resolveClientUuid(timesheet: CrewTimesheet): Promise<CloudResult<string | null>> {
   if (!timesheet.clientId) return cloudOk(null);
@@ -60,24 +61,29 @@ export async function listTimesheetsWithEntries(): Promise<CloudResult<CrewTimes
   } catch (error) { return cloudFail(error); }
 }
 
-export async function createTimesheet(value: CrewTimesheet): Promise<CloudResult<CrewTimesheet>> {
+export async function createTimesheet(value: CrewTimesheet, summary: FrozenTimesheetDatabaseSummaryPayload): Promise<CloudResult<CrewTimesheet>> {
   try {
     const user = await getCurrentUserId(); if (user.error || !user.data) return cloudFail(user.error);
     const client = await resolveClientUuid(value); if (client.error) return cloudFail(client.error);
     const db = getSupabaseBrowserClient();
-    const { data, error } = await db.from("timesheets").insert(timesheetModelToInsert(value, user.data, client.data)).select("*").single();
+    const existing = await db.from("timesheets").select("id").eq("user_id", user.data).eq("legacy_id", value.id).maybeSingle();
+    if (existing.error) return cloudFail(existing.error);
+    const query = existing.data
+      ? db.from("timesheets").update(timesheetModelToUpdate(value, client.data, summary)).eq("id", existing.data.id)
+      : db.from("timesheets").insert(timesheetModelToInsert(value, user.data, client.data, summary));
+    const { data, error } = await query.select("*").single();
     return error ? cloudFail(error) : cloudOk(timesheetRowToModel(data, value.clientId));
   } catch (error) { return cloudFail(error); }
 }
 
-export async function updateTimesheet(value: CrewTimesheet): Promise<CloudResult<CrewTimesheet>> {
+export async function updateTimesheet(value: CrewTimesheet, summary: FrozenTimesheetDatabaseSummaryPayload): Promise<CloudResult<CrewTimesheet>> {
   try {
     const user = await getCurrentUserId(); if (user.error || !user.data) return cloudFail(user.error);
     const client = await resolveClientUuid(value); if (client.error) return cloudFail(client.error);
     const db = getSupabaseBrowserClient();
-    const { data, error } = await db.from("timesheets").update(timesheetModelToUpdate(value, client.data)).eq("user_id", user.data).eq("legacy_id", value.id).select("*").maybeSingle();
+    const { data, error } = await db.from("timesheets").update(timesheetModelToUpdate(value, client.data, summary)).eq("user_id", user.data).eq("legacy_id", value.id).select("*").maybeSingle();
     if (error) return cloudFail(error);
-    if (!data) return createTimesheet(value);
+    if (!data) return createTimesheet(value, summary);
     return cloudOk(timesheetRowToModel(data, value.clientId));
   } catch (error) { return cloudFail(error); }
 }

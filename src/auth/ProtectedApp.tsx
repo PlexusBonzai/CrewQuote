@@ -56,9 +56,9 @@ function LocalDataNotice() {
             <CheckCircle size={18} />
           </div>
           <div className="min-w-0 flex-1">
-            <p className="text-sm font-semibold text-slate-950">Cloud accounts are now active.</p>
+            <p className="text-sm font-semibold text-slate-950">Your CrewQuote account is active.</p>
             <p className="mt-1 text-sm leading-relaxed text-slate-600">
-              Your existing CrewQuote records are still stored in this browser and will be migrated to your account in the next phase.
+              Settings, clients, and migrated Timesheets are cloud-backed. Invoices, payments, and logos remain protected in this browser.
             </p>
           </div>
           <button

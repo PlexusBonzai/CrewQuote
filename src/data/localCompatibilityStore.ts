@@ -5,6 +5,8 @@ const PHASE4_TIMESHEET_MIRROR_PREFIX = "cqp-phase4-timesheet-mirror-";
 const PHASE5_MIGRATION_COMPLETE_PREFIX = "cqp-phase5-invoices-migration-completed-";
 const PHASE5_INVOICE_MIRROR_PREFIX = "cqp-phase5-invoice-mirror-";
 const CALCULATION_SNAPSHOTS_PREFIX = "cqp-timesheet-calculation-snapshots-v1-";
+const BUSINESS_LOGO_RECOVERY_PREFIX = "cqp-business-logo-recovery-v1-";
+const BUSINESS_LOGO_BROWSER_ONLY_PREFIX = "cqp-business-logo-browser-only-";
 
 function readString(key: string) {
   try {
@@ -91,3 +93,20 @@ export function saveCalculationSnapshot(ownerUserId: string, snapshot: { ownerUs
 export function removeCalculationSnapshot(ownerUserId: string, timesheetLegacyId: string) { const snapshots = readCalculationSnapshots(ownerUserId); delete snapshots[timesheetLegacyId]; writeString(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`, JSON.stringify(snapshots)); }
 export function clearCalculationSnapshotsForOwner(ownerUserId: string) { window.localStorage?.removeItem(`${CALCULATION_SNAPSHOTS_PREFIX}${ownerUserId}`); }
 export function validateCalculationSnapshotOwner(snapshot: unknown, ownerUserId: string) { return Boolean(snapshot && typeof snapshot === "object" && (snapshot as { ownerUserId?: string }).ownerUserId === ownerUserId); }
+
+export function readBrowserLogoRecovery(ownerUserId: string) {
+  return readString(`${BUSINESS_LOGO_RECOVERY_PREFIX}${ownerUserId}`);
+}
+
+export function preserveBrowserLogoRecovery(ownerUserId: string, dataUrl: string) {
+  if (!ownerUserId || !dataUrl || readBrowserLogoRecovery(ownerUserId)) return;
+  writeString(`${BUSINESS_LOGO_RECOVERY_PREFIX}${ownerUserId}`, dataUrl);
+}
+
+export function logoKeptBrowserOnlyForUser(ownerUserId: string) {
+  return readString(`${BUSINESS_LOGO_BROWSER_ONLY_PREFIX}${ownerUserId}`) === "true";
+}
+
+export function markLogoKeptBrowserOnlyForUser(ownerUserId: string) {
+  writeString(`${BUSINESS_LOGO_BROWSER_ONLY_PREFIX}${ownerUserId}`, "true");
+}

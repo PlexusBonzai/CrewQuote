@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { AlertTriangle, CheckCircle, Film, X } from "lucide-react";
 import { useAuth } from "./AuthContext";
 import { AuthScreen } from "../components/auth/AuthScreen";
+import { runtimeConfig } from "../config/runtimeConfig";
 
 function LoadingScreen() {
   return (
@@ -25,17 +26,17 @@ function UnconfiguredScreen() {
             <AlertTriangle size={22} />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-bold text-slate-950">Supabase authentication is not configured.</h1>
+            <h1 className="text-xl font-bold text-slate-950">CrewQuote production configuration is incomplete.</h1>
             <p className="mt-2 text-sm leading-relaxed text-slate-600">
-              Set these browser-safe environment variables to enable CrewQuote account access:
+              Correct the browser-safe environment configuration, then rebuild and redeploy CrewQuote:
             </p>
             <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-slate-700">
               <p>VITE_SUPABASE_URL</p>
               <p>VITE_SUPABASE_PUBLISHABLE_KEY</p>
-              <p>VITE_SUPABASE_ANON_KEY</p>
             </div>
+            {runtimeConfig.errors.length > 0 && <ul className="mt-4 list-disc space-y-1 pl-5 text-sm text-amber-800">{runtimeConfig.errors.map(error => <li key={error}>{error}</li>)}</ul>}
             <p className="mt-4 text-sm leading-relaxed text-slate-500">
-              Use `VITE_SUPABASE_PUBLISHABLE_KEY` when available; `VITE_SUPABASE_ANON_KEY` is supported for local legacy projects. Values are intentionally not shown here.
+              Only the Supabase publishable browser key is accepted in production. Secret and service-role keys must never be placed in Vite environment variables. Values are intentionally not shown here.
             </p>
           </div>
         </div>
@@ -58,7 +59,7 @@ function LocalDataNotice() {
           <div className="min-w-0 flex-1">
             <p className="text-sm font-semibold text-slate-950">Your CrewQuote account is active.</p>
             <p className="mt-1 text-sm leading-relaxed text-slate-600">
-              Settings, clients, and migrated Timesheets are cloud-backed. Invoices, payments, and logos remain protected in this browser.
+              Settings, clients, migrated Timesheets, migrated Invoices and Payments, and any uploaded business logo are cloud-backed. Browser recovery records remain protected in this browser.
             </p>
           </div>
           <button

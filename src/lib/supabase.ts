@@ -1,16 +1,11 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "../types/database.types";
+import { runtimeConfig, runtimeConfigErrorMessage } from "../config/runtimeConfig";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim();
-const supabasePublishableKey = (
-  import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
-  import.meta.env.VITE_SUPABASE_ANON_KEY
-)?.trim();
-
-export const isSupabaseConfigured = Boolean(supabaseUrl && supabasePublishableKey);
+export const isSupabaseConfigured = runtimeConfig.isValid;
 
 export const supabase: SupabaseClient<Database> | null = isSupabaseConfigured
-  ? createClient<Database>(supabaseUrl as string, supabasePublishableKey as string, {
+  ? createClient<Database>(runtimeConfig.supabaseUrl, runtimeConfig.supabasePublishableKey, {
       auth: {
         autoRefreshToken: true,
         detectSessionInUrl: true,
@@ -21,7 +16,7 @@ export const supabase: SupabaseClient<Database> | null = isSupabaseConfigured
 
 export function getSupabaseBrowserClient() {
   if (!supabase) {
-    throw new Error("Supabase is not configured. Set VITE_SUPABASE_URL and VITE_SUPABASE_PUBLISHABLE_KEY to use the browser client. VITE_SUPABASE_ANON_KEY is also supported for local legacy projects.");
+    throw new Error(runtimeConfigErrorMessage() || "Supabase is not configured for this browser application.");
   }
 
   return supabase;

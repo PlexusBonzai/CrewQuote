@@ -6,6 +6,8 @@ import { listClients } from "./clientService";
 import { listRatePresets } from "./ratePresetService";
 import { getCurrentProfile } from "./profileService";
 import { listTimesheetsWithEntries } from "./timesheetService";
+import { listInvoicesWithLinesAndPayments } from "./invoiceService";
+import type { CrewInvoice } from "../data/crewquoteTypes";
 
 export interface Phase4CloudBackupData<T> {
   appData: T;
@@ -16,18 +18,20 @@ export interface Phase4CloudBackupData<T> {
     clients: unknown[];
     ratePresets: unknown[];
     timesheets?: unknown[];
+    invoices?: unknown[];
   };
 }
 
-export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(localData: T, includeCloudTimesheets = false): Promise<CloudResult<Phase4CloudBackupData<T>>> {
+export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(localData: T, includeCloudTimesheets = false, includeCloudInvoices = false): Promise<CloudResult<Phase4CloudBackupData<T>>> {
   try {
-    const [profile, settings, preferences, clients, ratePresets, timesheets] = await Promise.all([
+    const [profile, settings, preferences, clients, ratePresets, timesheets, invoices] = await Promise.all([
       getCurrentProfile(),
       getCurrentBusinessSettings(localData.profile),
       getCurrentUserPreferences({ onboardingDismissed: localData.onboardingDismissed, uiPreferences: {} }),
       listClients(),
       listRatePresets(),
       includeCloudTimesheets ? listTimesheetsWithEntries() : Promise.resolve(cloudOk<unknown[]>([])),
+      includeCloudInvoices ? listInvoicesWithLinesAndPayments(localData.invoices as CrewInvoice[]) : Promise.resolve(cloudOk<unknown[]>([])),
     ]);
     if (profile.error || !profile.data) return cloudFail(profile.error || "CrewQuote could not fetch the account profile for backup.");
     if (settings.error || !settings.data) return cloudFail(settings.error || "CrewQuote could not fetch cloud settings for backup.");
@@ -38,6 +42,10 @@ export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(lo
       data: null,
       error: `Complete current backup stopped: ${timesheets.error || "CrewQuote could not fetch cloud Timesheets."} Browser recovery data was not labelled as current.`,
     };
+    if (invoices.error || !invoices.data) return {
+      data: null,
+      error: `Complete current backup stopped: ${invoices.error || "CrewQuote could not fetch cloud Invoices and Payments."} Browser recovery data was not labelled as current.`,
+    };
 
     const appData = {
       ...localData,
@@ -47,6 +55,7 @@ export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(lo
       },
       clients: clients.data,
       timesheets: includeCloudTimesheets ? timesheets.data : localData.timesheets,
+      invoices: includeCloudInvoices ? invoices.data : localData.invoices,
       onboardingDismissed: preferences.data.preferences.onboardingDismissed,
     } as T;
     return cloudOk({
@@ -58,6 +67,7 @@ export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(lo
         clients: clients.data,
         ratePresets: ratePresets.data,
         ...(includeCloudTimesheets ? { timesheets: timesheets.data } : {}),
+        ...(includeCloudInvoices ? { invoices: invoices.data } : {}),
       },
     });
   } catch (error) {
@@ -65,7 +75,7 @@ export async function buildPhase4CloudBackupData<T extends Phase3AppDataLike>(lo
   }
 }
 
-export async function buildCloudAwareBackupData<T extends Phase3AppDataLike>(localData: T, includeCloudTimesheets = false): Promise<CloudResult<T>> {
-  const complete = await buildPhase4CloudBackupData(localData, includeCloudTimesheets);
+export async function buildCloudAwareBackupData<T extends Phase3AppDataLike>(localData: T, includeCloudTimesheets = false, includeCloudInvoices = false): Promise<CloudResult<T>> {
+  const complete = await buildPhase4CloudBackupData(localData, includeCloudTimesheets, includeCloudInvoices);
   return complete.error || !complete.data ? cloudFail(complete.error) : cloudOk(complete.data.appData);
 }

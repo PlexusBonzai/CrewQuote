@@ -182,3 +182,77 @@ export interface CrewTimesheet {
   invoiceId?: string;
   createdAt: string;
 }
+
+export type CrewInvoiceStatus = "draft" | "sent" | "paid" | "partial" | "overdue" | "cancelled";
+
+export interface CrewInvoiceLine {
+  id: string;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  isExtra?: boolean;
+  taxable?: boolean;
+  category?: "day-rate" | "overtime" | "equipment" | "travel" | "expenses" | "turnaround" | "additional";
+  sourceEntryId?: string;
+}
+
+export interface CrewInvoiceSellerSnapshot {
+  fullName: string;
+  role: string;
+  companyName: string;
+  email: string;
+  phone: string;
+  address: string;
+  vatRegistered: boolean;
+  vatNumber: string;
+  invoiceLabel: string;
+  businessLogoDataUrl: string;
+}
+
+export interface CrewPayment {
+  id: string;
+  paymentDate: string;
+  amount: number;
+  method: string;
+  reference: string;
+  notes: string;
+}
+
+export interface CrewInvoice {
+  id: string;
+  invoiceNumber: string;
+  poNumber?: string;
+  issueDate: string;
+  dueDate: string;
+  clientId?: string;
+  clientName: string;
+  client?: CrewClient;
+  crewName: string;
+  role: string;
+  companyName: string;
+  sellerLogoDataUrl?: string;
+  sellerSnapshot?: CrewInvoiceSellerSnapshot;
+  productionName?: string;
+  timesheetNumber: string;
+  timesheetDates?: string;
+  detailMode?: InvoiceDetailMode;
+  lineItems: CrewInvoiceLine[];
+  timesheetBreakdown?: CrewInvoiceLine[];
+  subtotal: number;
+  vat: number;
+  vatAmount: number;
+  total: number;
+  paidAmount?: number;
+  paidDate?: string;
+  balanceDue?: number;
+  currency: string;
+  status: CrewInvoiceStatus;
+  banking: Record<string, string>;
+  paymentTerms?: string;
+  paymentNotes: string;
+  notes?: string;
+  fromTimesheetId: string;
+  payments?: CrewPayment[];
+  createdAt: string;
+}

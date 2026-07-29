@@ -2,6 +2,8 @@ export const PHASE3_LOCAL_DATA_OWNER_KEY = "cqp-local-data-owner-user-id";
 const PHASE3_MIGRATION_COMPLETE_PREFIX = "cqp-phase3-migration-completed-";
 const PHASE4_MIGRATION_COMPLETE_PREFIX = "cqp-phase4-timesheets-migration-completed-";
 const PHASE4_TIMESHEET_MIRROR_PREFIX = "cqp-phase4-timesheet-mirror-";
+const PHASE5_MIGRATION_COMPLETE_PREFIX = "cqp-phase5-invoices-migration-completed-";
+const PHASE5_INVOICE_MIRROR_PREFIX = "cqp-phase5-invoice-mirror-";
 const CALCULATION_SNAPSHOTS_PREFIX = "cqp-timesheet-calculation-snapshots-v1-";
 
 function readString(key: string) {
@@ -54,6 +56,30 @@ export function readPhase4TimesheetMirror(userId: string): unknown[] {
   try {
     const value = JSON.parse(readString(`${PHASE4_TIMESHEET_MIRROR_PREFIX}${userId}`));
     return Array.isArray(value?.timesheets) ? value.timesheets : [];
+  } catch { return []; }
+}
+
+export function phase5MigrationCompletedForUser(userId: string) {
+  return readString(`${PHASE5_MIGRATION_COMPLETE_PREFIX}${userId}`) === "true";
+}
+
+export function markPhase5MigrationCompletedForUser(userId: string, fingerprint: string) {
+  writeString(`${PHASE5_MIGRATION_COMPLETE_PREFIX}${userId}`, "true");
+  writeString(`${PHASE5_MIGRATION_COMPLETE_PREFIX}${userId}-fingerprint`, fingerprint);
+}
+
+export function phase5MigrationFingerprintForUser(userId: string) {
+  return readString(`${PHASE5_MIGRATION_COMPLETE_PREFIX}${userId}-fingerprint`);
+}
+
+export function writePhase5InvoiceMirror(userId: string, invoices: unknown[]) {
+  window.localStorage?.setItem(`${PHASE5_INVOICE_MIRROR_PREFIX}${userId}`, JSON.stringify({ version: 1, invoices }));
+}
+
+export function readPhase5InvoiceMirror(userId: string): unknown[] {
+  try {
+    const value = JSON.parse(readString(`${PHASE5_INVOICE_MIRROR_PREFIX}${userId}`));
+    return Array.isArray(value?.invoices) ? value.invoices : [];
   } catch { return []; }
 }
 

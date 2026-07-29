@@ -125,6 +125,19 @@ The current app has client-specific last-used rate memory embedded in `Client.ra
 
 Work-day rate and calculation snapshots remain on `timesheet_entries`. Loading a timesheet must use saved snapshots rather than recalculating historical values from current Settings. Changing Settings alone must not rewrite summary fields. Invoices remain local during Phase 4 and continue using the existing saved timesheet/day data and invoice workflow.
 
+## Phase 5 Invoice Schema Preparation
+
+Phase 5 application migration is not active yet. The prepared Invoice identity and preservation model is:
+
+- `invoices.id` is the internal Supabase UUID primary key.
+- `invoices.legacy_id` is the CrewQuote app-facing `Invoice.id`; non-null values are unique per user.
+- `invoices.source_timesheet_legacy_id` preserves the browser-facing `fromTimesheetId` for direct lookup and source-delete protection.
+- `invoices.from_timesheet_id` remains the optional internal UUID relationship to the cloud Timesheet.
+- `invoices.invoice_snapshot` preserves the exact JSON-serialisable historical local Invoice model, including its client, business, banking, source Timesheet, line, expense, and PDF-visible snapshots where present.
+- `invoice_lines.legacy_id` preserves the app-facing line ID; non-null values are unique per user.
+
+Historical Invoice values must be imported from their saved browser records and snapshots. They must not be reconstructed or recalculated from current Timesheets or Settings. Phase 5 will keep the original browser Invoice data as a recovery copy after verified cloud activation.
+
 ## Import Batches
 
 Browser migration uses `import_batches` with:

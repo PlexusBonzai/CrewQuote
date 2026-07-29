@@ -425,7 +425,9 @@ export type Database = {
           from_timesheet_id: string | null
           id: string
           invoice_number: string
+          invoice_snapshot: Json | null
           issue_date: string
+          legacy_id: string | null
           notes: string | null
           paid_amount: number
           paid_date: string | null
@@ -436,6 +438,7 @@ export type Database = {
           role: string
           seller_logo_path: string | null
           seller_snapshot: Json | null
+          source_timesheet_legacy_id: string | null
           status: Database["public"]["Enums"]["invoice_status"]
           subtotal: number
           timesheet_dates: string | null
@@ -460,7 +463,9 @@ export type Database = {
           from_timesheet_id?: string | null
           id?: string
           invoice_number: string
+          invoice_snapshot?: Json | null
           issue_date: string
+          legacy_id?: string | null
           notes?: string | null
           paid_amount?: number
           paid_date?: string | null
@@ -471,6 +476,7 @@ export type Database = {
           role?: string
           seller_logo_path?: string | null
           seller_snapshot?: Json | null
+          source_timesheet_legacy_id?: string | null
           status?: Database["public"]["Enums"]["invoice_status"]
           subtotal?: number
           timesheet_dates?: string | null
@@ -495,7 +501,9 @@ export type Database = {
           from_timesheet_id?: string | null
           id?: string
           invoice_number?: string
+          invoice_snapshot?: Json | null
           issue_date?: string
+          legacy_id?: string | null
           notes?: string | null
           paid_amount?: number
           paid_date?: string | null
@@ -506,6 +514,7 @@ export type Database = {
           role?: string
           seller_logo_path?: string | null
           seller_snapshot?: Json | null
+          source_timesheet_legacy_id?: string | null
           status?: Database["public"]["Enums"]["invoice_status"]
           subtotal?: number
           timesheet_dates?: string | null

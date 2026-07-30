@@ -2,8 +2,38 @@ import { Component, Fragment, forwardRef, useState, useEffect, useMemo, useCallb
 import {
   Clock, Receipt, Settings, Film, Plus, Trash2,
   AlertTriangle, CheckCircle, Moon, ChevronDown, ChevronUp,
-  Save, Zap, Copy, FileText, Info, Users, Building2, Pencil
+  Save, Zap, Copy, FileText, Info, Users, Building2, Pencil, UserCircle
 } from "lucide-react";
+import { useAuth } from "./auth/AuthContext";
+import { AccountPage } from "./components/account/AccountPage";
+import { claimLocalDataOwner, getCalculationSnapshot, logoKeptBrowserOnlyForUser, markLogoKeptBrowserOnlyForUser, migrationCompletedForUser, phase4MigrationCompletedForUser, phase4MigrationFingerprintForUser, phase5MigrationCompletedForUser, phase5MigrationFingerprintForUser, preserveBrowserLogoRecovery, readBrowserLogoRecovery, readCalculationSnapshots, readLocalDataOwnerId, writePhase4TimesheetMirror, writePhase5InvoiceMirror } from "./data/localCompatibilityStore";
+import {
+  hasPhase3MigrationSource,
+  migrateBrowserDataToCloud,
+  summarizePhase3MigrationSource,
+  type Phase3MigrationSummary,
+} from "./services/cloudMigrationService";
+import { buildPhase4CloudBackupData } from "./services/cloudBackupService";
+import { migratePreparedTimesheets, preflightPhase4TimesheetMigration, type Phase4MigrationPreflight, type Phase4MigrationStage } from "./services/timesheetMigrationService";
+import { migratePreparedInvoices, preflightPhase5InvoiceMigration, type Phase5MigrationPreflight, type Phase5MigrationStage } from "./services/invoiceMigrationService";
+import { createInvoice as createCloudInvoice, deleteInvoice as deleteCloudInvoice, listInvoicesWithLinesAndPayments, updateInvoice as updateCloudInvoice } from "./services/invoiceService";
+import { getCurrentBusinessSettings, saveCurrentBusinessSettings } from "./services/businessSettingsService";
+import { getCurrentUserPreferences, saveCurrentUserPreferences } from "./services/userPreferencesService";
+import { deleteClient as deleteCloudClient, listClients, updateClient as updateCloudClient, upsertClientByLegacyId as upsertCloudClient } from "./services/clientService";
+import { calcDay, calcSummary, calcTurnaround, entryCallDateTime, sortEntriesForTurnaround, num, profileForTimesheet } from "./domain/calculations/timesheetCalculations";
+import {
+  calculationSourceFingerprint,
+  confirmCurrentBaselineSnapshot,
+  evaluateCalculationSnapshot,
+  prepareCurrentBaselineSnapshot,
+  summaryToDatabasePayload,
+  type LegacyTimesheetCalculationSnapshotV1,
+} from "./domain/calculations/timesheetCalculationSnapshots";
+import type { CrewInvoice, CrewPayment, CrewTimesheet, CrewTimesheetEntry } from "./data/crewquoteTypes";
+import { createTimesheet as createCloudTimesheet, deleteTimesheet as deleteCloudTimesheet, getTimesheetCloudId, listTimesheetsWithEntries, updateTimesheet as updateCloudTimesheet } from "./services/timesheetService";
+import { deleteEntry as deleteCloudEntry, getEntryCloudId, saveEntry as saveCloudEntry } from "./services/timesheetEntryService";
+import { saveEntryExpense } from "./services/dayExpenseService";
+import { loadBusinessLogo, migrateLocalBusinessLogo, removeBusinessLogo } from "./services/businessLogoService";
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -116,6 +146,7 @@ interface TimesheetEntry {
   calcOvertimeHours?: number;
   calcOvertimeCost?: number;
   calcDayTotal?: number;
+  calcSnapshot?: unknown;
   isSunday: boolean;
   isPublicHoliday: boolean;
 }
@@ -150,6 +181,7 @@ interface Timesheet {
   mealBreaksDeducted?: boolean;
   travelTimePaid?: boolean;
   equipmentRentalDaily?: boolean;
+  summarySnapshot?: unknown;
   invoiceId?: string;
   createdAt: string;
 }
@@ -163,6 +195,7 @@ interface InvoiceLine {
   isExtra?: boolean;
   taxable?: boolean;
   category?: "day-rate" | "overtime" | "equipment" | "travel" | "expenses" | "turnaround" | "additional";
+  sourceEntryId?: string;
 }
 
 interface InvoiceSellerSnapshot {
@@ -177,6 +210,8 @@ interface InvoiceSellerSnapshot {
   invoiceLabel: string;
   businessLogoDataUrl: string;
 }
+
+interface InvoicePayment extends CrewPayment {}
 
 interface Invoice {
   id: string;
@@ -212,6 +247,7 @@ interface Invoice {
   paymentNotes: string;
   notes?: string;
   fromTimesheetId: string;
+  payments?: InvoicePayment[];
   createdAt: string;
 }
 
@@ -239,7 +275,8 @@ const CURRENT_DATA_VERSION = 1;
 const BACKUP_VERSION = 1;
 const FEEDBACK_EMAIL = "dbruning22@gmail.com";
 const DEFAULT_INVOICE_DETAIL_MODE: InvoiceDetailMode = "detailed";
-const IS_DEV_BUILD = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+const PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE =
+  "Full restore remains paused because a backup now combines authoritative Supabase records, a private cloud logo, and separately labelled browser recovery data. Complete backup export remains available, but restoring requires an account-aware merge workflow that is not yet validated.";
 
 const STORAGE_KEYS = {
   dataVersion: "cqp-data-version",
@@ -251,12 +288,6 @@ const STORAGE_KEYS = {
 } as const;
 
 const CREWQUOTE_STORAGE_KEYS = Object.values(STORAGE_KEYS);
-
-function getOTBands(ruleId: OTRuleId, profile: Profile): { band1Hours: number; band1Mult: number; band2Mult: number } {
-  if (ruleId === "sa-film") return { band1Hours: 4,    band1Mult: 1.5, band2Mult: 2.0 };
-  if (ruleId === "sa-bcea") return { band1Hours: 9999, band1Mult: 1.5, band2Mult: 1.5 };
-  return { band1Hours: profile.defaultOtBand1Hours ?? 4, band1Mult: profile.defaultOtBand1Mult ?? 1.5, band2Mult: profile.defaultOtBand2Mult ?? 2.0 };
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PROFILE DEFAULTS
@@ -311,6 +342,18 @@ interface CrewQuoteBackup {
     timesheets: Timesheet[];
     invoices: Invoice[];
     onboardingDismissed: boolean;
+    calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> };
+    phase4Recovery?: {
+      localOwnerUserId: string;
+      phase4MigrationFingerprint: string;
+      phase3MigrationCompleted: boolean;
+      phase4MigrationAlreadyCompleted: boolean;
+      phase5MigrationFingerprint?: string;
+      phase5MigrationAlreadyCompleted?: boolean;
+      invoiceRecovery?: Invoice[];
+      businessLogoRecovery?: { ownerUserId: string; dataUrl: string };
+      cloudRecovery: unknown;
+    };
   };
 }
 
@@ -441,7 +484,7 @@ function backupTimestamp(d = new Date()) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
 }
 
-function createBackupPayload(data: AppData): CrewQuoteBackup {
+function createBackupPayload(data: AppData, calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> }, phase4Recovery?: CrewQuoteBackup["data"]["phase4Recovery"]): CrewQuoteBackup {
   return {
     format: "crewquote-backup",
     backupVersion: BACKUP_VERSION,
@@ -454,12 +497,14 @@ function createBackupPayload(data: AppData): CrewQuoteBackup {
       timesheets: data.timesheets,
       invoices: data.invoices,
       onboardingDismissed: data.onboardingDismissed,
+      calculationSnapshots,
+      phase4Recovery,
     },
   };
 }
 
-function downloadBackup(data: AppData, prefix = "crewquote-backup") {
-  const payload = createBackupPayload(data);
+function downloadBackup(data: AppData, prefix = "crewquote-backup", calculationSnapshots?: { ownerUserId: string; records: Record<string, unknown> }, phase4Recovery?: CrewQuoteBackup["data"]["phase4Recovery"]) {
+  const payload = createBackupPayload(data, calculationSnapshots, phase4Recovery);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -475,11 +520,8 @@ function downloadBackup(data: AppData, prefix = "crewquote-backup") {
 // CALCULATION ENGINE
 // ═══════════════════════════════════════════════════════════════════════════
 
-const toMins     = (t: string) => { if (!t) return 0; const [h = 0, m = 0] = (t + ":0").split(":").map(Number); return h * 60 + m; };
-const durH       = (s: string, e: string) => { let sm = toMins(s), em = toMins(e); if (em <= sm) em += 1440; return Math.max((em - sm) / 60, 0); };
 const hoursToHM  = (h: number) => { const n = Math.abs(h ?? 0); const hrs = Math.floor(n); const m = Math.round((n - hrs) * 60); return m > 0 ? `${hrs}h ${m}m` : `${hrs}h`; };
 const safe       = (v: unknown, def = 0) => parseFloat(String(v ?? def)) || def;
-const num        = (v: unknown, def = 0) => { const n = parseFloat(String(v ?? "")); return Number.isFinite(n) ? n : def; };
 const uid        = () => `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const todayStr   = () => new Date().toISOString().split("T")[0];
 const nextDayStr = (d: string) => { try { const dt = new Date(d + "T12:00:00"); dt.setDate(dt.getDate() + 1); return dt.toISOString().split("T")[0]; } catch { return todayStr(); } };
@@ -489,38 +531,6 @@ const fmtMoney   = (n: unknown, cur = "ZAR") => {
   const locale = { ZAR: "en-ZA", USD: "en-US", GBP: "en-GB", EUR: "de-DE" }[cur] || "en-ZA";
   return `${sym} ${new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(parseFloat(String(n ?? 0)) || 0)}`;
 };
-const parseDateOnly = (d?: string) => {
-  if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
-  const dt = new Date(`${d}T00:00:00`);
-  return Number.isNaN(dt.getTime()) ? null : dt;
-};
-const parseTimeParts = (t?: string) => {
-  if (!t) return null;
-  const [hRaw, mRaw = "0"] = t.split(":");
-  const h = Number(hRaw), m = Number(mRaw);
-  if (!Number.isFinite(h) || !Number.isFinite(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
-  return { h, m };
-};
-const entryCallDateTime = (e: Partial<TimesheetEntry>) => {
-  const d = parseDateOnly(e.date);
-  const t = parseTimeParts(e.callTime);
-  if (!d || !t) return null;
-  d.setHours(t.h, t.m, 0, 0);
-  return d;
-};
-const entryWrapDateTime = (e: Partial<TimesheetEntry>) => {
-  const call = entryCallDateTime(e);
-  const t = parseTimeParts(e.wrapTime);
-  if (!call || !t) return null;
-  const wrap = new Date(call);
-  wrap.setHours(t.h, t.m, 0, 0);
-  if (wrap.getTime() <= call.getTime()) wrap.setDate(wrap.getDate() + 1);
-  return wrap;
-};
-const sortEntriesForTurnaround = <T extends Partial<TimesheetEntry>>(entries: T[]) =>
-  [...entries].map((entry, index) => ({ entry, index, start: entryCallDateTime(entry)?.getTime() }))
-    .sort((a, b) => (a.start ?? Number.POSITIVE_INFINITY) - (b.start ?? Number.POSITIVE_INFINITY) || a.index - b.index)
-    .map(({ entry }) => entry);
 const latestEntryForDefaults = (entries: TimesheetEntry[]) => {
   const sorted = sortEntriesForTurnaround(entries);
   return [...sorted].reverse().find(e => entryCallDateTime(e)) || entries[entries.length - 1];
@@ -534,11 +544,11 @@ const findPreviousEntryForTurnaround = (entries: TimesheetEntry[], next: Partial
     return start !== undefined && start < nextMs;
   }) || null;
 };
-const calcTurnaround = (prev: Partial<TimesheetEntry>, next: Partial<TimesheetEntry>) => {
-  const prevWrap = entryWrapDateTime(prev);
-  const nextCall = entryCallDateTime(next);
-  if (!prevWrap || !nextCall) return null;
-  return Math.max((nextCall.getTime() - prevWrap.getTime()) / 3600000, 0);
+const calculationProfileForTimesheet = (profile: Profile, timesheet: Partial<Timesheet>): Profile => {
+  const effective = profileForTimesheet(profile, timesheet);
+  const entries = timesheet.entries || [];
+  if (!entries.length) return effective;
+  return { ...effective, vatRegistered: entries.some(entry => num(entry.vatRateUsed, 0) > 0) };
 };
 
 const blankClient = (overrides: Partial<Client> = {}): Client => ({
@@ -600,6 +610,32 @@ const comparableInvoiceLines = (lines: InvoiceLine[] = []) => lines.map(line => 
 const isManualInvoiceLine = (line: Partial<InvoiceLine>) => Boolean(line.isExtra || line.category === "additional");
 const invoiceGeneratedLines = (lines: InvoiceLine[] = []) => lines.filter(l => !isManualInvoiceLine(l));
 const invoiceManualLines = (lines: InvoiceLine[] = []) => lines.filter(isManualInvoiceLine);
+const invoiceReferencesEntry = (invoice: Invoice, entryId: string) =>
+  [...(invoice.lineItems || []), ...(invoice.timesheetBreakdown || [])].some(line => line.sourceEntryId === entryId);
+
+const invoiceForTimesheet = (timesheet: Partial<Timesheet>, invoices: Invoice[]) =>
+  invoices.find(invoice => Boolean(timesheet.id) && invoice.fromTimesheetId === timesheet.id)
+  || invoices.find(invoice => Boolean(timesheet.invoiceId) && invoice.id === timesheet.invoiceId)
+  || null;
+
+const timesheetBaseStatus = (timesheet: Partial<Timesheet>) => timesheet.status === "submitted" ? "submitted" : "open";
+
+function timesheetDisplayState(timesheet: Partial<Timesheet>, linkedInvoice: Invoice | null) {
+  if (!linkedInvoice) {
+    const status = timesheetBaseStatus(timesheet);
+    return { color: status === "submitted" ? "blue" : "gray", label: status === "submitted" ? "Submitted" : "Open" };
+  }
+  const status = normalizeInvoiceStatus(linkedInvoice.status);
+  const display = {
+    draft: { color: "teal", label: "Invoice created" },
+    sent: { color: "blue", label: "Invoice sent" },
+    paid: { color: "green", label: "Invoice paid" },
+    partial: { color: "amber", label: "Invoice partially paid" },
+    overdue: { color: "red", label: "Invoice overdue" },
+    cancelled: { color: "gray", label: "Invoice cancelled" },
+  } as const;
+  return display[status];
+}
 
 const clientBillingErrors = (client?: Partial<Client> | null): Partial<Record<keyof Client, string>> => {
   const errors: Partial<Record<keyof Client, string>> = {};
@@ -723,29 +759,6 @@ const protectedInvoiceStatus = (status?: string) => normalizeInvoiceStatus(statu
 const invoiceLogoForDisplay = (inv: Partial<Invoice>, profile: Profile) =>
   protectedInvoiceStatus(inv.status) ? (inv.sellerLogoDataUrl || "") : (profile.businessLogoDataUrl || inv.sellerLogoDataUrl || "");
 
-function profileForTimesheet(profile: Profile, ts?: Partial<Timesheet>): Profile {
-  if (!ts) return profile;
-  return {
-    ...profile,
-    defaultCurrency:          ts.currency || profile.defaultCurrency,
-    defaultDayRate:           num(ts.defaultDayRate, profile.defaultDayRate),
-    defaultIncludedHours:     num(ts.defaultIncludedHours, profile.defaultIncludedHours),
-    defaultEquipmentRental:   num(ts.defaultEquipmentRental, profile.defaultEquipmentRental),
-    defaultPerDiem:           num(ts.defaultPerDiem, profile.defaultPerDiem),
-    defaultVat:               num(ts.vat, profile.defaultVat),
-    defaultOvertimeRule:      (ts.defaultOvertimeRule || profile.defaultOvertimeRule) as OTRuleId,
-    defaultOtBand1Hours:      num(ts.defaultOtBand1Hours, profile.defaultOtBand1Hours),
-    defaultOtBand1Mult:       num(ts.defaultOtBand1Mult, profile.defaultOtBand1Mult),
-    defaultOtBand2Mult:       num(ts.defaultOtBand2Mult, profile.defaultOtBand2Mult),
-    defaultMinTurnaround:     num(ts.defaultMinTurnaround, profile.defaultMinTurnaround),
-    defaultTurnaroundMode:    (ts.defaultTurnaroundMode || profile.defaultTurnaroundMode) as TurnaroundMode,
-    defaultTurnaroundPenMult: num(ts.defaultTurnaroundPenMult, profile.defaultTurnaroundPenMult),
-    mealBreaksDeducted:       ts.mealBreaksDeducted ?? profile.mealBreaksDeducted,
-    travelTimePaid:           ts.travelTimePaid ?? profile.travelTimePaid,
-    equipmentRentalDaily:     ts.equipmentRentalDaily ?? profile.equipmentRentalDaily,
-  };
-}
-
 function timesheetDateRange(ts: Timesheet): string {
   const dates = (ts.entries || []).map(e => e.date).filter(Boolean).sort();
   if (!dates.length) return ts.startDate ? fmtDate(ts.startDate) : "Not set";
@@ -785,6 +798,7 @@ function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
     mealBreaksDeducted: t.mealBreaksDeducted,
     travelTimePaid: t.travelTimePaid,
     equipmentRentalDaily: t.equipmentRentalDaily,
+    summarySnapshot: t.summarySnapshot,
     invoiceId: t.invoiceId,
     createdAt: t.createdAt || new Date().toISOString(),
   };
@@ -794,10 +808,24 @@ function normalizeTimesheet(t: Partial<Timesheet>): Timesheet {
 
 function normalizeInvoice(i: Partial<Invoice>): Invoice {
   const status = normalizeInvoiceStatus(i.status);
-  const paidAmount = safe(i.paidAmount, status === "paid" ? i.total : 0);
+  const id = i.id || uid();
+  const savedPaidAmount = safe(i.paidAmount, status === "paid" ? i.total : 0);
+  const payments = Array.isArray(i.payments)
+    ? i.payments.map((payment, index) => ({
+        id: payment.id || `${id}:payment:${index}`,
+        paymentDate: payment.paymentDate || i.paidDate || i.issueDate || todayStr(),
+        amount: safe(payment.amount, 0),
+        method: payment.method || "",
+        reference: payment.reference || "",
+        notes: payment.notes || "",
+      })).filter(payment => payment.amount > 0)
+    : savedPaidAmount > 0
+      ? [{ id: `${id}:payment:legacy-summary`, paymentDate: i.paidDate || i.issueDate || todayStr(), amount: savedPaidAmount, method: "", reference: i.invoiceNumber || "", notes: "Imported from the saved Invoice payment summary." }]
+      : [];
+  const paidAmount = payments.length ? payments.reduce((sum, payment) => sum + payment.amount, 0) : savedPaidAmount;
   const total = safe(i.total, 0);
   return {
-    id: i.id || uid(),
+    id,
     invoiceNumber: i.invoiceNumber || "I-Not set",
     poNumber: i.poNumber || "",
     issueDate: i.issueDate || todayStr(),
@@ -830,6 +858,7 @@ function normalizeInvoice(i: Partial<Invoice>): Invoice {
     paymentNotes: i.paymentNotes || "",
     notes: i.notes || "",
     fromTimesheetId: i.fromTimesheetId || "",
+    payments,
     createdAt: i.createdAt || new Date().toISOString(),
   };
 }
@@ -904,6 +933,7 @@ function withEntrySnapshots(entry: TimesheetEntry, profile: Profile): TimesheetE
     calcOvertimeHours: c.totalOtH,
     calcOvertimeCost: c.totalOtCost,
     calcDayTotal: c.total,
+    calcSnapshot: entry.calcSnapshot ?? c,
   };
 }
 
@@ -1034,76 +1064,6 @@ function hasMeaningfulCrewQuoteData(data: AppData) {
     || data.timesheets.length > 0
     || data.invoices.length > 0
     || Boolean(p.fullName || p.companyName || p.email || p.phone || p.businessLogoDataUrl || p.bankAccountNumber || p.defaultDayRate);
-}
-
-/** Core per-day calculation — FULLY DEFENSIVE, never throws */
-function calcDay(e: Partial<TimesheetEntry>, profile: Profile) {
-  try {
-    const call  = e.callTime    || "08:00";
-    const wrap  = e.wrapTime    || "18:00";
-    const onSetH    = durH(call, wrap);
-    const overnight = toMins(wrap) <= toMins(call);
-    const mealDeducted = e.mealDeductedUsed ?? e.mealDeducted ?? profile.mealBreaksDeducted ?? true;
-    const travelPaid   = e.travelPaidUsed   ?? e.travelPaid   ?? profile.travelTimePaid     ?? true;
-    const mealH = mealDeducted ? Math.max(num(e.mealBreakMinutes) / 60, 0) : 0;
-    const workH = Math.max(onSetH - mealH, 0);
-    const travH = travelPaid && e.travelStartTime && e.travelEndTime ? durH(e.travelStartTime, e.travelEndTime) : 0;
-    const paidH = workH + travH;
-    const dayRate     = num(e.dayRateUsed ?? e.dayRate, profile.defaultDayRate ?? 0);
-    const incH        = Math.max(num(e.includedHoursUsed ?? e.includedHours, profile.defaultIncludedHours ?? 10), 1);
-    const baseHourly  = dayRate / incH;
-    const ruleId      = (e.overtimeRuleUsed || e.overtimeRule || profile.defaultOvertimeRule || "sa-film") as OTRuleId;
-    const ovEntry     = { defaultOtBand1Hours: num(e.otBand1HoursUsed ?? e.otBand1Hours, profile.defaultOtBand1Hours ?? 4), defaultOtBand1Mult: num(e.otBand1MultUsed ?? e.otBand1Mult, profile.defaultOtBand1Mult ?? 1.5), defaultOtBand2Mult: num(e.otBand2MultUsed ?? e.otBand2Mult, profile.defaultOtBand2Mult ?? 2.0) };
-    const bands       = getOTBands(ruleId, { ...profile, ...ovEntry } as Profile);
-    const totalOtH    = Math.max(paidH - incH, 0);
-    const b1H         = Math.min(totalOtH, bands.band1Hours);
-    const b2H         = Math.max(totalOtH - bands.band1Hours, 0);
-    const b1Cost      = b1H * baseHourly * bands.band1Mult;
-    const b2Cost      = b2H * baseHourly * bands.band2Mult;
-    const totalOtCost = b1Cost + b2Cost;
-    const equip    = num(e.equipmentRentalUsed ?? e.equipmentRental, profile.equipmentRentalDaily ? profile.defaultEquipmentRental : 0);
-    const perDiem  = num(e.perDiemUsed ?? e.perDiem, profile.defaultPerDiem ?? 0);
-    const expenses = num(e.expenses, 0);
-    const total    = dayRate + totalOtCost + equip + perDiem + expenses;
-    return { onSetH, overnight, mealH, workH, travH, paidH, incH, baseHourly, totalOtH, b1H, b1Cost, b2H, b2Cost, totalOtCost, equip, perDiem, expenses, dayRate, total, ruleId, bands };
-  } catch {
-    return { onSetH: 0, overnight: false, mealH: 0, workH: 0, travH: 0, paidH: 0, incH: 10, baseHourly: 0, totalOtH: 0, b1H: 0, b1Cost: 0, b2H: 0, b2Cost: 0, totalOtCost: 0, equip: 0, perDiem: 0, expenses: 0, dayRate: 0, total: 0, ruleId: "sa-film" as OTRuleId, bands: { band1Hours: 4, band1Mult: 1.5, band2Mult: 2.0 } };
-  }
-}
-
-function calcSummary(entries: TimesheetEntry[], profile: Profile) {
-  const sortedEntries = sortEntriesForTurnaround(entries || []);
-  const calcs        = sortedEntries.map((e, i) => {
-    const c = calcDay(e, profile);
-    const prev = i > 0 ? sortedEntries[i - 1] : undefined;
-    const turnaround = prev ? calcTurnaround(prev, e) : null;
-    const minTR = num(e.turnaroundMinimumHoursUsed, profile.defaultMinTurnaround || 10);
-    const trMode = (e.turnaroundRuleUsed || profile.defaultTurnaroundMode || "warning") as TurnaroundMode;
-    const shortfall = turnaround !== null ? Math.max(minTR - turnaround, 0) : 0;
-    const turnaroundPenalty = trMode === "penalty"
-      ? shortfall * (c.baseHourly || 0) * num(e.turnaroundPenaltyMultUsed, profile.defaultTurnaroundPenMult || 1)
-      : 0;
-    const vatRate = profile.vatRegistered ? num(e.vatRateUsed, profile.defaultVat) : 0;
-    const totalWithPenalty = c.total + turnaroundPenalty;
-    return { entry: e, c: { ...c, turnaround, turnaroundPenalty, totalWithPenalty, vatRate, vatAmount: totalWithPenalty * (vatRate / 100) } };
-  });
-  const totalDays    = calcs.length;
-  const totalDayRates = calcs.reduce((s, { c }) => s + (c.dayRate    || 0), 0);
-  const totalOtCost  = calcs.reduce((s, { c }) => s + (c.totalOtCost || 0), 0);
-  const totalOtH     = calcs.reduce((s, { c }) => s + (c.totalOtH    || 0), 0);
-  const totalEquip   = calcs.reduce((s, { c }) => s + (c.equip       || 0), 0);
-  const totalPerDiem = calcs.reduce((s, { c }) => s + (c.perDiem     || 0), 0);
-  const totalExp     = calcs.reduce((s, { c }) => s + (c.expenses    || 0), 0);
-  const totalTurnaroundPenalty = calcs.reduce((s, { c }) => s + (c.turnaroundPenalty || 0), 0);
-  const totalPaidH   = calcs.reduce((s, { c }) => s + (c.paidH       || 0), 0);
-  const totalTravH   = calcs.reduce((s, { c }) => s + (c.travH       || 0), 0);
-  const subtotal     = totalDayRates + totalOtCost + totalEquip + totalPerDiem + totalExp + totalTurnaroundPenalty;
-  const vatRates     = [...new Set(calcs.map(({ c }) => c.vatRate || 0))];
-  const vatPct       = vatRates.length === 1 ? vatRates[0] : (profile.vatRegistered ? num(profile.defaultVat) : 0);
-  const mixedVat     = vatRates.length > 1;
-  const vatAmt       = calcs.reduce((s, { c }) => s + (c.vatAmount || 0), 0);
-  const grandTotal   = subtotal + vatAmt;
-  return { calcs, totalDays, totalDayRates, totalOtCost, totalOtH, totalEquip, totalPerDiem, totalExp, totalTurnaroundPenalty, totalPaidH, totalTravH, subtotal, vatPct, mixedVat, vatAmt, grandTotal };
 }
 
 const genTSNum  = (list: Timesheet[]) => { const yr = new Date().getFullYear(); return `T-${yr}-${String((list || []).filter(t => t?.timesheetNumber?.startsWith(`T-${yr}`)).length + 1).padStart(4, "0")}`; };
@@ -1505,13 +1465,133 @@ function ToastContainer({ toasts }: { toasts: ToastMsg[] }) {
 
 type SettingsTabId = "profile" | "invoice" | "rates" | "overtime" | "timesheet" | "banking" | "backup";
 
-function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onTestError }: {
+function TimesheetCalculationReview({ timesheets, profile, ownerUserId }: {
+  timesheets: Timesheet[];
+  profile: Profile;
+  ownerUserId?: string;
+}) {
+  const [candidates, setCandidates] = useState<Record<string, LegacyTimesheetCalculationSnapshotV1>>({});
+  const [states, setStates] = useState<Record<string, string>>({});
+  const [busyId, setBusyId] = useState("");
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+
+  useEffect(() => {
+    if (!ownerUserId) { setStates({}); return; }
+    let active = true;
+    void Promise.all(timesheets.map(async timesheet => {
+      const snapshot = getCalculationSnapshot(ownerUserId, timesheet.id);
+      const state = await evaluateCalculationSnapshot(ownerUserId, timesheet as CrewTimesheet, snapshot);
+      return [timesheet.id, state] as const;
+    })).then(entries => {
+      if (active) setStates(Object.fromEntries(entries));
+    }).catch(() => {
+      if (active) setError("CrewQuote could not read the local calculation review state.");
+    });
+    return () => { active = false; };
+  }, [ownerUserId, revision, timesheets]);
+
+  const prepare = async (timesheet: Timesheet) => {
+    if (!ownerUserId) return;
+    setBusyId(timesheet.id);
+    setError("");
+    try {
+      const snapshot = await prepareCurrentBaselineSnapshot(ownerUserId, timesheet as CrewTimesheet, profile);
+      setCandidates(current => ({ ...current, [timesheet.id]: snapshot }));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "CrewQuote could not prepare this calculation review.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const confirmBaseline = async (timesheet: Timesheet) => {
+    if (!ownerUserId) return;
+    const candidate = candidates[timesheet.id];
+    if (!candidate) return;
+    setBusyId(timesheet.id);
+    setError("");
+    try {
+      const sourceFingerprint = await calculationSourceFingerprint(timesheet as CrewTimesheet);
+      confirmCurrentBaselineSnapshot(ownerUserId, candidate, sourceFingerprint);
+      setCandidates(current => { const { [timesheet.id]: _, ...remaining } = current; return remaining; });
+      setRevision(current => current + 1);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "CrewQuote could not confirm this calculation baseline.");
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  if (!ownerUserId) {
+    return <AlertBox type="info">Sign in to review browser-local timesheet calculations for the owning CrewQuote account.</AlertBox>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-sm font-semibold text-slate-900">Timesheet Calculation Review</p>
+        <p className="mt-1 text-sm leading-relaxed text-slate-500">Review freezes the displayed work-day and summary values in this browser for the signed-in account. It does not upload or migrate anything.</p>
+      </div>
+      {error && <AlertBox type="error">{error}</AlertBox>}
+      {!timesheets.length && <p className="text-sm text-slate-500">No browser-local timesheets need review.</p>}
+      {timesheets.map(timesheet => {
+        const candidate = candidates[timesheet.id];
+        const status = candidate ? "review-ready" : (states[timesheet.id] || "checking");
+        const summary = candidate?.databaseSummaryPayload;
+        return (
+          <div key={timesheet.id} className="rounded-lg border border-slate-200 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-slate-900">{timesheet.timesheetNumber || "Untitled timesheet"}</p>
+                <p className="mt-1 text-sm text-slate-500">{timesheet.productionName || "No production name"} · {timesheet.entries.length} work day{timesheet.entries.length === 1 ? "" : "s"}</p>
+                <p className={`mt-2 text-xs font-semibold ${status === "valid" ? "text-emerald-700" : status === "review-ready" ? "text-amber-800" : "text-slate-500"}`}>Calculation state: {status.replace(/-/g, " ")}</p>
+              </div>
+              {!candidate && <Btn size="sm" variant="secondary" disabled={busyId === timesheet.id} onClick={() => void prepare(timesheet)}><FileText size={13}/>{busyId === timesheet.id ? "Preparing..." : "Review Values"}</Btn>}
+            </div>
+            {candidate && summary && (
+              <div className="mt-4 border-t border-slate-200 pt-4">
+                <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+                  <SRow label="Paid hours" value={Number(summary.summary_paid_hours).toFixed(2)} />
+                  <SRow label="Overtime" value={Number(summary.summary_overtime_hours).toFixed(2)} />
+                  <SRow label="VAT" value={fmtMoney(Number(summary.summary_vat_amount), timesheet.currency)} />
+                  <SRow label="Total" value={fmtMoney(Number(summary.summary_grand_total), timesheet.currency)} />
+                </div>
+                <AlertBox type="warning"><span>The original record does not persist every historical calculation setting. Confirming stores this displayed baseline locally and makes it eligible for a later, separate migration step.</span></AlertBox>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Btn size="sm" disabled={busyId === timesheet.id} onClick={() => void confirmBaseline(timesheet)}><CheckCircle size={13}/>{busyId === timesheet.id ? "Confirming..." : "Confirm Frozen Baseline"}</Btn>
+                  <Btn size="sm" variant="secondary" disabled={busyId === timesheet.id} onClick={() => void prepare(timesheet)}>Recalculate Review</Btn>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup, onUploadLogo, onRemoveLogo, onKeepLogoBrowserOnly, logoCloudActive, showLogoMigrationNotice, logoCloudError, cloudSaving, cloudError, migrationPanel, phase4MigrationPanel, phase5MigrationPanel, backupImportDisabledMessage, calculationOwnerUserId, phase4Completed, phase5Completed }: {
   profile: Profile;
   appData: AppData;
-  onSave: (p: Profile) => void;
-  onExportBackup: () => void;
-  onImportBackup: (data: AppData) => void;
-  onTestError: () => void;
+  onSave: (p: Profile) => void | Promise<void>;
+  onExportBackup: () => void | Promise<void>;
+  onImportBackup: (data: AppData) => void | Promise<void>;
+  onUploadLogo: (dataUrl: string) => Promise<string>;
+  onRemoveLogo: () => Promise<void>;
+  onKeepLogoBrowserOnly: () => void;
+  logoCloudActive: boolean;
+  showLogoMigrationNotice: boolean;
+  logoCloudError?: string;
+  cloudSaving?: boolean;
+  cloudError?: string;
+  migrationPanel?: React.ReactNode;
+  phase4MigrationPanel?: React.ReactNode;
+  phase5MigrationPanel?: React.ReactNode;
+  backupImportDisabledMessage?: string;
+  calculationOwnerUserId?: string;
+  phase4Completed?: boolean;
+  phase5Completed?: boolean;
 }) {
   const [f, setF] = useState<Profile>({ ...DEFAULT_PROFILE, ...profile });
   const [tab, setTab] = useState<SettingsTabId>("profile");
@@ -1526,9 +1606,18 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
   const setT = (k: keyof Profile) => (v: boolean) => setF(p => ({ ...p, [k]: v }));
   const savedProfile = useMemo(() => ({ ...DEFAULT_PROFILE, ...profile }), [profile]);
   const hasUnsavedChanges = useMemo(() => JSON.stringify(f) !== JSON.stringify(savedProfile), [f, savedProfile]);
-  const save = () => {
+  const previousProfile = useRef(savedProfile);
+  useEffect(() => {
+    const nextSavedProfile = { ...DEFAULT_PROFILE, ...profile };
+    setF(current => JSON.stringify(current) === JSON.stringify(previousProfile.current)
+      ? nextSavedProfile
+      : { ...current, businessLogoDataUrl: nextSavedProfile.businessLogoDataUrl });
+    previousProfile.current = nextSavedProfile;
+  }, [profile]);
+
+  const save = async () => {
     try {
-      onSave(f);
+      await onSave(f);
     } catch (err) {
       setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "Settings could not be saved. Try exporting a backup and freeing browser storage." });
       return;
@@ -1560,7 +1649,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
     const ok = confirm("Importing this backup will replace your current CrewQuote data. CrewQuote will first download an emergency backup of your current data.");
     if (!ok) return;
     try {
-      onImportBackup(importReady.data);
+      void Promise.resolve(onImportBackup(importReady.data)).catch(err => {
+        setImportError(err instanceof Error ? err.message : "CrewQuote could not import this backup. Your current data has been preserved.");
+      });
     } catch (err) {
       setImportError(err instanceof Error ? err.message : "CrewQuote could not import this backup. Your current data has been preserved.");
     }
@@ -1573,19 +1664,43 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
     setLogoMessage(null);
     try {
       const logo = await prepareBusinessLogo(file);
-      setF(p => ({ ...p, businessLogoDataUrl: logo.dataUrl }));
-      setLogoMessage({ type: "info", text: `Logo ready to save. Optimised to ${logo.width} x ${logo.height}px, ${formatBytes(logo.bytes)}.` });
+      const cloudDataUrl = await onUploadLogo(logo.dataUrl);
+      setF(p => ({ ...p, businessLogoDataUrl: cloudDataUrl }));
+      setLogoMessage({ type: "info", text: `Logo uploaded, read back, and activated for this account. Optimised to ${logo.width} x ${logo.height}px, ${formatBytes(logo.bytes)}.` });
     } catch (err) {
       setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "The logo could not be processed. Try a different image." });
     } finally {
       setLogoBusy(false);
     }
   };
-  const removeLogo = () => {
+  const removeLogo = async () => {
     if (!f.businessLogoDataUrl) return;
-    if (!confirm("Remove the saved business logo from Settings?")) return;
-    setF(p => ({ ...p, businessLogoDataUrl: "" }));
-    setLogoMessage({ type: "info", text: "Logo removed. Save Settings to keep this change." });
+    if (!confirm("Remove the active business logo from your CrewQuote account? A separately labelled browser recovery copy will be retained.")) return;
+    setLogoBusy(true);
+    setLogoMessage(null);
+    try {
+      await onRemoveLogo();
+      setF(p => ({ ...p, businessLogoDataUrl: "" }));
+      setLogoMessage({ type: "info", text: "The active cloud logo was removed. A labelled browser recovery copy was retained." });
+    } catch (err) {
+      setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "The logo could not be removed. The current logo remains active." });
+    } finally {
+      setLogoBusy(false);
+    }
+  };
+  const uploadExistingLogo = async () => {
+    if (!f.businessLogoDataUrl) return;
+    setLogoBusy(true);
+    setLogoMessage(null);
+    try {
+      const cloudDataUrl = await onUploadLogo(f.businessLogoDataUrl);
+      setF(p => ({ ...p, businessLogoDataUrl: cloudDataUrl }));
+      setLogoMessage({ type: "info", text: "Existing browser logo uploaded, verified, and activated for this account." });
+    } catch (err) {
+      setLogoMessage({ type: "error", text: err instanceof Error ? err.message : "The browser logo could not be uploaded. It remains available in this browser." });
+    } finally {
+      setLogoBusy(false);
+    }
   };
   const sym  = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[f.defaultCurrency] || "R";
   const isCustom = f.defaultOvertimeRule === "custom";
@@ -1647,8 +1762,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
               </div>
               <div className="flex flex-wrap items-center gap-2 sm:justify-end">
                 {hasUnsavedChanges && <span className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 ring-1 ring-amber-200">Unsaved changes</span>}
-                {saved && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200"><CheckCircle size={13}/> Settings saved successfully.</span>}
-                <Btn onClick={save}><Save size={14} /> Save Settings</Btn>
+                {cloudError && <span className="rounded-full bg-red-50 px-2.5 py-1 text-xs font-semibold text-red-700 ring-1 ring-red-200">Cloud save unavailable</span>}
+                {saved && <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-semibold text-emerald-700 ring-1 ring-emerald-200"><CheckCircle size={13}/> Saved to your CrewQuote account.</span>}
+                <Btn onClick={save} disabled={cloudSaving}><Save size={14} /> {cloudSaving ? "Saving..." : "Save Settings"}</Btn>
               </div>
             </div>
           </div>
@@ -1676,6 +1792,17 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
           {tab === "invoice" && (
             <div className="space-y-5">
               <SectionCard title="Business logo" description="Your logo will appear on invoice PDFs. PNG, JPG, or WebP. A transparent PNG works best.">
+                {showLogoMigrationNotice && (
+                  <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+                    <p className="font-bold">Move your existing browser logo to your CrewQuote account?</p>
+                    <p className="mt-1 leading-relaxed">This browser has a logo, but no private cloud logo exists for the signed-in owner. Uploading keeps the browser copy as recovery and makes the verified cloud image authoritative after sign-in.</p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Btn onClick={() => void uploadExistingLogo()} disabled={logoBusy}><Save size={14}/>{logoBusy ? "Uploading..." : "Upload Existing Logo"}</Btn>
+                      <Btn variant="secondary" onClick={onKeepLogoBrowserOnly} disabled={logoBusy}>Keep Browser Only</Btn>
+                      <Btn variant="danger" onClick={() => void removeLogo()} disabled={logoBusy}>Remove Logo</Btn>
+                    </div>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 lg:grid-cols-[280px_minmax(0,1fr)] gap-5">
                   <div>
                     <div
@@ -1688,6 +1815,9 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                     </div>
                   </div>
                   <div className="space-y-3">
+                    <div className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ${logoCloudActive ? "bg-emerald-50 text-emerald-700 ring-emerald-200" : "bg-slate-50 text-slate-600 ring-slate-200"}`}>
+                      {logoCloudActive ? "Private cloud logo active" : "Browser-only logo"}
+                    </div>
                     <Fld label="Business Logo" hint={`Accepted formats: PNG, JPG, WebP. Original file limit: ${formatBytes(MAX_LOGO_FILE_BYTES)}. Stored logo limit: ${formatBytes(MAX_STORED_LOGO_BYTES)}.`}>
                       <input
                         id={logoInputId}
@@ -1699,9 +1829,10 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                       />
                     </Fld>
                     <div className="flex flex-wrap gap-2">
-                      <Btn variant="secondary" onClick={() => document.getElementById(logoInputId)?.click()} disabled={logoBusy}>{logoBusy ? "Processing..." : "Replace Logo"}</Btn>
-                      <Btn variant="danger" onClick={removeLogo} disabled={!f.businessLogoDataUrl || logoBusy}>Remove Logo</Btn>
+                      <Btn variant="secondary" onClick={() => document.getElementById(logoInputId)?.click()} disabled={logoBusy}>{logoBusy ? "Processing..." : f.businessLogoDataUrl ? "Replace Logo" : "Upload Logo"}</Btn>
+                      <Btn variant="danger" onClick={() => void removeLogo()} disabled={!f.businessLogoDataUrl || logoBusy}>Remove Logo</Btn>
                     </div>
+                    {logoCloudError && <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">Cloud logo unavailable: {logoCloudError} The owner-matched browser recovery logo remains in use.</div>}
                     {logoMessage && (
                       <div className={`rounded-lg border px-3 py-2 text-sm ${logoMessage.type === "error" ? "border-red-200 bg-red-50 text-red-700" : "border-blue-200 bg-blue-50 text-blue-800"}`}>
                         {logoMessage.text}
@@ -1825,33 +1956,44 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
 
           {tab === "backup" && (
             <div className="space-y-5">
+              {migrationPanel}
               <SectionCard title="Data & Backup" description={`CrewQuote Pro Beta · Version ${APP_VERSION} · Data version ${CURRENT_DATA_VERSION}`}>
                 <div className="space-y-5">
                   <AlertBox type="warning">
-                    CrewQuote currently stores data only in this browser on this device. It does not sync between devices. Clearing browser data may remove your records. Export regular backups.
+                    {phase5Completed
+                      ? `Settings, clients, Timesheets, Invoices, Invoice lines, and Payments are cloud-backed. ${logoCloudActive ? "The active business logo is private and cloud-backed; browser recovery remains separately labelled." : "The business logo remains browser-only until you upload it."}`
+                      : phase4Completed
+                      ? "Settings, clients, and Timesheets are cloud-backed. Invoices, Invoice lines, and Payments remain browser-local until confirmed Phase 5 migration; logos can be moved independently from Invoice settings."
+                      : "Settings and clients are cloud-backed. Timesheets remain in this browser while awaiting reviewed migration. Invoices and payments remain browser-local."}
                   </AlertBox>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <MetricCard label="Clients" value={appData.clients.length} detail="Stored locally" icon={Users} tone="blue" />
-                    <MetricCard label="Timesheets" value={appData.timesheets.length} detail="Includes days, rates, and expenses" icon={Clock} tone="slate" />
-                    <MetricCard label="Invoices" value={appData.invoices.length} detail="Includes snapshots and payments" icon={Receipt} tone="green" />
+                    <MetricCard label="Clients" value={appData.clients.length} detail="Cloud-backed" icon={Users} tone="blue" />
+                    <MetricCard label="Timesheets" value={appData.timesheets.length} detail={phase4Completed ? "Cloud-backed with days and expenses" : "Browser migration source"} icon={Clock} tone="slate" />
+                    <MetricCard label="Invoices" value={appData.invoices.length} detail={phase5Completed ? "Cloud-backed with lines and Payments" : "Browser migration source"} icon={Receipt} tone="green" />
                   </div>
                   <div className="rounded-lg border border-slate-200 p-4">
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
                         <p className="text-sm font-semibold text-slate-900">Export Backup</p>
-                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Download one JSON file containing CrewQuote-owned settings, logo, clients, timesheets, rate snapshots, expenses, invoices, payments, and numbering data.</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Download one complete JSON backup containing authoritative cloud profile, settings, preferences, clients, rate presets, Timesheets, work days, day expenses, Invoices, Invoice lines, and Payments plus local logos, ownership, snapshots, numbering, migration metadata, and labelled recovery data. Export stops if any required cloud fetch fails.</p>
                       </div>
                       <Btn onClick={onExportBackup}><FileText size={14}/> Export Backup</Btn>
                     </div>
                   </div>
                   <div className="rounded-lg border border-slate-200 p-4">
+                    <TimesheetCalculationReview timesheets={appData.timesheets} profile={profile} ownerUserId={calculationOwnerUserId} />
+                  </div>
+                  {phase4MigrationPanel}
+                  {phase5MigrationPanel}
+                  <div className="rounded-lg border border-slate-200 p-4">
                     <div className="flex flex-col gap-4">
                       <div>
                         <p className="text-sm font-semibold text-slate-900">Import Backup</p>
-                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Choose a CrewQuote backup JSON file. CrewQuote validates it and shows a summary before replacing anything.</p>
+                        <p className="mt-1 text-sm leading-relaxed text-slate-500">Restore will return after an account-aware merge can safely distinguish authoritative cloud records and the private cloud logo from separately labelled browser recovery data.</p>
                       </div>
+                      {backupImportDisabledMessage && <AlertBox type="warning">{backupImportDisabledMessage}</AlertBox>}
                       <Fld label="Backup JSON File" hint="Current data is preserved if validation fails or you cancel the import.">
-                        <input type="file" accept="application/json,.json" onChange={handleImportFile} className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100`} />
+                        <input type="file" accept="application/json,.json" onChange={handleImportFile} disabled={Boolean(backupImportDisabledMessage)} className={`${base} file:mr-3 file:rounded-md file:border-0 file:bg-blue-50 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-blue-700 hover:file:bg-blue-100 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:text-slate-400`} />
                       </Fld>
                       {importError && <AlertBox type="error">{importError}</AlertBox>}
                       {importReady && (
@@ -1867,7 +2009,7 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                           </div>
                           <p className="mt-3 text-sm font-semibold text-amber-950">Importing this backup will replace your current CrewQuote data.</p>
                           <div className="mt-4 flex flex-wrap gap-2">
-                            <Btn variant="danger" onClick={confirmImport}>Confirm Replacement</Btn>
+                            <Btn variant="danger" onClick={confirmImport} disabled={Boolean(backupImportDisabledMessage)}>Confirm Replacement</Btn>
                             <Btn variant="secondary" onClick={() => setImportReady(null)}>Cancel Import</Btn>
                           </div>
                         </div>
@@ -1883,13 +2025,6 @@ function SettingsPage({ profile, appData, onSave, onExportBackup, onImportBackup
                     <p className="text-sm font-semibold text-slate-900">CrewQuote Pro Beta</p>
                     <p className="mt-1 text-sm text-slate-500">Version {APP_VERSION}</p>
                   </div>
-                  {IS_DEV_BUILD && (
-                    <div className="rounded-lg border border-slate-200 p-4">
-                      <p className="text-sm font-semibold text-slate-900">Test Recovery Screen</p>
-                      <p className="mt-1 text-sm leading-relaxed text-slate-500">Triggers a safe render error so you can confirm the recovery screen, emergency backup, and reset warning behave correctly.</p>
-                      <Btn variant="secondary" className="mt-3" onClick={() => { if (confirm("Trigger the recovery screen now?")) onTestError(); }}>Trigger Test Error</Btn>
-                    </div>
-                  )}
                 </div>
               </SectionCard>
             </div>
@@ -1945,17 +2080,26 @@ function ClientFields({ client, onChange, errors = {}, fieldPrefix = "client" }:
   );
 }
 
-function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
-  clients: Client[]; timesheets: Timesheet[]; invoices: Invoice[]; onSave: (clients: Client[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast, loading, loadError, saving, onRetry }: {
+  clients: Client[];
+  timesheets: Timesheet[];
+  invoices: Invoice[];
+  onSave: (clients: Client[]) => void | Promise<void>;
+  onShowToast: (msg: string, type?: ToastType) => void;
+  loading?: boolean;
+  loadError?: string;
+  saving?: boolean;
+  onRetry?: () => void;
 }) {
   const [draft, setDraft] = useState<Client | null>(null);
   const [clientErrors, setClientErrors] = useState<Partial<Record<keyof Client, string>>>({});
+  const [busy, setBusy] = useState(false);
 
   const startAdd = () => { setDraft(blankClient()); setClientErrors({}); };
   const startEdit = (client: Client) => { setDraft({ ...client }); setClientErrors({}); };
   const cancel = () => { setDraft(null); setClientErrors({}); };
 
-  const saveClient = () => {
+  const saveClient = async () => {
     if (!draft) return;
     const errors = clientBillingErrors(draft);
     if (Object.keys(errors).length) {
@@ -1967,13 +2111,20 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
     }
     const client = normalizeClient(draft);
     const exists = clients.some(c => c.id === client.id);
-    onSave(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
-    setDraft(null);
-    setClientErrors({});
-    onShowToast(`${client.companyName} saved`);
+    setBusy(true);
+    try {
+      await onSave(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+      setDraft(null);
+      setClientErrors({});
+      onShowToast(`${client.companyName} saved`);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const deleteClient = (id: string) => {
+  const deleteClient = async (id: string) => {
     const client = clients.find(c => c.id === id);
     const name = clientName(client) || "this client";
     const linkedTimesheets = (timesheets || []).filter(t => t.clientId === id);
@@ -1983,8 +2134,15 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
       return;
     }
     if (!confirm(`Delete client "${name}"? This cannot be undone.`)) return;
-    onSave(clients.filter(c => c.id !== id));
-    onShowToast("Client deleted", "info");
+    setBusy(true);
+    try {
+      await onSave(clients.filter(c => c.id !== id));
+      onShowToast("Client deleted", "info");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not delete this client from your account.", "error");
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -1992,8 +2150,15 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
       <PageHeader
         title="Clients"
         description="Saved bill-to companies and people for invoices."
-        actions={<Btn onClick={startAdd}><Plus size={14}/> Add Client</Btn>}
+        actions={<Btn onClick={startAdd} disabled={loading || saving || busy}><Plus size={14}/> Add Client</Btn>}
       />
+      {loading && <AlertBox type="info">Loading clients from your CrewQuote account...</AlertBox>}
+      {loadError && (
+        <AlertBox type="error">
+          <span>{loadError}</span>
+          {onRetry && <button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry</button>}
+        </AlertBox>
+      )}
 
       {draft && (
         <Card className="p-5 sm:p-6 max-w-5xl">
@@ -2003,8 +2168,8 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
               <p className="text-sm text-slate-500 mt-0.5">Client records are for invoice recipients only.</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Btn variant="secondary" size="sm" onClick={cancel}>{"\u2190"} Back to Clients</Btn>
-              <Btn size="sm" onClick={saveClient}><Save size={13}/> Save Client</Btn>
+              <Btn variant="secondary" size="sm" onClick={cancel} disabled={busy || saving}>{"\u2190"} Back to Clients</Btn>
+              <Btn size="sm" onClick={saveClient} disabled={busy || saving}><Save size={13}/> {busy || saving ? "Saving..." : "Save Client"}</Btn>
             </div>
           </div>
           <ClientFields client={draft} onChange={setDraft} errors={clientErrors} fieldPrefix="client" />
@@ -2039,8 +2204,8 @@ function ClientsPage({ clients, timesheets, invoices, onSave, onShowToast }: {
                       <td className={`${UI.td} text-slate-500`}>{client.email || "—"}</td>
                       <td className={`${UI.td} max-w-xs truncate text-slate-500`}>{client.billingAddress || "Not set"}</td>
                       <td className={`${UI.td} text-right`}>
-                        <IconButton label={`Edit ${client.companyName || "client"}`} variant="primary" onClick={e => { e.stopPropagation(); startEdit(client); }}><Pencil size={14}/></IconButton>
-                        <IconButton label={`Delete ${client.companyName || "client"}`} variant="danger" onClick={e => { e.stopPropagation(); deleteClient(client.id); }}><Trash2 size={14}/></IconButton>
+                         <IconButton label={`Edit ${client.companyName || "client"}`} variant="primary" onClick={e => { e.stopPropagation(); if (!busy && !saving) startEdit(client); }}><Pencil size={14}/></IconButton>
+                         <IconButton label={`Delete ${client.companyName || "client"}`} variant="danger" onClick={e => { e.stopPropagation(); if (!busy && !saving) void deleteClient(client.id); }}><Trash2 size={14}/></IconButton>
                       </td>
                     </tr>
                   );
@@ -2184,11 +2349,13 @@ function CalculationBreakdown({ entry, profile, turnaround, title = "Calculation
 // ADD DAY FORM  — no manual OT rate, auto-filled from profile
 // ═══════════════════════════════════════════════════════════════════════════
 
-function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Timesheet; profile: Profile; onAdd: (e: TimesheetEntry) => void; onShowToast: (msg: string, type?: ToastType) => void }) {
+function AddDayForm({ timesheet, profile, onAdd, onShowToast, disabled = false }: { timesheet: Timesheet; profile: Profile; onAdd: (e: TimesheetEntry) => Promise<void>; onShowToast: (msg: string, type?: ToastType) => void; disabled?: boolean }) {
   const defaultPrev = latestEntryForDefaults(timesheet.entries || []);
   const [form, setForm] = useState<Omit<TimesheetEntry, "id">>(() => entryDefaults(profile, defaultPrev, timesheet.productionName));
   const [showRates, setShowRates] = useState(false);
   const [includePreviousExpenses, setIncludePreviousExpenses] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const pendingLegacyId = useRef(uid());
   const usedKey: Record<string, string> = { dayRate: "dayRateUsed", includedHours: "includedHoursUsed", overtimeRule: "overtimeRuleUsed", otBand1Hours: "otBand1HoursUsed", otBand1Mult: "otBand1MultUsed", otBand2Mult: "otBand2MultUsed", equipmentRental: "equipmentRentalUsed", perDiem: "perDiemUsed", travelPaid: "travelPaidUsed", mealDeducted: "mealDeductedUsed" };
   const upd    = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) => {
     const v = e.target.value;
@@ -2220,16 +2387,25 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
     onShowToast(includePreviousExpenses ? "Previous day duplicated with expenses — review before saving" : "Previous day duplicated without one-off expenses", "info");
   };
 
-  const handleAdd = () => {
+  const handleAdd = async () => {
+    if (saving || disabled) return;
     if (!form.date)     { onShowToast("Please enter a date", "error"); return; }
     if (!form.callTime) { onShowToast("Please enter a call time", "error"); return; }
     if (!form.wrapTime) { onShowToast("Please enter a wrap time", "error"); return; }
-    const entry: TimesheetEntry = withEntrySnapshots({ id: uid(), ...form }, profile);
+    const entry: TimesheetEntry = withEntrySnapshots({ id: pendingLegacyId.current, ...form }, profile);
     const c = calcDay(entry, profile);
-    onAdd(entry);
-    const nextDate = nextDayStr(form.date);
-    setForm(p => ({ ...entryDefaults(profile, entry, timesheet.productionName), date: nextDate }));
-    onShowToast(`Day added successfully — ${fmtDate(entry.date)} | ${fmtMoney(c.total, cur)}${c.totalOtH > 0 ? ` | ${hoursToHM(c.totalOtH)} OT` : ""}`);
+    setSaving(true);
+    try {
+      await onAdd(entry);
+      pendingLegacyId.current = uid();
+      const nextDate = nextDayStr(form.date);
+      setForm({ ...entryDefaults(profile, entry, timesheet.productionName), date: nextDate });
+      onShowToast(`Saved to CrewQuote account — ${fmtDate(entry.date)} | ${fmtMoney(c.total, cur)}${c.totalOtH > 0 ? ` | ${hoursToHM(c.totalOtH)} OT` : ""}`);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this work day. Your form values were kept.", "error");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -2327,12 +2503,12 @@ function AddDayForm({ timesheet, profile, onAdd, onShowToast }: { timesheet: Tim
         )}
 
         <div className="flex flex-col gap-3 sm:flex-row">
-          <button onClick={handleAdd}
-            className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2">
-            <Plus size={16}/> Add This Day
+          <button onClick={() => void handleAdd()} disabled={saving || disabled}
+            className="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+            <Plus size={16}/> {saving ? "Saving work day..." : "Add This Day"}
           </button>
           {defaultPrev && (
-            <Btn variant="secondary" onClick={handleDuplicate} title="Prefill a new day from the latest saved day">
+            <Btn variant="secondary" onClick={handleDuplicate} disabled={saving || disabled} title="Prefill a new day from the latest saved day">
               <Copy size={14}/> Duplicate Previous Day
             </Btn>
           )}
@@ -2348,11 +2524,13 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
   entry: TimesheetEntry;
   profile: Profile;
   mode: "edit" | "duplicate";
-  onSave: (entry: TimesheetEntry) => void;
+  onSave: (entry: TimesheetEntry) => Promise<void>;
   onCancel: () => void;
 }) {
   const [form, setForm] = useState<TimesheetEntry>(() => normalizeEntry(entry));
   const [showRates, setShowRates] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const cur = profile.defaultCurrency || "ZAR";
   const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
   const usedKey: Record<string, string> = { dayRate: "dayRateUsed", includedHours: "includedHoursUsed", overtimeRule: "overtimeRuleUsed", otBand1Hours: "otBand1HoursUsed", otBand1Mult: "otBand1MultUsed", otBand2Mult: "otBand2MultUsed", equipmentRental: "equipmentRentalUsed", perDiem: "perDiemUsed", travelPaid: "travelPaidUsed", mealDeducted: "mealDeductedUsed" };
@@ -2368,9 +2546,17 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
   const setVat = (e: React.ChangeEvent<HTMLInputElement>) => setForm(p => ({ ...p, vatRateUsed: num(e.target.value) }));
   const c = calcDay(form, profile);
 
-  const save = () => {
-    if (!form.date || !form.callTime || !form.wrapTime) return;
-    onSave(withEntrySnapshots(form, profile));
+  const save = async () => {
+    if (saving || !form.date || !form.callTime || !form.wrapTime) return;
+    setSaving(true);
+    setSaveError("");
+    try {
+      await onSave(withEntrySnapshots(form, profile));
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "CrewQuote could not save this work day. Your form values were kept.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -2382,12 +2568,13 @@ function TimesheetDayEditor({ entry, profile, mode, onSave, onCancel }: {
             <p className="text-sm text-gray-400 mt-0.5">{fmtDate(form.date)} · {hoursToHM(c.paidH)} paid · {fmtMoney(c.total, cur)}</p>
           </div>
           <div className="flex gap-2">
-            <Btn variant="secondary" size="sm" onClick={onCancel}>Cancel</Btn>
-            <Btn size="sm" onClick={save}><Save size={13}/> {mode === "duplicate" ? "Add Duplicate" : "Save Day"}</Btn>
+            <Btn variant="secondary" size="sm" onClick={onCancel} disabled={saving}>Cancel</Btn>
+            <Btn size="sm" onClick={() => void save()} disabled={saving}><Save size={13}/> {saving ? "Saving work day..." : mode === "duplicate" ? "Add Duplicate" : "Save Day"}</Btn>
           </div>
         </div>
 
         <div className="space-y-4">
+          {saveError && <AlertBox type="error">{saveError}</AlertBox>}
           <Card className="p-4">
             <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Day Details</p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
@@ -2603,7 +2790,7 @@ function WeeklyView({ timesheet, profile, onEditEntry, onDuplicateEntry, onDelet
 // SUMMARY VIEW
 // ═══════════════════════════════════════════════════════════════════════════
 
-function SummaryView({ timesheet, profile, onStartInvoice }: { timesheet: Timesheet; profile: Profile; onStartInvoice: () => void }) {
+function SummaryView({ timesheet, profile, linkedInvoice, invoiceReferencesAvailable, onStartInvoice }: { timesheet: Timesheet; profile: Profile; linkedInvoice: Invoice | null; invoiceReferencesAvailable: boolean; onStartInvoice: () => void }) {
   const cur = profile.defaultCurrency || "ZAR";
   const sum = useMemo(() => calcSummary(timesheet.entries || [], profile), [timesheet.entries, profile]);
 
@@ -2641,9 +2828,11 @@ function SummaryView({ timesheet, profile, onStartInvoice }: { timesheet: Timesh
           </div>
         </Card>
       </div>
-      {timesheet.status === "invoiced"
-        ? <AlertBox type="success">Invoice already created for this timesheet.</AlertBox>
-        : <Btn variant="success" size="lg" onClick={onStartInvoice}><Receipt size={16}/> Create Invoice from Timesheet</Btn>}
+      {linkedInvoice
+        ? <AlertBox type="success">{timesheetDisplayState(timesheet, linkedInvoice).label}: {linkedInvoice.invoiceNumber || "not numbered"}.</AlertBox>
+        : invoiceReferencesAvailable
+          ? <Btn variant="success" size="lg" onClick={onStartInvoice}><Receipt size={16}/> Create Invoice from Timesheet</Btn>
+          : <AlertBox type="warning">Invoice references are unavailable. Retry loading Invoices before creating one from this Timesheet.</AlertBox>}
     </div>
   );
 }
@@ -2666,17 +2855,17 @@ function buildSummaryTimesheetLines(sum: ReturnType<typeof calcSummary>): Invoic
 function buildDetailedTimesheetLines(sum: ReturnType<typeof calcSummary>): InvoiceLine[] {
   const lines: InvoiceLine[] = [];
   sum.calcs.forEach(({ entry, c }) => {
-    const d = fmtDate(entry.date);
-    if (c.dayRate > 0) lines.push({ id: uid(), description: `${d} — Day Rate`, quantity: 1, unitPrice: c.dayRate, amount: c.dayRate, taxable: true, category: "day-rate" });
-    if (c.b1H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 1 (${hoursToHM(c.b1H)} @ ${c.bands.band1Mult}x)`, quantity: c.b1H, unitPrice: c.b1Cost / Math.max(c.b1H, 1), amount: c.b1Cost, taxable: true, category: "overtime" });
-    if (c.b2H > 0) lines.push({ id: uid(), description: `${d} — Overtime band 2 (${hoursToHM(c.b2H)} @ ${c.bands.band2Mult}x)`, quantity: c.b2H, unitPrice: c.b2Cost / Math.max(c.b2H, 1), amount: c.b2Cost, taxable: true, category: "overtime" });
-    if (c.equip > 0) lines.push({ id: uid(), description: `${d} — Equipment Rental`, quantity: 1, unitPrice: c.equip, amount: c.equip, taxable: true, category: "equipment" });
-    if (c.travH > 0) lines.push({ id: uid(), description: `${d} — Travel (${hoursToHM(c.travH)}${entry.travelDistance ? `, ${entry.travelDistance} km` : ""})`, quantity: 1, unitPrice: 0, amount: 0, taxable: false, category: "travel" });
+    const d = fmtDate(entry.date || "");
+    if (c.dayRate > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Day Rate`, quantity: 1, unitPrice: c.dayRate, amount: c.dayRate, taxable: true, category: "day-rate" });
+    if (c.b1H > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Overtime band 1 (${hoursToHM(c.b1H)} @ ${c.bands.band1Mult}x)`, quantity: c.b1H, unitPrice: c.b1Cost / Math.max(c.b1H, 1), amount: c.b1Cost, taxable: true, category: "overtime" });
+    if (c.b2H > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Overtime band 2 (${hoursToHM(c.b2H)} @ ${c.bands.band2Mult}x)`, quantity: c.b2H, unitPrice: c.b2Cost / Math.max(c.b2H, 1), amount: c.b2Cost, taxable: true, category: "overtime" });
+    if (c.equip > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Equipment Rental`, quantity: 1, unitPrice: c.equip, amount: c.equip, taxable: true, category: "equipment" });
+    if (c.travH > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Travel (${hoursToHM(c.travH)}${entry.travelDistance ? `, ${entry.travelDistance} km` : ""})`, quantity: 1, unitPrice: 0, amount: 0, taxable: false, category: "travel" });
     if (c.perDiem + c.expenses > 0) {
       const expenseBits = [c.perDiem > 0 ? "per diem" : "", c.expenses > 0 ? (entry.expenseDescription || "expenses") : ""].filter(Boolean).join(" + ");
-      lines.push({ id: uid(), description: `${d} — Expenses${expenseBits ? ` (${expenseBits})` : ""}`, quantity: 1, unitPrice: c.perDiem + c.expenses, amount: c.perDiem + c.expenses, taxable: true, category: "expenses" });
+      lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Expenses${expenseBits ? ` (${expenseBits})` : ""}`, quantity: 1, unitPrice: c.perDiem + c.expenses, amount: c.perDiem + c.expenses, taxable: true, category: "expenses" });
     }
-    if (c.turnaroundPenalty > 0) lines.push({ id: uid(), description: `${d} — Turnaround penalty`, quantity: 1, unitPrice: c.turnaroundPenalty, amount: c.turnaroundPenalty, taxable: true, category: "turnaround" });
+    if (c.turnaroundPenalty > 0) lines.push({ id: uid(), sourceEntryId: entry.id, description: `${d} — Turnaround penalty`, quantity: 1, unitPrice: c.turnaroundPenalty, amount: c.turnaroundPenalty, taxable: true, category: "turnaround" });
   });
   return lines;
 }
@@ -2685,7 +2874,7 @@ const buildTimesheetLines = (sum: ReturnType<typeof calcSummary>, mode: InvoiceD
   mode === "detailed" ? buildDetailedTimesheetLines(sum) : buildSummaryTimesheetLines(sum);
 
 function rebuildDraftInvoiceFromTimesheet(inv: Invoice, timesheet: Timesheet, profile: Profile): Invoice {
-  const effectiveProfile = profileForTimesheet(profile, timesheet);
+  const effectiveProfile = calculationProfileForTimesheet(profile, timesheet);
   const sum = calcSummary(timesheet.entries || [], effectiveProfile);
   const detailMode = inv.detailMode || "summary";
   const baseLines = buildTimesheetLines(sum, detailMode);
@@ -2716,10 +2905,10 @@ function rebuildDraftInvoiceFromTimesheet(inv: Invoice, timesheet: Timesheet, pr
 }
 
 function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoices, onSave, onUpdateTimesheet, onBack, onShowToast }: {
-  timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void; invoices: Invoice[];
-  onSave: (inv: Invoice) => void; onUpdateTimesheet: (ts: Timesheet) => void; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
+  timesheet: Timesheet; profile: Profile; clients: Client[]; onSaveClients: (clients: Client[]) => void | Promise<void>; invoices: Invoice[];
+  onSave: (inv: Invoice) => Promise<void>; onUpdateTimesheet: (ts: Timesheet) => Promise<void>; onBack: () => void; onShowToast: (msg: string, type?: ToastType) => void;
 }) {
-  const effectiveProfile = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
+  const effectiveProfile = useMemo(() => calculationProfileForTimesheet(profile, timesheet), [profile, timesheet]);
   const cur = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
   const sym = { ZAR: "R", USD: "$", GBP: "£", EUR: "€" }[cur] || "R";
   const sum = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
@@ -2731,8 +2920,13 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const [dueDate, setDueDate] = useState("");
   const [status, setStatus] = useState<InvoiceStatus>("draft");
   const [detailMode, setDetailMode] = useState<InvoiceDetailMode>(DEFAULT_INVOICE_DETAIL_MODE);
+  const [clientChoice, setClientChoice] = useState(savedClient?.id || "");
+  const [clientSearch, setClientSearch] = useState("");
   const [clientDraft, setClientDraft] = useState<Client>(() => savedClient ? { ...savedClient } : blankClient({ companyName: timesheet.clientName === "Unknown / add later" ? "" : timesheet.clientName || "" }));
   const [clientErrors, setClientErrors] = useState<Partial<Record<keyof Client, string>>>({});
+  const [clientDirty, setClientDirty] = useState(false);
+  const [editingClientDetails, setEditingClientDetails] = useState(false);
+  const [clientWorkflowError, setClientWorkflowError] = useState("");
   const [extras, setExtras] = useState<InvoiceLine[]>([]);
   const [newItem, setNewItem] = useState({ description: "", quantity: "1", unitPrice: "", taxable: true });
   const [paymentTerms, setPaymentTerms] = useState(timesheet.paymentTerms || savedClient?.paymentTerms || savedClient?.defaultPaymentTerms || profile.paymentTerms || "");
@@ -2740,6 +2934,18 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const [paidDate, setPaidDate] = useState("");
   const [notes, setNotes] = useState(timesheet.notes || "");
   const [showDayBreakdowns, setShowDayBreakdowns] = useState(false);
+  const [savingInvoice, setSavingInvoice] = useState(false);
+  const [clientSaving, setClientSaving] = useState(false);
+  const pendingInvoiceId = useRef(uid());
+  const pendingInvoiceCreatedAt = useRef(new Date().toISOString());
+  const assignedClientId = useRef(timesheet.clientId || "");
+
+  const filteredClients = useMemo(() => {
+    const term = clientSearch.trim().toLowerCase();
+    return [...clients]
+      .sort((left, right) => clientName(left).localeCompare(clientName(right), undefined, { sensitivity: "base" }))
+      .filter(client => !term || [client.companyName, client.contactPerson, client.email].some(value => String(value || "").toLowerCase().includes(term)));
+  }, [clientSearch, clients]);
 
   const baseLines = useMemo(() => buildTimesheetLines(sum, detailMode), [sum, detailMode]);
   const timesheetBreakdown = useMemo(() => detailMode === "summary_timesheet" ? buildDetailedTimesheetLines(sum) : [], [sum, detailMode]);
@@ -2753,17 +2959,43 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   const paidAmount = Math.min(safe(paidAmountStr, 0), total);
   const balanceDue = Math.max(total - paidAmount, 0);
   const clientIncomplete = !clientBillingComplete(clientDraft);
-  const duplicateInvoice = invoices.some(inv => inv.invoiceNumber === invoiceNumber);
+  const duplicateInvoice = invoices.some(inv => inv.invoiceNumber === invoiceNumber && inv.id !== pendingInvoiceId.current);
+  const existingSourceInvoice = invoices.find(inv => inv.fromTimesheetId === timesheet.id && inv.id !== pendingInvoiceId.current) || null;
   const poMissing = clientDraft.poRequired && !poNumber.trim();
+
+  const chooseClient = (choice: string) => {
+    setClientWorkflowError("");
+    setClientErrors({});
+    setEditingClientDetails(false);
+    if (choice === "new") {
+      setClientChoice("new");
+      setClientDraft(blankClient());
+      setClientDirty(true);
+      return;
+    }
+    const selected = clients.find(client => client.id === choice) || null;
+    setClientChoice(selected?.id || "");
+    setClientDraft(selected ? { ...selected } : blankClient());
+    setClientDirty(false);
+    if (selected?.paymentTerms || selected?.defaultPaymentTerms) setPaymentTerms(selected.paymentTerms || selected.defaultPaymentTerms);
+  };
 
   const focusClientBilling = (errors = clientBillingErrors(clientDraft)) => {
     setClientErrors(errors);
+    if (clientChoice && clientChoice !== "new") setEditingClientDetails(true);
     document.getElementById("invoice-client-billing-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
     const first = firstClientBillingErrorField(errors);
     setTimeout(() => first && document.getElementById(`invoice-client-${first}`)?.focus(), 120);
   };
 
-  const persistClientDetails = (notify = true) => {
+  const persistClientDetails = async (notify = true) => {
+    setClientWorkflowError("");
+    if (!clientChoice) {
+      const message = "Select an existing client or choose + Add new client before creating the Invoice.";
+      setClientWorkflowError(message);
+      if (notify) onShowToast(message, "error");
+      return null;
+    }
     const errors = clientBillingErrors(clientDraft);
     if (Object.keys(errors).length) {
       focusClientBilling(errors);
@@ -2772,23 +3004,60 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     }
     const client = normalizeClient(clientDraft);
     const exists = clients.some(c => c.id === client.id);
-    onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    const needsClientSave = clientChoice === "new" || clientDirty;
+    if (needsClientSave) {
+      try {
+        await onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+        setClientChoice(client.id);
+        setClientDraft(client);
+        setClientDirty(false);
+        setEditingClientDetails(false);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "CrewQuote could not save this client to your account.";
+        setClientWorkflowError(message);
+        onShowToast(message, "error");
+        return null;
+      }
+    }
+    const nextPaymentTerms = client.paymentTerms || client.defaultPaymentTerms || timesheet.paymentTerms || profile.paymentTerms;
     const updatedTS = {
       ...timesheet,
       clientId: client.id,
       clientName: clientName(client),
       clientIncomplete: !clientBillingComplete(client),
-      paymentTerms: client.paymentTerms || client.defaultPaymentTerms || timesheet.paymentTerms || profile.paymentTerms,
+      paymentTerms: nextPaymentTerms,
     };
-    onUpdateTimesheet(updatedTS);
+    const needsTimesheetAssignment = assignedClientId.current !== client.id
+      || timesheet.clientId !== client.id
+      || timesheet.clientName !== updatedTS.clientName
+      || timesheet.paymentTerms !== nextPaymentTerms;
+    if (needsTimesheetAssignment) {
+      try {
+        await onUpdateTimesheet(updatedTS);
+        assignedClientId.current = client.id;
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : "CrewQuote could not update the cloud Timesheet client.";
+        const message = needsClientSave
+          ? `The Client was saved, but could not be assigned to the source Timesheet. ${detail}`
+          : `The selected Client could not be assigned to the source Timesheet. ${detail}`;
+        setClientWorkflowError(message);
+        onShowToast(message, "error");
+        return null;
+      }
+    }
     setClientDraft(client);
     setClientErrors({});
     if (client.paymentTerms || client.defaultPaymentTerms) setPaymentTerms(client.paymentTerms || client.defaultPaymentTerms);
-    if (notify) onShowToast("Client billing details saved");
+    if (notify) onShowToast(needsClientSave ? "Client saved and assigned to the source Timesheet" : "Client assigned to the source Timesheet");
     return client;
   };
 
-  const saveClientDetails = () => { persistClientDetails(true); };
+  const saveClientDetails = async () => {
+    if (clientSaving || savingInvoice) return;
+    setClientSaving(true);
+    try { await persistClientDetails(true); }
+    finally { setClientSaving(false); }
+  };
 
   const addExtra = () => {
     const qty = parseFloat(newItem.quantity) || 1;
@@ -2820,15 +3089,15 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     }
   };
 
-  const makeInvoice = (): Invoice => ({
-    id: uid(),
+  const makeInvoice = (client: Client = clientDraft): Invoice => ({
+    id: pendingInvoiceId.current,
     invoiceNumber,
     poNumber,
     issueDate,
     dueDate,
-    clientId: clientDraft.id,
-    clientName: clientName(clientDraft),
-    client: clientDraft,
+    clientId: client.id,
+    clientName: clientName(client),
+    client: { ...client },
     crewName: profile.fullName || "",
     role: timesheet.role || profile.role || "",
     companyName: profile.companyName || profile.fullName || "",
@@ -2854,10 +3123,17 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     paymentNotes: paymentTerms,
     notes,
     fromTimesheetId: timesheet.id,
-    createdAt: new Date().toISOString(),
+    createdAt: pendingInvoiceCreatedAt.current,
   });
 
   const ensureClientReady = () => {
+    if (!clientChoice) {
+      const message = "Choose a client before creating the Invoice.";
+      setClientWorkflowError(message);
+      document.getElementById("invoice-client-billing-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onShowToast(message, "error");
+      return false;
+    }
     const errors = clientBillingErrors(clientDraft);
     if (!Object.keys(errors).length) return true;
     focusClientBilling(errors);
@@ -2866,6 +3142,10 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
   };
 
   const ensureInvoiceReady = () => {
+    if (existingSourceInvoice) {
+      onShowToast(`Invoice ${existingSourceInvoice.invoiceNumber || "not numbered"} already references this Timesheet. Open or delete that Invoice before creating another.`, "error");
+      return false;
+    }
     if (!ensureClientReady()) return false;
     if (poMissing) {
       document.getElementById("invoice-details-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2881,29 +3161,43 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
     return true;
   };
 
-  const handleSave = () => {
-    if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
-    const inv = makeInvoice();
-    onSave(inv);
-    onShowToast(`Invoice ${inv.invoiceNumber} saved`);
-  };
-
-  const downloadPdf = async () => {
-    if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
+  const handleSave = async () => {
+    if (savingInvoice || clientSaving || !ensureInvoiceReady()) return;
+    setSavingInvoice(true);
     try {
-      await downloadInvoicePdf(makeInvoice(), profile);
-      onShowToast("Invoice PDF downloaded");
-    } catch {
-      onShowToast("Invoice PDF could not be generated. Please try again.", "error");
+    const client = await persistClientDetails(false);
+    if (!client) return;
+    const inv = makeInvoice(client);
+    await onSave(inv);
+    onShowToast(`Invoice ${inv.invoiceNumber} saved`);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save the invoice source status.", "error");
+    } finally {
+      setSavingInvoice(false);
     }
   };
 
-  const printCurrentInvoice = () => {
-    if (!ensureInvoiceReady()) return;
-    persistClientDetails(false);
-    printInvoice(makeInvoice(), profile);
+  const downloadPdf = async () => {
+    if (savingInvoice || clientSaving || !ensureInvoiceReady()) return;
+    setClientSaving(true);
+    try {
+      const client = await persistClientDetails(false);
+      if (!client) return;
+      await downloadInvoicePdf(makeInvoice(client), profile);
+      onShowToast("Invoice PDF downloaded");
+    } catch {
+      onShowToast("Invoice PDF could not be generated. Please try again.", "error");
+    } finally { setClientSaving(false); }
+  };
+
+  const printCurrentInvoice = async () => {
+    if (savingInvoice || clientSaving || !ensureInvoiceReady()) return;
+    setClientSaving(true);
+    try {
+      const client = await persistClientDetails(false);
+      if (!client) return;
+      printInvoice(makeInvoice(client), profile);
+    } finally { setClientSaving(false); }
   };
 
   return (
@@ -2913,13 +3207,13 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
         description={`${timesheet.productionName || "Not set"} · ${timesheet.timesheetNumber || "Not set"}`}
         secondaryActions={<Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>}
         actions={<>
-          <Btn variant="secondary" onClick={downloadPdf}><FileText size={14}/> Download PDF</Btn>
-          <Btn variant="secondary" onClick={printCurrentInvoice}><FileText size={14}/> Print Invoice</Btn>
-          <Btn variant="success" onClick={handleSave}><Save size={14}/> Save Invoice</Btn>
+          <Btn variant="secondary" onClick={downloadPdf} disabled={savingInvoice || clientSaving || Boolean(existingSourceInvoice)}><FileText size={14}/> Download PDF</Btn>
+          <Btn variant="secondary" onClick={printCurrentInvoice} disabled={savingInvoice || clientSaving || Boolean(existingSourceInvoice)}><FileText size={14}/> Print Invoice</Btn>
+          <Btn variant="success" onClick={() => void handleSave()} disabled={savingInvoice || clientSaving || Boolean(existingSourceInvoice)}><Save size={14}/> {savingInvoice ? "Saving..." : clientSaving ? "Saving Client..." : "Save Invoice"}</Btn>
         </>}
       />
 
-      {clientIncomplete && (
+      {clientChoice && clientIncomplete && (
         <Card className="border-amber-200 bg-amber-50 p-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -2938,9 +3232,11 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
       {duplicateInvoice && (
         <AlertBox type="warning">Invoice number {invoiceNumber || "Not set"} already exists. You can override it, but double-check before saving or exporting.</AlertBox>
       )}
+      {existingSourceInvoice && <AlertBox type="warning">Invoice {existingSourceInvoice.invoiceNumber || "not numbered"} now references this source Timesheet. Creating another Invoice is disabled.</AlertBox>}
       {poMissing && (
         <AlertBox type="warning">This client requires a PO number before finalising or exporting this invoice.</AlertBox>
       )}
+      {clientWorkflowError && <AlertBox type="error">{clientWorkflowError}</AlertBox>}
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 space-y-5">
@@ -2961,9 +3257,44 @@ function InvoiceReviewScreen({ timesheet, profile, clients, onSaveClients, invoi
               <div>
                 <div className="flex items-center justify-between mb-2">
                   <p className="text-xs font-bold text-gray-300 uppercase tracking-wider">Bill To</p>
-                  <Btn variant="secondary" size="xs" onClick={saveClientDetails}><Save size={12}/> Save Client Details</Btn>
+                  {clientChoice && clientChoice !== "new" && <Btn variant="secondary" size="xs" onClick={() => { setClientChoice(""); setEditingClientDetails(false); setClientWorkflowError(""); }} disabled={savingInvoice || clientSaving}>Change Client</Btn>}
                 </div>
-                <ClientFields client={clientDraft} onChange={setClientDraft} errors={Object.keys(clientErrors).length ? clientErrors : (clientIncomplete ? clientBillingErrors(clientDraft) : {})} fieldPrefix="invoice-client" />
+                {!clientChoice && (
+                  <div className="space-y-3">
+                    <Inp label="Search saved clients" value={clientSearch} onChange={e => setClientSearch(e.target.value)} placeholder="Company, contact person, or email" disabled={savingInvoice || clientSaving} />
+                    <SInp label="Select Client" value="" onChange={e => chooseClient(e.target.value)} required disabled={savingInvoice || clientSaving}>
+                      <option value="">Choose a client...</option>
+                      {filteredClients.map(client => <option key={client.id} value={client.id}>{client.companyName || "Unnamed client"}{client.contactPerson ? ` — ${client.contactPerson}` : ""}</option>)}
+                      <option value="new">+ Add new client</option>
+                    </SInp>
+                    <p className="text-xs leading-relaxed text-slate-500">Selecting a client is required. This client will also be assigned to the source timesheet.</p>
+                  </div>
+                )}
+                {clientChoice === "new" && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div><p className="text-sm font-semibold text-slate-900">New Client</p><p className="text-xs text-slate-500">The full Client record will be saved before the Timesheet is assigned and the Invoice is created.</p></div>
+                      <Btn variant="secondary" size="xs" onClick={() => { setClientChoice(""); setClientErrors({}); setClientWorkflowError(""); }} disabled={savingInvoice || clientSaving}>Cancel New Client</Btn>
+                    </div>
+                    <ClientFields client={clientDraft} onChange={client => { setClientDraft(client); setClientDirty(true); }} errors={Object.keys(clientErrors).length ? clientErrors : {}} fieldPrefix="invoice-client" />
+                  </div>
+                )}
+                {clientChoice && clientChoice !== "new" && (
+                  <div className="space-y-3">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                      <p className="font-semibold text-slate-950">{clientDraft.companyName || "Unnamed client"}</p>
+                      {clientDraft.contactPerson && <p className="mt-0.5 text-sm text-slate-600">Contact: {clientDraft.contactPerson}</p>}
+                      {clientDraft.email && <p className="text-sm text-slate-600">{clientDraft.email}</p>}
+                      {clientDraft.billingAddress && <p className="mt-2 whitespace-pre-line text-sm text-slate-600">{clientDraft.billingAddress}</p>}
+                    </div>
+                    {timesheet.clientId !== clientDraft.id && <p className="text-xs leading-relaxed text-blue-700">This client will also be assigned to the source timesheet.</p>}
+                    <div className="flex flex-wrap gap-2">
+                      <Btn variant="secondary" size="xs" onClick={() => setEditingClientDetails(value => !value)} disabled={savingInvoice || clientSaving}>{editingClientDetails ? "Hide Client Fields" : "Edit Client Details"}</Btn>
+                      {clientDirty && <Btn variant="secondary" size="xs" onClick={() => void saveClientDetails()} disabled={savingInvoice || clientSaving}><Save size={12}/> {clientSaving ? "Saving..." : "Save Client Details"}</Btn>}
+                    </div>
+                    {editingClientDetails && <ClientFields client={clientDraft} onChange={client => { setClientDraft(client); setClientDirty(true); }} errors={Object.keys(clientErrors).length ? clientErrors : (clientIncomplete ? clientBillingErrors(clientDraft) : {})} fieldPrefix="invoice-client" />}
+                  </div>
+                )}
               </div>
             </div>
           </Card>
@@ -3115,12 +3446,12 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
   profile: Profile;
   clients: Client[];
   invoices: Invoice[];
-  onSaveClients: (clients: Client[]) => void;
-  onSave: (invoice: Invoice) => void;
+  onSaveClients: (clients: Client[]) => void | Promise<void>;
+  onSave: (invoice: Invoice) => void | Promise<void>;
   onCancel: () => void;
   onShowToast: (msg: string, type?: ToastType) => void;
 }) {
-  const sourceProfile = useMemo(() => sourceTimesheet ? profileForTimesheet(profile, sourceTimesheet) : profile, [profile, sourceTimesheet]);
+  const sourceProfile = useMemo(() => sourceTimesheet ? calculationProfileForTimesheet(profile, sourceTimesheet) : profile, [profile, sourceTimesheet]);
   const sourceSummary = useMemo(() => sourceTimesheet ? calcSummary(sourceTimesheet.entries || [], sourceProfile) : null, [sourceTimesheet, sourceProfile]);
   const initialDetailMode = (invoice.detailMode || "summary") as InvoiceDetailMode;
   const initialClient = clients.find(c => c.id === invoice.clientId) || invoice.client || blankClient({ id: invoice.clientId || uid(), companyName: invoice.clientName || "" });
@@ -3214,7 +3545,7 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     setNewItem({ description: "", quantity: "1", unitPrice: "", taxable: true });
   };
 
-  const persistClientDetails = () => {
+  const persistClientDetails = async () => {
     const errors = clientBillingErrors(clientDraft);
     if (Object.keys(errors).length) {
       focusClientBilling(errors);
@@ -3223,7 +3554,12 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     }
     const client = normalizeClient(clientDraft);
     const exists = clients.some(c => c.id === client.id);
-    onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    try {
+      await onSaveClients(exists ? clients.map(c => c.id === client.id ? client : c) : [...clients, client]);
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+      return null;
+    }
     setClientDraft(client);
     setClientErrors({});
     if (client.paymentTerms || client.defaultPaymentTerms) setPaymentTerms(client.paymentTerms || client.defaultPaymentTerms);
@@ -3233,6 +3569,19 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
 
   const makeEditedInvoice = (): Invoice => {
     const nextStatus = normalizeInvoiceStatus(status);
+    const existingPayments = invoice.payments || [];
+    const editedPayments: InvoicePayment[] = totals.paidAmount > 0
+      ? existingPayments.length <= 1
+        ? [{
+            id: existingPayments[0]?.id || `${invoice.id}:payment:legacy-summary`,
+            paymentDate: paidDate || existingPayments[0]?.paymentDate || issueDate,
+            amount: totals.paidAmount,
+            method: existingPayments[0]?.method || "",
+            reference: existingPayments[0]?.reference || invoiceNumber,
+            notes: existingPayments[0]?.notes || "Saved from the Invoice payment summary.",
+          }]
+        : existingPayments
+      : [];
     return normalizeInvoice({
       ...invoice,
       invoiceNumber,
@@ -3260,6 +3609,7 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
       paidAmount: totals.paidAmount,
       paidDate,
       balanceDue: totals.balanceDue,
+      payments: editedPayments,
       currency: cur,
       status: nextStatus,
       banking: invoice.banking && Object.keys(invoice.banking).length ? invoice.banking : { accountName: profile.bankAccountName, bankName: profile.bankName, accountNumber: profile.bankAccountNumber, branchCode: profile.bankBranchCode, swift: profile.bankSwift, iban: profile.bankIban, reference: profile.bankReference || invoiceNumber },
@@ -3296,11 +3646,12 @@ function InvoiceEditScreen({ invoice, sourceTimesheet, profile, clients, invoice
     return true;
   };
 
-  const saveChanges = () => {
+  const saveChanges = async () => {
     if (!validateBeforeSave()) return;
-    persistClientDetails();
+    const client = await persistClientDetails();
+    if (!client) return;
     const next = makeEditedInvoice();
-    onSave(next);
+    await onSave(next);
     onShowToast(`Invoice ${next.invoiceNumber} saved`);
   };
 
@@ -4005,42 +4356,54 @@ function printTimesheet(ts: Timesheet, profile: Profile) {
 // TIMESHEET DETAIL
 // ═══════════════════════════════════════════════════════════════════════════
 
-function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, onCreateInvoice, onShowToast }: {
-  timesheet: Timesheet; profile: Profile; onUpdate: (ts: Timesheet) => void;
+function TimesheetDetail({ timesheet, profile, clients, linkedInvoice, invoiceReferencesAvailable, onUpdate, onBack, onCreateInvoice, onShowToast, busy, busyMessage }: {
+  timesheet: Timesheet; profile: Profile; onUpdate: (ts: Timesheet) => Promise<void>;
+  clients: Client[];
   linkedInvoice?: Invoice | null; onBack: () => void; onCreateInvoice: (ts: Timesheet) => void; onShowToast: (msg: string, type?: ToastType) => void;
+  invoiceReferencesAvailable: boolean;
+  busy: boolean; busyMessage: string;
 }) {
   const [tab, setTab]     = useState("add");
   const [editingDay, setEditingDay] = useState<{ mode: "edit" | "duplicate"; entry: TimesheetEntry } | null>(null);
   const [showProductionRates, setShowProductionRates] = useState(false);
+  const [editingDetails, setEditingDetails] = useState<Timesheet | null>(null);
   const [productionRates, setProductionRates] = useState<RateDraft>(() => rateDraftFromTimesheet(timesheet, profile));
-  const effectiveProfile  = useMemo(() => profileForTimesheet(profile, timesheet), [profile, timesheet]);
+  const effectiveProfile  = useMemo(() => calculationProfileForTimesheet(profile, timesheet), [profile, timesheet]);
   const sum               = useMemo(() => calcSummary(timesheet.entries || [], effectiveProfile), [timesheet.entries, effectiveProfile]);
   const cur               = timesheet.currency || effectiveProfile.defaultCurrency || "ZAR";
   const hasEntries        = (timesheet.entries || []).length > 0;
   const linkedStatus      = linkedInvoice ? normalizeInvoiceStatus(linkedInvoice.status) : null;
   const linkedFinalised   = Boolean(linkedStatus && linkedStatus !== "draft");
-  const addEntry          = (e: TimesheetEntry) => {
-    onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), withEntrySnapshots(e, effectiveProfile)] });
+  const addEntry          = async (e: TimesheetEntry) => {
+    await onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), withEntrySnapshots(e, effectiveProfile)] });
   };
-  const updateEntry       = (entry: TimesheetEntry) => {
-    onUpdate({ ...timesheet, entries: (timesheet.entries || []).map(e => e.id === entry.id ? withEntrySnapshots(entry, effectiveProfile) : e) });
+  const updateEntry       = async (entry: TimesheetEntry) => {
+    await onUpdate({ ...timesheet, entries: (timesheet.entries || []).map(e => e.id === entry.id ? withEntrySnapshots(entry, effectiveProfile) : e) });
     onShowToast("Timesheet day updated.");
   };
   const duplicateEntryFromWeekly = (entry: TimesheetEntry) => {
     setEditingDay({ mode: "duplicate", entry: withEntrySnapshots({ ...entry, id: uid(), date: nextDayStr(entry.date), callTime: "08:00", wrapTime: "18:00" }, effectiveProfile) });
   };
-  const deleteEntry       = (id: string) => {
-    onUpdate({ ...timesheet, entries: (timesheet.entries || []).filter(e => e.id !== id) });
-    onShowToast("Timesheet day deleted", "info");
+  const deleteEntry       = async (id: string) => {
+    if (linkedInvoice) {
+      alert(`This work day cannot be deleted because invoice ${linkedInvoice.invoiceNumber || "not numbered"} depends on its source timesheet.`);
+      return;
+    }
+    try {
+      await onUpdate({ ...timesheet, entries: (timesheet.entries || []).filter(e => e.id !== id) });
+      onShowToast("Timesheet day deleted", "info");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not delete this work day.", "error");
+    }
   };
-  const saveDayEditor     = (entry: TimesheetEntry) => {
+  const saveDayEditor     = async (entry: TimesheetEntry) => {
     if (!editingDay) return;
     const snapshot = withEntrySnapshots(entry, effectiveProfile);
     if (editingDay.mode === "duplicate") {
-      onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), snapshot] });
+      await onUpdate({ ...timesheet, entries: [...(timesheet.entries || []), snapshot] });
       onShowToast("Timesheet day duplicated.");
     } else {
-      updateEntry(snapshot);
+      await updateEntry(snapshot);
     }
     setEditingDay(null);
   };
@@ -4048,7 +4411,26 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
     setProductionRates(rateDraftFromTimesheet(timesheet, profile));
     setShowProductionRates(v => !v);
   };
-  const saveProductionRates = () => {
+  const saveTimesheetDetails = async () => {
+    if (!editingDetails || !editingDetails.productionName.trim()) return;
+    const selectedClient = clients.find(client => client.id === editingDetails.clientId) || null;
+    const next: Timesheet = {
+      ...editingDetails,
+      status: timesheetBaseStatus(editingDetails),
+      productionName: editingDetails.productionName.trim(),
+      clientId: selectedClient?.id,
+      clientName: selectedClient ? clientName(selectedClient) : "Unknown / add later",
+      clientIncomplete: !selectedClient || !clientBillingComplete(selectedClient),
+    };
+    try {
+      await onUpdate(next);
+      setEditingDetails(null);
+      onShowToast("Saved to CrewQuote account");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this Timesheet. Your form values were kept.", "error");
+    }
+  };
+  const saveProductionRates = async () => {
     const choice = prompt("How should these changes apply?\n\n1. Apply to future days only\n2. Recalculate existing days that have not been invoiced\n3. Recalculate all days in this timesheet", "1") || "1";
     if (!["1", "2", "3"].includes(choice)) return;
     if (linkedFinalised && choice === "3" && !confirm("This timesheet is linked to an invoice. Editing it may require updating or recreating the invoice. Recalculate all days anyway?")) return;
@@ -4058,12 +4440,17 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
     if (canRecalculateExisting) {
       next = { ...next, entries: (next.entries || []).map(e => applyRateDraftToEntry(e, productionRates, nextProfile)) };
     }
-    onUpdate(next);
-    setShowProductionRates(false);
-    onShowToast(choice === "1" ? "Production rates saved for future days." : "Production rates saved and matching days recalculated.");
+    try {
+      await onUpdate(next);
+      setShowProductionRates(false);
+      onShowToast(choice === "1" ? "Production rates saved for future days." : "Production rates saved and matching days recalculated.");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save the production rates.", "error");
+    }
   };
-  const statusColor       = ({ open: "gray", submitted: "blue", invoiced: "teal" } as Record<string, string>)[timesheet.status] || "gray";
-  const statusLabel       = ({ open: "Open", submitted: "Submitted", invoiced: "Invoiced" } as Record<string, string>)[timesheet.status] || "Open";
+  const displayState      = linkedInvoice || invoiceReferencesAvailable
+    ? timesheetDisplayState(timesheet, linkedInvoice || null)
+    : { color: "amber", label: "Invoice state unavailable" };
   const TABS = [{ id: "add", label: "Add Day" }, { id: "weekly", label: `Weekly (${(timesheet.entries||[]).length})` }, { id: "summary", label: "Summary" }];
 
   return (
@@ -4071,20 +4458,54 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
       <PageHeader
         title={timesheet.productionName || "Untitled"}
         description={`${timesheet.timesheetNumber} · Bill to ${timesheet.clientName || "Unknown / add later"} · ${(timesheet.entries||[]).length} day${(timesheet.entries||[]).length !== 1 ? "s" : ""} · ${fmtMoney(sum.grandTotal, cur)}`}
-        badge={<Badge color={statusColor}>{statusLabel}</Badge>}
+        badge={<Badge color={displayState.color}>{displayState.label}</Badge>}
         secondaryActions={<Btn variant="secondary" size="sm" onClick={onBack}>{"\u2190"} Back to Timesheets</Btn>}
         actions={<>
-          <Btn variant="secondary" size="sm" onClick={openProductionRates}><Pencil size={13}/> Edit production rates</Btn>
-          {timesheet.status !== "invoiced" && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
+          <Btn variant="secondary" size="sm" onClick={() => setEditingDetails({ ...timesheet })} disabled={busy}><Pencil size={13}/> Edit Timesheet</Btn>
+          <Btn variant="secondary" size="sm" onClick={openProductionRates} disabled={busy}><Pencil size={13}/> Edit production rates</Btn>
+          {!linkedInvoice && invoiceReferencesAvailable && sum.grandTotal > 0 && <Btn variant="success" size="sm" onClick={() => onCreateInvoice(timesheet)}><Receipt size={13}/> Create Invoice</Btn>}
           <Btn variant="secondary" size="sm" disabled={!hasEntries} title={!hasEntries ? "Add at least one day before exporting a timesheet." : "Print or save this timesheet as PDF"} className={!hasEntries ? "opacity-50 cursor-not-allowed" : ""} onClick={() => hasEntries && printTimesheet(timesheet, effectiveProfile)}><FileText size={13}/> Print Timesheet</Btn>
         </>}
       />
       {!hasEntries && <AlertBox type="info">Add at least one day before exporting a timesheet.</AlertBox>}
+      {busy && <AlertBox type="info">{busyMessage || "Saving work day..."}</AlertBox>}
       {linkedInvoice && linkedFinalised && (
         <AlertBox type="warning">This timesheet is linked to an invoice. Editing it may require updating or recreating the invoice.</AlertBox>
       )}
       {linkedInvoice && !linkedFinalised && (
         <AlertBox type="info">Draft invoice {linkedInvoice.invoiceNumber} will use the latest timesheet totals when you update or save timesheet changes.</AlertBox>
+      )}
+      {editingDetails && (
+        <Card className="p-5">
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <p className="text-sm font-bold text-gray-900">Edit Timesheet</p>
+              <p className="text-xs text-gray-400 mt-0.5">The app-facing Timesheet ID and saved work-day rate snapshots are preserved.</p>
+            </div>
+            <div className="flex gap-2">
+              <Btn variant="secondary" size="sm" onClick={() => setEditingDetails(null)} disabled={busy}>Cancel</Btn>
+              <Btn size="sm" onClick={() => void saveTimesheetDetails()} disabled={busy || !editingDetails.productionName.trim()}><Save size={13}/> {busy ? "Saving Timesheet..." : "Save Timesheet"}</Btn>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <Inp label="Production / Project Name" value={editingDetails.productionName} onChange={e => setEditingDetails(current => current ? { ...current, productionName: e.target.value } : current)} required />
+            <SInp label="Bill-to Client" value={editingDetails.clientId || ""} onChange={e => setEditingDetails(current => current ? { ...current, clientId: e.target.value || undefined } : current)}>
+              <option value="">Unknown / add later</option>
+              {clients.map(client => <option key={client.id} value={client.id}>{clientName(client) || "Unnamed client"}</option>)}
+            </SInp>
+            <Inp label="Crew Member" value={editingDetails.crewName} onChange={e => setEditingDetails(current => current ? { ...current, crewName: e.target.value } : current)} />
+            <Inp label="Role" value={editingDetails.role} onChange={e => setEditingDetails(current => current ? { ...current, role: e.target.value } : current)} />
+            <Inp label="Start Date" type="date" value={editingDetails.startDate || ""} onChange={e => setEditingDetails(current => current ? { ...current, startDate: e.target.value } : current)} />
+            <SInp label="Currency" value={editingDetails.currency} onChange={e => setEditingDetails(current => current ? { ...current, currency: e.target.value } : current)}>
+              {["ZAR", "USD", "GBP", "EUR"].map(currency => <option key={currency} value={currency}>{currency}</option>)}
+            </SInp>
+            <SInp label="Status" value={timesheetBaseStatus(editingDetails)} onChange={e => setEditingDetails(current => current ? { ...current, status: e.target.value as Timesheet["status"] } : current)}>
+              <option value="open">Open</option><option value="submitted">Submitted</option>
+            </SInp>
+            <Inp label="Payment Terms" value={editingDetails.paymentTerms || ""} onChange={e => setEditingDetails(current => current ? { ...current, paymentTerms: e.target.value } : current)} />
+            <div className="md:col-span-2"><TxInp label="Notes" rows={3} value={editingDetails.notes || ""} onChange={e => setEditingDetails(current => current ? { ...current, notes: e.target.value } : current)} /></div>
+          </div>
+        </Card>
       )}
       {showProductionRates && (
         <Card className="p-5">
@@ -4094,8 +4515,8 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
               <p className="text-xs text-gray-400 mt-0.5">These rates fill future days unless you choose to recalculate existing entries.</p>
             </div>
             <div className="flex gap-2">
-              <Btn variant="secondary" size="sm" onClick={() => setShowProductionRates(false)}>Cancel</Btn>
-              <Btn size="sm" onClick={saveProductionRates}><Save size={13}/> Save Rates</Btn>
+              <Btn variant="secondary" size="sm" onClick={() => setShowProductionRates(false)} disabled={busy}>Cancel</Btn>
+              <Btn size="sm" onClick={() => void saveProductionRates()} disabled={busy}><Save size={13}/> {busy ? "Saving Timesheet..." : "Save Rates"}</Btn>
             </div>
           </div>
           <ProductionRateFields rates={productionRates} onChange={setProductionRates} currency={cur} />
@@ -4104,9 +4525,9 @@ function TimesheetDetail({ timesheet, profile, linkedInvoice, onUpdate, onBack, 
       <div className="flex flex-wrap gap-1 border-b border-slate-200">
         {TABS.map(t => <button key={t.id} type="button" onClick={() => setTab(t.id)} className={`rounded-t-lg px-4 py-2.5 text-sm font-semibold border-b-2 -mb-px transition-colors ${UI.focus} ${tab === t.id ? "border-blue-600 bg-white text-blue-700" : "border-transparent text-slate-500 hover:bg-white hover:text-slate-900"}`}>{t.label}</button>)}
       </div>
-      {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={effectiveProfile} onAdd={addEntry} onShowToast={onShowToast} />}
-      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onEditEntry={entry => setEditingDay({ mode: "edit", entry })} onDuplicateEntry={duplicateEntryFromWeekly} onDeleteEntry={deleteEntry} />}
-      {tab === "summary"&& <SummaryView timesheet={timesheet} profile={effectiveProfile} onStartInvoice={() => onCreateInvoice(timesheet)} />}
+      {tab === "add"    && <AddDayForm  timesheet={timesheet} profile={effectiveProfile} onAdd={addEntry} onShowToast={onShowToast} disabled={busy} />}
+      {tab === "weekly" && <WeeklyView  timesheet={timesheet} profile={effectiveProfile} onEditEntry={entry => !busy && setEditingDay({ mode: "edit", entry })} onDuplicateEntry={entry => !busy && duplicateEntryFromWeekly(entry)} onDeleteEntry={id => { if (!busy) void deleteEntry(id); }} />}
+      {tab === "summary"&& <SummaryView timesheet={timesheet} profile={effectiveProfile} linkedInvoice={linkedInvoice || null} invoiceReferencesAvailable={invoiceReferencesAvailable} onStartInvoice={() => onCreateInvoice(timesheet)} />}
       {editingDay && <TimesheetDayEditor entry={editingDay.entry} profile={effectiveProfile} mode={editingDay.mode} onSave={saveDayEditor} onCancel={() => setEditingDay(null)} />}
     </div>
   );
@@ -4129,7 +4550,7 @@ function FirstRunOnboarding({ onSettings, onClients, onDismiss }: { onSettings: 
             Complete your business details, add a client, create a timesheet, add your work days, then generate an invoice.
           </p>
           <p className="mt-2 text-sm leading-relaxed text-amber-800">
-            CrewQuote currently stores data only in this browser on this device. It does not sync between devices. Clearing browser data may remove your records. Export regular backups.
+            Activated CrewQuote workspaces sync with your account. Business logos and protected browser recovery copies remain local, so export regular complete backups.
           </p>
         </div>
         <div className="flex flex-wrap gap-2 lg:justify-end">
@@ -4142,10 +4563,12 @@ function FirstRunOnboarding({ onSettings, onClients, onDismiss }: { onSettings: 
   );
 }
 
-function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, onAddInvoice, onSaveInvoices, onShowToast, showOnboarding, onDismissOnboarding, onNavigate }: {
-  timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => void; onSaveClients: (clients: Client[]) => void;
-  invoices: Invoice[]; onAddInvoice: (i: Invoice) => void; onSaveInvoices: (invoices: Invoice[]) => void; onShowToast: (msg: string, type?: ToastType) => void;
+function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, invoices, invoiceLinksLoading, invoiceLinksError, onAddInvoice, onSaveInvoices, onShowToast, showOnboarding, onDismissOnboarding, onNavigate, loading, loadError, onRetry, cloudActive, busy, busyMessage }: {
+  timesheets: Timesheet[]; profile: Profile; clients: Client[]; onSave: (t: Timesheet[]) => Promise<void>; onSaveClients: (clients: Client[]) => void | Promise<void>;
+  invoices: Invoice[]; onAddInvoice: (i: Invoice) => Promise<void>; onSaveInvoices: (invoices: Invoice[]) => Promise<void>; onShowToast: (msg: string, type?: ToastType) => void;
+  invoiceLinksLoading: boolean; invoiceLinksError: string;
   showOnboarding: boolean; onDismissOnboarding: () => void; onNavigate: (page: string) => void;
+  loading: boolean; loadError: string; onRetry: () => void; cloudActive: boolean; busy: boolean; busyMessage: string;
 }) {
   const [view, setView]           = useState<"list" | "detail" | "invoice-review">("list");
   const [selected, setSelected]   = useState<Timesheet | null>(null);
@@ -4161,7 +4584,10 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     rates: rateDraftFromProfile(profile),
   });
   const [newClient, setNewClient] = useState<Client>(() => blankClient());
+  const [creating, setCreating] = useState(false);
+  const pendingTimesheetLegacyId = useRef(uid());
   const cur = profile.defaultCurrency || "ZAR";
+  const invoiceReferencesAvailable = !invoiceLinksLoading && !invoiceLinksError;
   const selectedClientForNew = newTs.clientChoice !== "unknown" && newTs.clientChoice !== "new"
     ? clients.find(c => c.id === newTs.clientChoice) || null
     : null;
@@ -4186,29 +4612,44 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
     setShowNewRates(false);
   };
 
-  const createTS = () => {
-    if (!newTs.productionName.trim()) return;
+  const createTS = async () => {
+    if (creating || busy || !newTs.productionName.trim()) return;
+    if (newTs.clientChoice === "new" && !newClient.companyName.trim()) {
+      onShowToast("Enter the new client company name or choose Unknown / add later", "error");
+      return;
+    }
+    setCreating(true);
 
     let chosenClient: Client | null = null;
     let nextClients = clients;
+    let clientsChanged = false;
 
     if (newTs.clientChoice === "new") {
-      if (!newClient.companyName.trim()) { onShowToast("Enter the new client company name or choose Unknown / add later", "error"); return; }
       chosenClient = normalizeClient({ ...newClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
       nextClients = [...clients, chosenClient];
-      onSaveClients(nextClients);
+      clientsChanged = true;
     } else if (newTs.clientChoice !== "unknown") {
       chosenClient = clients.find(c => c.id === newTs.clientChoice) || null;
       if (chosenClient) {
         const remembered = normalizeClient({ ...chosenClient, rateMemory: memoryFromRateDraft(newTs.rates, newTs.productionName.trim()) });
         nextClients = clients.map(c => c.id === remembered.id ? remembered : c);
-        onSaveClients(nextClients);
         chosenClient = remembered;
+        clientsChanged = true;
+      }
+    }
+
+    if (clientsChanged) {
+      try {
+        await onSaveClients(nextClients);
+      } catch (err) {
+        onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this client to your account.", "error");
+        setCreating(false);
+        return;
       }
     }
 
     const ts: Timesheet = {
-      id: uid(),
+      id: pendingTimesheetLegacyId.current,
       timesheetNumber: genTSNum(timesheets),
       productionName: newTs.productionName.trim(),
       clientId: chosenClient?.id,
@@ -4239,76 +4680,94 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
       equipmentRentalDaily: true,
       createdAt: new Date().toISOString(),
     };
-    onSave([...timesheets, ts]); setSelected(ts); setView("detail"); setShowNew(false); resetNewTimesheet();
+    try {
+      await onSave([...timesheets, ts]);
+      pendingTimesheetLegacyId.current = uid();
+      setSelected(ts); setView("detail"); setShowNew(false); resetNewTimesheet();
+      onShowToast("Saved to CrewQuote account");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not save this Timesheet. Your form values were kept.", "error");
+    } finally {
+      setCreating(false);
+    }
   };
 
-  const updateTS = useCallback((ts: Timesheet) => {
-    onSave((timesheets || []).map(x => x.id === ts.id ? ts : x));
-    const linked = (invoices || []).find(i => i.id === ts.invoiceId || i.fromTimesheetId === ts.id);
+  const updateTS = useCallback(async (ts: Timesheet) => {
+    await onSave((timesheets || []).map(x => x.id === ts.id ? ts : x));
+    const linked = invoiceForTimesheet(ts, invoices || []);
     if (linked && normalizeInvoiceStatus(linked.status) === "draft") {
-      onSaveInvoices((invoices || []).map(i => i.id === linked.id ? rebuildDraftInvoiceFromTimesheet(i, ts, profile) : i));
+      await onSaveInvoices((invoices || []).map(i => i.id === linked.id ? rebuildDraftInvoiceFromTimesheet(i, ts, profile) : i));
     }
     if (ts.clientId) {
       const client = clients.find(c => c.id === ts.clientId);
       if (client) {
         const remembered = normalizeClient({ ...client, rateMemory: memoryFromRateDraft(rateDraftFromTimesheet(ts, profile), ts.productionName) });
-        onSaveClients(clients.map(c => c.id === remembered.id ? remembered : c));
+        void Promise.resolve(onSaveClients(clients.map(c => c.id === remembered.id ? remembered : c))).catch(err => {
+          onShowToast(err instanceof Error ? err.message : "CrewQuote could not update the client rate memory.", "error");
+        });
       }
     }
     setSelected(ts);
-  }, [timesheets, invoices, clients, profile, onSave, onSaveInvoices, onSaveClients]);
+  }, [timesheets, invoices, clients, profile, onSave, onSaveInvoices, onSaveClients, onShowToast]);
 
-  const deleteTS = (id: string) => {
+  const assignInvoiceClientToTimesheet = useCallback(async (ts: Timesheet) => {
+    await onSave((timesheets || []).map(current => current.id === ts.id ? ts : current));
+    setSelected(ts);
+  }, [onSave, timesheets]);
+
+  const deleteTS = async (id: string) => {
     const ts = (timesheets || []).find(t => t.id === id);
-    const linked = (invoices || []).find(i => i.id === ts?.invoiceId || i.fromTimesheetId === id);
+    const linked = ts ? invoiceForTimesheet(ts, invoices || []) : null;
     if (linked) {
       alert(`This timesheet is linked to invoice ${linked.invoiceNumber || "not numbered"} and cannot be deleted while that invoice exists.`);
       return;
     }
     const name = `${ts?.productionName || "Untitled timesheet"}${ts?.timesheetNumber ? ` - ${ts.timesheetNumber}` : ""}`;
     if (!confirm(`Delete timesheet "${name}"? This cannot be undone.`)) return;
-    onSave((timesheets||[]).filter(t => t.id !== id));
-    if (selected?.id === id) { setView("list"); setSelected(null); }
+    try {
+      await onSave((timesheets||[]).filter(t => t.id !== id));
+      if (selected?.id === id) { setView("list"); setSelected(null); }
+      onShowToast("Timesheet deleted", "info");
+    } catch (err) {
+      onShowToast(err instanceof Error ? err.message : "CrewQuote could not delete this Timesheet.", "error");
+    }
   };
 
   const startInvoice = useCallback((ts: Timesheet) => {
-    updateTS(ts);
+    if (!invoiceReferencesAvailable) {
+      onShowToast("Invoice references are unavailable. Retry loading before creating an Invoice from this Timesheet.", "error");
+      return;
+    }
     setSelected(ts);
     setView("invoice-review");
-  }, [updateTS]);
+  }, [invoiceReferencesAvailable, onShowToast]);
 
-  const saveInvoice = useCallback((inv: Invoice) => {
-    onAddInvoice(inv);
-    const source = (timesheets || []).find(t => t.id === inv.fromTimesheetId) || selected!;
-    const updated = {
-      ...source,
-      status: "invoiced" as const,
-      invoiceId: inv.id,
-      clientId: inv.clientId || source.clientId,
-      clientName: inv.clientName || source.clientName,
-      clientIncomplete: false,
-      paymentTerms: inv.paymentTerms || source.paymentTerms,
-    };
-    onSave((timesheets || []).map(x => x.id === updated.id ? updated : x));
-    setSelected(updated);
+  const saveInvoice = useCallback(async (inv: Invoice) => {
+    await onAddInvoice(inv);
     setView("list"); setSelected(null);
-  }, [selected, timesheets, onAddInvoice, onSave]);
+  }, [onAddInvoice]);
 
   const currentTS = selected ? ((timesheets||[]).find(t => t.id === selected.id) || selected) : null;
 
   if (view === "invoice-review" && currentTS)
-    return <InvoiceReviewScreen timesheet={currentTS} profile={profile} clients={clients} onSaveClients={onSaveClients} invoices={invoices} onSave={saveInvoice} onUpdateTimesheet={updateTS} onBack={() => setView("detail")} onShowToast={onShowToast} />;
+    return <InvoiceReviewScreen timesheet={currentTS} profile={profile} clients={clients} onSaveClients={onSaveClients} invoices={invoices} onSave={saveInvoice} onUpdateTimesheet={assignInvoiceClientToTimesheet} onBack={() => setView("detail")} onShowToast={onShowToast} />;
 
   if (view === "detail" && currentTS)
-    return <TimesheetDetail timesheet={currentTS} profile={profile} linkedInvoice={(invoices || []).find(i => i.id === currentTS.invoiceId || i.fromTimesheetId === currentTS.id) || null} onUpdate={updateTS} onBack={() => { setView("list"); setSelected(null); }} onCreateInvoice={startInvoice} onShowToast={onShowToast} />;
+    return <TimesheetDetail timesheet={currentTS} profile={profile} clients={clients} linkedInvoice={invoiceForTimesheet(currentTS, invoices || [])} invoiceReferencesAvailable={invoiceReferencesAvailable} onUpdate={updateTS} onBack={() => { setView("list"); setSelected(null); }} onCreateInvoice={startInvoice} onShowToast={onShowToast} busy={busy} busyMessage={busyMessage} />;
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Timesheets"
         description={`${(timesheets||[]).length} timesheet${(timesheets||[]).length !== 1 ? "s" : ""}`}
-        actions={<Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>}
+        actions={<Btn onClick={() => setShowNew(true)} disabled={loading || busy}><Plus size={14}/> New Timesheet</Btn>}
       />
+
+      {loading && <AlertBox type="info">Loading Timesheets from your CrewQuote account...</AlertBox>}
+      {loadError && <AlertBox type="error"><span>Cloud unavailable: {loadError}</span><button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry</button></AlertBox>}
+      {invoiceLinksError && <AlertBox type="warning"><span>Invoice references unavailable: {invoiceLinksError} Timesheet Invoice creation is disabled until the reread succeeds.</span><button type="button" onClick={onRetry} className="ml-2 font-semibold underline">Retry</button></AlertBox>}
+      {busy && <AlertBox type="info">{busyMessage || "Saving Timesheet..."}</AlertBox>}
+      {!cloudActive && <AlertBox type="warning">Migration required: existing browser Timesheets remain active until their reviewed Phase 4 migration is completed. CrewQuote has not switched to an empty cloud workspace.</AlertBox>}
 
       {showOnboarding && (
         <FirstRunOnboarding
@@ -4375,19 +4834,21 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
               <TxInp label="Notes" rows={2} value={newTs.notes} onChange={e => setNewTs(p => ({ ...p, notes: e.target.value }))} placeholder="Optional production or billing notes" />
             </div>
             <div className="flex gap-2 mt-4">
-              <Btn className="flex-1 justify-center" onClick={createTS} disabled={!newTs.productionName.trim()}>Create Timesheet →</Btn>
-              <Btn variant="secondary" onClick={() => { setShowNew(false); resetNewTimesheet(); }}>Cancel</Btn>
+              <Btn className="flex-1 justify-center" onClick={() => void createTS()} disabled={!newTs.productionName.trim() || creating || busy}>{creating ? "Saving Timesheet..." : "Create Timesheet →"}</Btn>
+              <Btn variant="secondary" onClick={() => { setShowNew(false); resetNewTimesheet(); }} disabled={creating || busy}>Cancel</Btn>
             </div>
           </div>
         </div>
       )}
 
       <Card>
-        {(timesheets||[]).length === 0 ? (
+        {(loading || loadError) ? (
+          <div className="py-16 text-center"><p className="text-sm text-slate-400">{loading ? "Loading Timesheets..." : "Timesheets are unavailable until the cloud request succeeds."}</p></div>
+        ) : (timesheets||[]).length === 0 ? (
           <div className="py-16 text-center">
             <div className="w-14 h-14 bg-gray-100 rounded-2xl flex items-center justify-center mx-auto mb-4"><Clock size={24} className="text-gray-300"/></div>
-            <h3 className="text-base font-semibold text-gray-900 mb-1">No timesheets yet</h3>
-            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">Create a timesheet to start tracking your work days and overtime.</p>
+            <h3 className="text-base font-semibold text-gray-900 mb-1">{cloudActive ? "Empty cloud account" : "No timesheets yet"}</h3>
+            <p className="text-sm text-gray-400 mb-5 max-w-sm mx-auto">{cloudActive ? "No Timesheets were found in this CrewQuote account. Create one to start tracking work days and overtime." : "Create a timesheet to start tracking your work days and overtime."}</p>
             <Btn onClick={() => setShowNew(true)}><Plus size={14}/> New Timesheet</Btn>
           </div>
         ) : (
@@ -4396,11 +4857,13 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
               <thead><tr>{["Timesheet","Production","Bill To","Days","Status","Total",""].map((h,i) => <th key={i} className={`${UI.th} ${i >= 5 ? "text-right" : "text-left"}`}>{h}</th>)}</tr></thead>
               <tbody className="divide-y divide-slate-100">
                 {[...(timesheets||[])].sort((a,b) => new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime()).map(ts => {
-                  const effectiveProfile = profileForTimesheet(profile, ts);
+                  const effectiveProfile = calculationProfileForTimesheet(profile, ts);
                   const s = calcSummary(ts.entries||[], effectiveProfile);
                   const billTo = getTimesheetClient(ts, clients);
-                  const col = ({ open:"gray", submitted:"blue", invoiced:"teal" } as Record<string,string>)[ts.status]||"gray";
-                  const lbl = ({ open:"Open", submitted:"Submitted", invoiced:"Invoiced" } as Record<string,string>)[ts.status]||"Open";
+                  const linkedInvoice = invoiceForTimesheet(ts, invoices || []);
+                  const display = linkedInvoice || invoiceReferencesAvailable
+                    ? timesheetDisplayState(ts, linkedInvoice)
+                    : { color: "amber", label: "Invoice state unavailable" };
                   const openTimesheet = () => { setSelected(ts); setView("detail"); };
                   return (
                     <tr key={ts.id} role="button" tabIndex={0} className={UI.rowClickable} onClick={openTimesheet} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openTimesheet(); } }}>
@@ -4413,9 +4876,9 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
                         </div>
                       </td>
                       <td className={`${UI.td} text-slate-500`}>{(ts.entries||[]).length}</td>
-                      <td className={UI.td}><Badge color={col}>{lbl}</Badge></td>
+                      <td className={UI.td}><Badge color={display.color}>{display.label}</Badge></td>
                       <td className={`${UI.td} text-right font-semibold text-slate-950 tabular-nums`}>{fmtMoney(s.grandTotal, ts.currency||cur)}</td>
-                      <td className={`${UI.td} text-right`}><IconButton label={`Delete ${ts.timesheetNumber}`} variant="danger" onClick={e => { e.stopPropagation(); deleteTS(ts.id); }}><Trash2 size={14}/></IconButton></td>
+                      <td className={`${UI.td} text-right`}><IconButton label={`Delete ${ts.timesheetNumber}`} variant="danger" disabled={busy} onClick={e => { e.stopPropagation(); void deleteTS(ts.id); }}><Trash2 size={14}/></IconButton></td>
                     </tr>
                   );
                 })}
@@ -4432,26 +4895,32 @@ function TimesheetsPage({ timesheets, profile, clients, onSave, onSaveClients, i
 // INVOICES PAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
-function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTimesheets, onSaveClients, onSaveProfile, onShowToast, onViewTimesheets }: {
+function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveClients, onSaveProfile, onShowToast, onViewTimesheets, loading, loadError, busy, busyMessage, onRetry, cloudActive }: {
   invoices: Invoice[];
   timesheets: Timesheet[];
   clients: Client[];
   profile: Profile;
-  onSave: (invoices: Invoice[]) => void;
-  onSaveTimesheets: (timesheets: Timesheet[]) => void;
-  onSaveClients: (clients: Client[]) => void;
+  onSave: (invoices: Invoice[]) => Promise<void>;
+  onSaveClients: (clients: Client[]) => void | Promise<void>;
   onSaveProfile: (profile: Profile) => void;
   onShowToast: (msg: string, type?: ToastType) => void;
   onViewTimesheets: () => void;
+  loading: boolean;
+  loadError: string;
+  busy: boolean;
+  busyMessage: string;
+  onRetry: () => void;
+  cloudActive: boolean;
 }) {
   const [sel, setSel] = useState<string | null>(null);
   const [editingInvoice, setEditingInvoice] = useState(false);
   const [protectedEditMessage, setProtectedEditMessage] = useState("");
   const [deleteCandidate, setDeleteCandidate] = useState<Invoice | null>(null);
   const [invoiceActionMessage, setInvoiceActionMessage] = useState("");
+  const [paymentDraft, setPaymentDraft] = useState({ id: "", amount: "", paymentDate: todayStr(), method: "", reference: "", notes: "" });
   const sortedInvoices = [...(invoices||[])].sort((a,b)=>new Date(b.createdAt).getTime()-new Date(a.createdAt).getTime());
   const inv = sel ? sortedInvoices.find(i => i.id === sel) || null : null;
-  const updateInvoice = (next: Invoice) => onSave((invoices || []).map(i => i.id === next.id ? next : i));
+  const updateInvoice = async (next: Invoice) => onSave((invoices || []).map(i => i.id === next.id ? next : i));
   const summaryCurrency = profile.defaultCurrency || sortedInvoices[0]?.currency || "ZAR";
   const currentMonth = todayStr().slice(0, 7);
   const receivableStatuses = ["sent", "partial", "overdue"];
@@ -4492,26 +4961,25 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
     setDeleteCandidate(invoice);
   };
 
-  const confirmDeleteInvoice = () => {
+  const confirmDeleteInvoice = async () => {
     if (!deleteCandidate) return;
     const invoiceToDelete = deleteCandidate;
-    const remainingInvoices = (invoices || []).filter(i => i.id !== invoiceToDelete.id);
-    const nextTimesheets = (timesheets || []).map(ts => {
-      const linkedToDeleted = ts.invoiceId === invoiceToDelete.id || ts.id === invoiceToDelete.fromTimesheetId;
-      if (!linkedToDeleted) return ts;
-      const remainingLinked = remainingInvoices.find(i => i.fromTimesheetId === ts.id || i.id === ts.invoiceId);
-      if (remainingLinked) return { ...ts, invoiceId: remainingLinked.id, status: "invoiced" as const };
-      return { ...ts, invoiceId: undefined, status: ts.status === "invoiced" ? "open" as const : ts.status };
-    });
-    onSave(remainingInvoices);
-    onSaveTimesheets(nextTimesheets);
+    const deletedInvoiceLegacyId = invoiceToDelete.id;
+    const sourceTimesheetLegacyId = invoiceToDelete.fromTimesheetId;
+    const remainingInvoices = (invoices || []).filter(i => i.id !== deletedInvoiceLegacyId);
+    try {
+      await onSave(remainingInvoices);
+    } catch (err) {
+      setInvoiceActionMessage(err instanceof Error ? err.message : "CrewQuote could not delete this Invoice and its related records.");
+      return;
+    }
     onSaveProfile(rememberInvoiceNumber(profile, invoiceToDelete.invoiceNumber));
     setDeleteCandidate(null);
     setEditingInvoice(false);
     setProtectedEditMessage("");
     setInvoiceActionMessage("");
     setSel(null);
-    onShowToast(`Invoice ${invoiceToDelete.invoiceNumber || "not numbered"} was deleted.`, "info");
+    onShowToast(`Invoice ${invoiceToDelete.invoiceNumber || "not numbered"} was deleted.${sourceTimesheetLegacyId ? " Source Timesheet Invoice links were refreshed." : ""}`, "info");
   };
 
   if (inv) {
@@ -4537,16 +5005,47 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
           clients={clients}
           invoices={invoices}
           onSaveClients={onSaveClients}
-          onSave={next => { updateInvoice(next); setEditingInvoice(false); setSel(next.id); }}
+          onSave={async next => { await updateInvoice(next); setEditingInvoice(false); setSel(next.id); }}
           onCancel={() => setEditingInvoice(false)}
           onShowToast={onShowToast}
         />
       );
     }
 
-    const savePatch = (patch: Partial<Invoice>) => {
+    const savePatch = async (patch: Partial<Invoice>) => {
       const next = normalizeInvoice({ ...inv, ...patch });
-      updateInvoice(next);
+      await updateInvoice(next);
+      return next;
+    };
+
+    const savePaymentSet = async (payments: InvoicePayment[], message: string) => {
+      const paid = payments.reduce((sum, payment) => sum + safe(payment.amount, 0), 0);
+      const latestDate = [...payments].map(payment => payment.paymentDate).filter(Boolean).sort().at(-1) || "";
+      const nextStatus: InvoiceStatus = paid >= inv.total && inv.total > 0 ? "paid" : paid > 0 ? "partial" : inv.status === "draft" ? "draft" : "sent";
+      await savePatch({ payments, paidAmount: paid, paidDate: latestDate, balanceDue: Math.max(inv.total - paid, 0), status: nextStatus });
+      setPaymentDraft({ id: "", amount: "", paymentDate: todayStr(), method: "", reference: "", notes: "" });
+      onShowToast(message);
+    };
+
+    const savePayment = async () => {
+      const amount = safe(paymentDraft.amount, 0);
+      if (amount <= 0) { onShowToast("Payment amount must be greater than zero.", "error"); return; }
+      if (!paymentDraft.paymentDate) { onShowToast("Payment date is required.", "error"); return; }
+      const otherPayments = (inv.payments || []).filter(payment => payment.id !== paymentDraft.id).reduce((sum, payment) => sum + safe(payment.amount, 0), 0);
+      if (otherPayments + amount > inv.total + 0.000001) { onShowToast("Recorded Payments cannot exceed the Invoice total.", "error"); return; }
+      const payment: InvoicePayment = { ...paymentDraft, id: paymentDraft.id || uid(), amount };
+      const nextPayments = paymentDraft.id
+        ? (inv.payments || []).map(existing => existing.id === paymentDraft.id ? payment : existing)
+        : [...(inv.payments || []), payment];
+      try { await savePaymentSet(nextPayments, paymentDraft.id ? "Payment updated" : "Payment added"); }
+      catch (err) { onShowToast(err instanceof Error ? err.message : "CrewQuote could not save the Payment.", "error"); }
+    };
+
+    const editPayment = (payment: InvoicePayment) => setPaymentDraft({ ...payment, amount: String(payment.amount) });
+    const removePayment = async (payment: InvoicePayment) => {
+      if (!confirm(`Delete the Payment of ${fmtMoney(payment.amount, inv.currency)} dated ${fmtDate(payment.paymentDate)}?`)) return;
+      try { await savePaymentSet((inv.payments || []).filter(existing => existing.id !== payment.id), "Payment deleted"); }
+      catch (err) { onShowToast(err instanceof Error ? err.message : "CrewQuote could not delete the Payment.", "error"); }
     };
 
     const openDraftEditor = () => {
@@ -4601,21 +5100,27 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
       printInvoice(inv, profile);
     };
 
-    const changeStatus = (status: InvoiceStatus) => {
+    const changeStatus = async (status: InvoiceStatus) => {
       const nextStatus = normalizeInvoiceStatus(status);
       const finalisingDraft = isDraft && nextStatus !== "draft";
       if (finalisingDraft && !validateDraftInvoiceBeforeFinalising()) return;
       if (!isDraft && nextStatus === "draft" && !confirm(`Change invoice ${inv.invoiceNumber || "not numbered"} back to Draft? Draft invoices can be edited again.`)) return;
       const logoPatch = finalisingDraft ? { sellerLogoDataUrl: profile.businessLogoDataUrl || inv.sellerLogoDataUrl || "", sellerSnapshot: sellerSnapshotFromProfile(profile) } : {};
       if (status === "paid") {
-        savePatch({ status, paidAmount: inv.total, paidDate: inv.paidDate || todayStr(), balanceDue: 0, ...logoPatch });
+        const remaining = Math.max(inv.total - paidAmount, 0);
+        const existingPayments = (inv.payments || []).filter(payment => payment.id !== `${inv.id}:payment:mark-paid`);
+        const payments = remaining > 0
+          ? [...existingPayments, { id: `${inv.id}:payment:mark-paid`, paymentDate: todayStr(), amount: remaining, method: "", reference: inv.invoiceNumber, notes: "Marked paid in CrewQuote." }]
+          : (inv.payments || []);
+        await savePatch({ status, payments, paidAmount: inv.total, paidDate: inv.paidDate || todayStr(), balanceDue: 0, ...logoPatch });
         onShowToast("Invoice marked paid");
         return;
       }
-      savePatch({ status, ...logoPatch });
+      await savePatch({ status, ...logoPatch });
+      onShowToast(`Invoice status changed to ${INVOICE_STATUS[nextStatus].label}`);
     };
 
-    const markPaid = () => changeStatus("paid");
+    const markPaid = () => void changeStatus("paid").catch(err => onShowToast(err instanceof Error ? err.message : "CrewQuote could not mark the Invoice paid.", "error"));
 
     return (
       <div className="space-y-5">
@@ -4633,12 +5138,14 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
             <Btn variant="secondary" onClick={openDraftEditor}><Pencil size={14}/> Edit</Btn>
             <Btn variant="secondary" onClick={exportInvoice}><FileText size={14}/> Download Invoice</Btn>
             <Btn variant="secondary" onClick={printInvoiceAction}><FileText size={14}/> Print Invoice</Btn>
-            <Btn variant="success" onClick={markPaid} disabled={normalizeInvoiceStatus(inv.status) === "paid"}><CheckCircle size={14}/> Mark Paid</Btn>
-            <Btn variant="danger" onClick={() => requestDeleteInvoice(inv)}><Trash2 size={14}/> Delete Invoice</Btn>
+            <Btn variant="success" onClick={markPaid} disabled={normalizeInvoiceStatus(inv.status) === "paid" || busy}><CheckCircle size={14}/> Mark Paid</Btn>
+            <Btn variant="danger" onClick={() => requestDeleteInvoice(inv)} disabled={busy}><Trash2 size={14}/> Delete Invoice</Btn>
           </>}
         />
         {invoiceActionMessage && <AlertBox type="warning">{invoiceActionMessage}</AlertBox>}
         {protectedEditMessage && <AlertBox type="warning">{protectedEditMessage}</AlertBox>}
+        {loadError && <AlertBox type="error"><span>{loadError}</span> <button type="button" className="ml-2 font-bold underline" onClick={onRetry}>Retry</button></AlertBox>}
+        {busy && <AlertBox type="info">{busyMessage || "Saving Invoice..."}</AlertBox>}
         {!isDraft && <AlertBox type="info">This invoice is protected because its status is {statusMeta.label}. Change it back to Draft before editing invoice details or line items.</AlertBox>}
         {deleteCandidate && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true" aria-labelledby="delete-invoice-title" onClick={e => { if (e.target === e.currentTarget) setDeleteCandidate(null); }}>
@@ -4657,7 +5164,7 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
               </div>
               <div className="mt-6 flex flex-wrap justify-end gap-2">
                 <Btn variant="secondary" onClick={() => setDeleteCandidate(null)}>Cancel</Btn>
-                <Btn variant="danger" onClick={confirmDeleteInvoice}><Trash2 size={14}/> Delete Invoice</Btn>
+                <Btn variant="danger" onClick={() => void confirmDeleteInvoice()}><Trash2 size={14}/> Delete Invoice</Btn>
               </div>
             </Card>
           </div>
@@ -4667,11 +5174,11 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
         <Card className="p-5 sm:p-6 max-w-5xl">
           <p className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">Status & Payment</p>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-            <SInp label="Status" value={inv.status} onChange={e => changeStatus(e.target.value as InvoiceStatus)}>
+            <SInp label="Status" value={inv.status} disabled={busy} onChange={e => void changeStatus(e.target.value as InvoiceStatus).catch(err => onShowToast(err instanceof Error ? err.message : "CrewQuote could not update the Invoice status.", "error"))}>
               {(Object.entries(INVOICE_STATUS) as [InvoiceStatus, { label: string; color: string }][]).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
             </SInp>
-            <Inp label="Paid Amount" type="number" min="0" value={String(inv.paidAmount || "")} onChange={e => savePatch({ paidAmount: safe(e.target.value, 0) })} />
-            <Inp label="Paid Date" type="date" value={inv.paidDate || ""} onChange={e => savePatch({ paidDate: e.target.value })} />
+            <Inp label="Paid Amount" type="number" min="0" value={String(inv.paidAmount || "")} readOnly />
+            <Inp label="Latest Paid Date" type="date" value={inv.paidDate || ""} readOnly />
             <div>
               <p className="text-xs font-bold text-gray-300 uppercase tracking-wider mb-1">Balance Due</p>
               <p className="text-sm font-semibold">{fmtMoney(balanceDue, inv.currency)}</p>
@@ -4682,6 +5189,21 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
             </div>
           </div>
           {isDraft && <p className="mt-4 text-sm text-slate-500">Use Edit to change invoice reference, PO number, dates, line items, expenses, payment terms, notes, or client billing details.</p>}
+          <div className="mt-6 border-t border-slate-100 pt-5">
+            <div className="flex flex-wrap items-center justify-between gap-2"><p className="text-xs font-bold uppercase tracking-wider text-gray-400">Payments</p><p className="text-xs text-slate-500">{(inv.payments || []).length} recorded</p></div>
+            {(inv.payments || []).length > 0 && <div className="mt-3 space-y-2">{(inv.payments || []).map(payment => <div key={payment.id} className="flex flex-col gap-2 rounded-lg border border-slate-200 p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div><p className="text-sm font-semibold text-slate-900">{fmtMoney(payment.amount, inv.currency)} · {fmtDate(payment.paymentDate)}</p><p className="text-xs text-slate-500">{[payment.method, payment.reference, payment.notes].filter(Boolean).join(" · ") || "No reference supplied"}</p></div>
+              <div className="flex gap-2"><Btn size="sm" variant="secondary" onClick={() => editPayment(payment)} disabled={busy}><Pencil size={13}/> Edit</Btn><Btn size="sm" variant="danger" onClick={() => void removePayment(payment)} disabled={busy}><Trash2 size={13}/> Delete</Btn></div>
+            </div>)}</div>}
+            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              <Inp label="Payment Amount" type="number" min="0.01" step="0.01" value={paymentDraft.amount} onChange={e => setPaymentDraft(current => ({ ...current, amount: e.target.value }))} />
+              <Inp label="Payment Date" type="date" value={paymentDraft.paymentDate} onChange={e => setPaymentDraft(current => ({ ...current, paymentDate: e.target.value }))} />
+              <Inp label="Method" value={paymentDraft.method} onChange={e => setPaymentDraft(current => ({ ...current, method: e.target.value }))} placeholder="EFT, cash, card..." />
+              <Inp label="Reference" value={paymentDraft.reference} onChange={e => setPaymentDraft(current => ({ ...current, reference: e.target.value }))} />
+              <Inp label="Payment Notes" value={paymentDraft.notes} onChange={e => setPaymentDraft(current => ({ ...current, notes: e.target.value }))} />
+              <div className="flex items-end gap-2"><Btn onClick={() => void savePayment()} disabled={busy}><Save size={14}/>{paymentDraft.id ? "Update Payment" : "Add Payment"}</Btn>{paymentDraft.id && <Btn variant="secondary" onClick={() => setPaymentDraft({ id: "", amount: "", paymentDate: todayStr(), method: "", reference: "", notes: "" })}>Cancel</Btn>}</div>
+            </div>
+          </div>
         </Card>
         </div>
 
@@ -4739,8 +5261,11 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
     <div className="space-y-5">
       <PageHeader
         title="Invoices"
-        description={`${(invoices||[]).length} invoice${(invoices||[]).length !== 1 ? "s" : ""}`}
+        description={`${(invoices||[]).length} invoice${(invoices||[]).length !== 1 ? "s" : ""} · ${cloudActive ? "Saved to CrewQuote account" : "Browser recovery mode"}`}
       />
+      {loading && <AlertBox type="info">Loading Invoices and Payments...</AlertBox>}
+      {loadError && <AlertBox type="error"><span>{loadError}</span> <button type="button" className="ml-2 font-bold underline" onClick={onRetry}>Retry</button></AlertBox>}
+      {busy && <AlertBox type="info">{busyMessage || "Saving Invoice..."}</AlertBox>}
       {sortedInvoices.length > 0 && (
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
           <MetricCard label="Outstanding" value={fmtMoney(outstandingTotal, summaryCurrency)} detail="Unpaid balances" icon={Receipt} tone="blue" />
@@ -4772,7 +5297,7 @@ function InvoicesPage({ invoices, timesheets, clients, profile, onSave, onSaveTi
 // LAYOUT
 // ═══════════════════════════════════════════════════════════════════════════
 
-const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings }];
+const NAV = [{ id:"timesheets",label:"Timesheets",icon:Clock },{ id:"clients",label:"Clients",icon:Users },{ id:"invoices",label:"Invoices",icon:Receipt },{ id:"settings",label:"Settings",icon:Settings },{ id:"account",label:"Account",icon:UserCircle }];
 
 type FeedbackType = "Bug" | "Calculation issue" | "Feature request" | "Confusing workflow" | "Other";
 
@@ -5056,7 +5581,184 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { error: Er
 // APP ROOT
 // ═══════════════════════════════════════════════════════════════════════════
 
+function Phase3MigrationPanel({ summary, busy, error, success, onImport, onDismiss }: {
+  summary: Phase3MigrationSummary;
+  busy: boolean;
+  error: string;
+  success: string;
+  onImport: () => void;
+  onDismiss?: () => void;
+}) {
+  return (
+    <Card className="p-5 sm:p-6 border-blue-200 bg-blue-50/40">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-base font-bold text-slate-950">Import browser data into your account?</p>
+          <p className="mt-1 max-w-3xl text-sm leading-relaxed text-slate-600">
+            CrewQuote found business settings and clients stored in this browser. Settings and clients will be copied into your account now. Existing browser Timesheets remain protected until reviewed migration; an account with no browser Timesheets uses Supabase immediately. Invoices remain browser-local.
+          </p>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+            <MetricCard label="Business settings" value={summary.businessSettingsFound ? "Yes" : "No"} detail="Account import" icon={Settings} tone="blue" />
+            <MetricCard label="Clients" value={summary.clientCount} detail="Bill-to records" icon={Users} tone="slate" />
+            <MetricCard label="Rate memories" value={summary.rateMemoryCount} detail="Client last-used rates" icon={Zap} tone="slate" />
+            <MetricCard label="Timesheets" value={summary.timesheetCount} detail={summary.timesheetCount ? "Await reviewed migration" : "Cloud account"} icon={Clock} tone="orange" />
+            <MetricCard label="Invoices" value={summary.invoiceCount} detail="Remain local" icon={Receipt} tone="orange" />
+          </div>
+          <p className="mt-4 text-sm leading-relaxed text-slate-600">
+            Existing browser data will not be deleted. CrewQuote will download a safety backup before cloud import starts and associate remaining local records in this browser with this account.
+          </p>
+          {error && <div className="mt-4"><AlertBox type="error">{error}</AlertBox></div>}
+          {success && <div className="mt-4"><AlertBox type="success">{success}</AlertBox></div>}
+        </div>
+        <div className="flex flex-shrink-0 flex-wrap gap-2 lg:justify-end">
+          <Btn onClick={onImport} disabled={busy}><Save size={14}/> {busy ? "Importing..." : "Import to My Account"}</Btn>
+          {onDismiss && <Btn variant="secondary" onClick={onDismiss} disabled={busy}>Not Now</Btn>}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+const PHASE4_STAGE_LABELS: Record<string, string> = {
+  preparing: "Preparing migration",
+  "creating-backup": "Creating safety backup",
+  validating: "Validating calculation snapshots",
+  "checking-previous": "Checking previous migration",
+  "resolving-clients": "Resolving clients",
+  "importing-timesheets": "Importing timesheets",
+  "importing-work-days": "Importing work days",
+  "importing-expenses": "Importing expenses",
+  verifying: "Verifying cloud records",
+  "updating-compatibility": "Updating local compatibility data",
+  complete: "Migration complete",
+  "already-migrated": "Already migrated",
+  failed: "Migration failed",
+};
+
+function Phase4MigrationPanel({ preflight, invoiceCount, paymentCount, busy, stage, counts, error, success, completed, confirming, onValidate, onOpenConfirmation, onCancelConfirmation, onStart }: {
+  preflight: Phase4MigrationPreflight | null;
+  invoiceCount: number;
+  paymentCount: number;
+  busy: boolean;
+  stage: string;
+  counts: { timesheets: number; timesheet_entries: number; day_expenses: number };
+  error: string;
+  success: string;
+  completed: boolean;
+  confirming: boolean;
+  onValidate: () => void;
+  onOpenConfirmation: () => void;
+  onCancelConfirmation: () => void;
+  onStart: () => void;
+}) {
+  const summary = preflight?.summary;
+  const progress = stage ? PHASE4_STAGE_LABELS[stage] || "Preparing migration" : "Review calculation snapshots before migration.";
+  return (
+    <div className="rounded-lg border border-blue-200 bg-blue-50/40 p-4">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-bold text-slate-950">Copy reviewed timesheets to your account</p>
+          <p className="mt-1 max-w-3xl text-sm leading-relaxed text-slate-600">This one-time action copies only reviewed browser-local Timesheets, work days, and day expenses. After verified migration, the normal Timesheets workspace switches to your CrewQuote account.</p>
+          {summary && <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-5">
+            <MetricCard label="Timesheets" value={summary.timesheetCount} detail="Reviewed records" icon={Clock} tone="blue" />
+            <MetricCard label="Work days" value={summary.entryCount} detail="Frozen values" icon={Zap} tone="slate" />
+            <MetricCard label="Expenses" value={summary.expenseCount} detail="Derived rows" icon={Receipt} tone="slate" />
+            <MetricCard label="Invoices" value={invoiceCount} detail="Remain local" icon={FileText} tone="orange" />
+            <MetricCard label="Payments" value={paymentCount} detail="Remain local" icon={Building2} tone="orange" />
+          </div>}
+          <p className="mt-4 text-sm font-medium text-slate-700">{progress}</p>
+          {busy && summary && <p className="mt-1 text-xs text-slate-500">Timesheets imported: {counts.timesheets} of {summary.timesheetCount} · Work days imported: {counts.timesheet_entries} of {summary.entryCount} · Expenses imported: {counts.day_expenses} of {summary.expenseCount}</p>}
+          {error && <div className="mt-3"><AlertBox type="error">{error}</AlertBox></div>}
+          {success && <div className="mt-3"><AlertBox type="success">{success}</AlertBox></div>}
+          {completed && !success && <div className="mt-3"><AlertBox type="success">This browser has a verified Phase 4 migration marker. The normal Timesheets workspace now loads from your CrewQuote account.</AlertBox></div>}
+          {confirming && summary && (
+            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+              <p className="font-bold">Start reviewed timesheet migration?</p>
+              <p className="mt-1 leading-relaxed">Your reviewed timesheets and work days will be copied to your CrewQuote account. A complete safety backup will download before migration begins. Invoices and payments will remain stored in this browser. Local source records will not be deleted.</p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Btn onClick={onStart} disabled={busy}><Save size={14}/> Start Migration</Btn>
+                <Btn variant="secondary" onClick={onCancelConfirmation} disabled={busy}>Cancel</Btn>
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="flex flex-shrink-0 flex-wrap gap-2 lg:justify-end">
+          {!completed && !confirming && <Btn variant="secondary" onClick={onValidate} disabled={busy}><CheckCircle size={14}/>{busy && stage === "preparing" ? "Checking..." : preflight ? "Recheck Readiness" : "Check Migration Readiness"}</Btn>}
+          {!completed && preflight && !confirming && <Btn onClick={onOpenConfirmation} disabled={busy}><Save size={14}/> Start Migration</Btn>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const PHASE5_STAGE_LABELS: Record<string, string> = {
+  preparing: "Preparing Invoice migration",
+  validating: "Validating saved Invoice records",
+  "creating-backup": "Creating complete safety backup",
+  "checking-previous": "Checking previous Invoice migration",
+  "resolving-relationships": "Resolving Clients and source Timesheets",
+  "importing-invoices": "Importing Invoice headers",
+  "importing-lines": "Importing Invoice lines",
+  "importing-payments": "Importing Payments",
+  verifying: "Verifying financial records and snapshots",
+  "updating-compatibility": "Updating owner-scoped compatibility data",
+  complete: "Invoice migration complete",
+  "already-migrated": "Invoice migration already verified",
+  failed: "Invoice migration failed",
+};
+
+function Phase5MigrationPanel({ preflight, busy, stage, counts, error, success, completed, confirming, onValidate, onOpenConfirmation, onCancelConfirmation, onStart }: {
+  preflight: Phase5MigrationPreflight | null;
+  busy: boolean;
+  stage: string;
+  counts: { invoices: number; invoice_lines: number; payments: number };
+  error: string;
+  success: string;
+  completed: boolean;
+  confirming: boolean;
+  onValidate: () => void;
+  onOpenConfirmation: () => void;
+  onCancelConfirmation: () => void;
+  onStart: () => void;
+}) {
+  const summary = preflight?.summary;
+  const progress = stage ? PHASE5_STAGE_LABELS[stage] || "Preparing Invoice migration" : "Review browser-local Invoices before migration.";
+  return (
+    <div className="rounded-lg border border-emerald-200 bg-emerald-50/40 p-4">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-bold text-slate-950">Copy Invoices and Payments to your account</p>
+          <p className="mt-1 max-w-3xl text-sm leading-relaxed text-slate-600">This confirmed action copies exact saved Invoice values, snapshots, lines, and Payments. It does not recalculate historical records. After verification, the normal Invoice workspace switches to Supabase.</p>
+          {summary && <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-6">
+            <MetricCard label="Invoices" value={summary.invoiceCount} detail="Saved headers" icon={FileText} tone="blue" />
+            <MetricCard label="Lines" value={summary.lineCount} detail="Exact saved lines" icon={Receipt} tone="slate" />
+            <MetricCard label="Payments" value={summary.paymentCount} detail="Stable IDs" icon={Building2} tone="green" />
+            <MetricCard label="Protected" value={summary.protectedCount} detail="Sent or locked" icon={CheckCircle} tone="orange" />
+            <MetricCard label="Paid" value={summary.paidCount} detail="Paid status" icon={CheckCircle} tone="green" />
+            <MetricCard label="Outstanding" value={fmtMoney(summary.outstandingTotal)} detail="Saved balances" icon={AlertTriangle} tone="red" />
+          </div>}
+          <p className="mt-4 text-sm font-medium text-slate-700">{progress}</p>
+          {busy && summary && <p className="mt-1 text-xs text-slate-500">Invoices: {counts.invoices} of {summary.invoiceCount} · Lines: {counts.invoice_lines} of {summary.lineCount} · Payments: {counts.payments} of {summary.paymentCount}</p>}
+          {error && <div className="mt-3"><AlertBox type="error">{error}</AlertBox></div>}
+          {success && <div className="mt-3"><AlertBox type="success">{success}</AlertBox></div>}
+          {completed && !success && <div className="mt-3"><AlertBox type="success">This browser has a verified Phase 5 marker. Invoices, lines, and Payments now load from your CrewQuote account.</AlertBox></div>}
+          {confirming && summary && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950">
+            <p className="font-bold">Start Invoice and Payment migration?</p>
+            <p className="mt-1 leading-relaxed">Your invoices and payments will be copied to your CrewQuote account. Existing totals, invoice numbers and PDF content will be preserved. A complete safety backup will download before migration begins. Business logos and the original browser records remain local.</p>
+            <div className="mt-3 flex flex-wrap gap-2"><Btn onClick={onStart} disabled={busy}><Save size={14}/> Start Invoice Migration</Btn><Btn variant="secondary" onClick={onCancelConfirmation} disabled={busy}>Cancel</Btn></div>
+          </div>}
+        </div>
+        <div className="flex flex-shrink-0 flex-wrap gap-2 lg:justify-end">
+          {!completed && !confirming && <Btn variant="secondary" onClick={onValidate} disabled={busy}><CheckCircle size={14}/>{busy && stage === "preparing" ? "Checking..." : preflight ? "Recheck Readiness" : "Check Migration Readiness"}</Btn>}
+          {!completed && preflight && !confirming && <Btn onClick={onOpenConfirmation} disabled={busy}><Save size={14}/> Start Invoice Migration</Btn>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function AppShell() {
+  const { signOut, user } = useAuth();
   const [page,       setPage]       = useState("timesheets");
   const [profile,    setProfile]    = useState<Profile>({ ...DEFAULT_PROFILE });
   const [clients,    setClients]    = useState<Client[]>([]);
@@ -5066,25 +5768,248 @@ function AppShell() {
   const [ready,      setReady]      = useState(false);
   const [toasts,     setToasts]     = useState<ToastMsg[]>([]);
   const [startupError, setStartupError] = useState("");
-  const [forceTestError, setForceTestError] = useState(false);
+  const [cloudError, setCloudError] = useState("");
+  const [cloudSavingSettings, setCloudSavingSettings] = useState(false);
+  const [cloudSavingClients, setCloudSavingClients] = useState(false);
+  const [ownerMismatch, setOwnerMismatch] = useState(false);
+  const [ownershipClaimRequired, setOwnershipClaimRequired] = useState(false);
+  const [migrationSummary, setMigrationSummary] = useState<Phase3MigrationSummary | null>(null);
+  const [migrationDismissed, setMigrationDismissed] = useState(false);
+  const [migrationBusy, setMigrationBusy] = useState(false);
+  const [migrationError, setMigrationError] = useState("");
+  const [migrationSuccess, setMigrationSuccess] = useState("");
+  const [phase4Preflight, setPhase4Preflight] = useState<Phase4MigrationPreflight | null>(null);
+  const [phase4Busy, setPhase4Busy] = useState(false);
+  const [phase4Stage, setPhase4Stage] = useState("");
+  const [phase4Counts, setPhase4Counts] = useState({ timesheets: 0, timesheet_entries: 0, day_expenses: 0 });
+  const [phase4Error, setPhase4Error] = useState("");
+  const [phase4Success, setPhase4Success] = useState("");
+  const [phase4Confirming, setPhase4Confirming] = useState(false);
+  const [phase5Preflight, setPhase5Preflight] = useState<Phase5MigrationPreflight | null>(null);
+  const [phase5Busy, setPhase5Busy] = useState(false);
+  const [phase5Stage, setPhase5Stage] = useState("");
+  const [phase5Counts, setPhase5Counts] = useState({ invoices: 0, invoice_lines: 0, payments: 0 });
+  const [phase5Error, setPhase5Error] = useState("");
+  const [phase5Success, setPhase5Success] = useState("");
+  const [phase5Confirming, setPhase5Confirming] = useState(false);
+  const [loadedOwnerUserId, setLoadedOwnerUserId] = useState("");
+  const [timesheetsCloudActive, setTimesheetsCloudActive] = useState(false);
+  const [timesheetsLoading, setTimesheetsLoading] = useState(true);
+  const [timesheetsError, setTimesheetsError] = useState("");
+  const [timesheetsBusy, setTimesheetsBusy] = useState(false);
+  const [timesheetsBusyMessage, setTimesheetsBusyMessage] = useState("");
+  const [hasLocalTimesheetMigrationSource, setHasLocalTimesheetMigrationSource] = useState(false);
+  const [invoicesCloudActive, setInvoicesCloudActive] = useState(false);
+  const [invoicesLoading, setInvoicesLoading] = useState(true);
+  const [invoicesError, setInvoicesError] = useState("");
+  const [invoicesBusy, setInvoicesBusy] = useState(false);
+  const [invoicesBusyMessage, setInvoicesBusyMessage] = useState("");
+  const [hasLocalInvoiceMigrationSource, setHasLocalInvoiceMigrationSource] = useState(false);
+  const [logoCloudActive, setLogoCloudActive] = useState(false);
+  const [showLogoMigrationNotice, setShowLogoMigrationNotice] = useState(false);
+  const [logoCloudError, setLogoCloudError] = useState("");
+  const cloudRequestGeneration = useRef(0);
+  const timesheetsMutationActive = useRef(false);
+  const invoicesMutationActive = useRef(false);
+  const activeUserIdRef = useRef(user?.id || "");
+  activeUserIdRef.current = user?.id || "";
 
-  useEffect(() => {
-    (async () => {
+  const loadCloudAwareData = useCallback(async () => {
+    if (!user?.id) return;
+    const requestedUserId = user.id;
+    const generation = ++cloudRequestGeneration.current;
+    const stale = () => generation !== cloudRequestGeneration.current || activeUserIdRef.current !== requestedUserId;
+    setReady(false);
+    setLoadedOwnerUserId("");
+    setProfile({ ...DEFAULT_PROFILE });
+    setClients([]);
+    setTimesheets([]);
+    setInvoices([]);
+    setOnboardingDismissed(false);
+    setStartupError("");
+    setCloudError("");
+    setTimesheetsError("");
+    setInvoicesError("");
+    setTimesheetsLoading(true);
+    setInvoicesLoading(true);
+    setTimesheetsCloudActive(false);
+    setInvoicesCloudActive(false);
+    setLogoCloudActive(false);
+    setShowLogoMigrationNotice(false);
+    setLogoCloudError("");
+    setHasLocalTimesheetMigrationSource(false);
+    setHasLocalInvoiceMigrationSource(false);
+    setOwnerMismatch(false);
+    setOwnershipClaimRequired(false);
+    try {
+      const localData = await loadStoredAppData();
+      if (stale()) return;
+      const localOwner = readLocalDataOwnerId();
+      setHasLocalTimesheetMigrationSource(localData.timesheets.length > 0);
+      setHasLocalInvoiceMigrationSource(localData.invoices.length > 0);
+      const hasPrivateLocalData = hasMeaningfulCrewQuoteData(localData);
+      if (hasPrivateLocalData && localOwner && localOwner !== requestedUserId) {
+        setMigrationSummary(null);
+        setOwnerMismatch(true);
+        return;
+      }
+      if (hasPrivateLocalData && !localOwner) {
+        setProfile(localData.profile);
+        setClients(localData.clients);
+        setTimesheets(localData.timesheets);
+        setInvoices(localData.invoices);
+        setOnboardingDismissed(localData.onboardingDismissed);
+        setMigrationSummary(null);
+        setOwnershipClaimRequired(true);
+        return;
+      }
+
+      const migrationWasCompleted = migrationCompletedForUser(requestedUserId);
+      const sourceSummary = summarizePhase3MigrationSource(localData);
+      const shouldHaveMigration = hasPhase3MigrationSource(localData) && !migrationWasCompleted;
+      if (shouldHaveMigration) {
+        setProfile(localData.profile);
+        setClients(localData.clients);
+        setInvoices(localData.invoices);
+        setOnboardingDismissed(localData.onboardingDismissed);
+        setMigrationSummary(sourceSummary);
+        setCloudError("");
+        if (localData.timesheets.length === 0) {
+          setTimesheetsCloudActive(true);
+          const cloudTimesheets = await listTimesheetsWithEntries();
+          if (stale()) return;
+          if (cloudTimesheets.error || !cloudTimesheets.data) {
+            setTimesheets([]);
+            setTimesheetsError(cloudTimesheets.error || "CrewQuote could not load Timesheets from Supabase.");
+          } else {
+            try {
+              const mapped = cloudTimesheets.data as Timesheet[];
+              writePhase4TimesheetMirror(requestedUserId, mapped);
+              setTimesheets(mapped);
+            } catch (err) {
+              setTimesheets([]);
+              setTimesheetsError(err instanceof Error ? err.message : "CrewQuote could not update the Timesheet compatibility mirror.");
+            }
+          }
+        } else {
+          setTimesheets(localData.timesheets);
+        }
+        return;
+      }
+
+      const phase4WasCompleted = phase4MigrationCompletedForUser(requestedUserId);
+      const shouldUseCloudTimesheets = localData.timesheets.length === 0
+        || (localOwner === requestedUserId && phase4WasCompleted);
+      setTimesheetsCloudActive(shouldUseCloudTimesheets);
+      const phase5WasCompleted = phase5MigrationCompletedForUser(requestedUserId);
+      const shouldUseCloudInvoices = localData.invoices.length === 0
+        || (localOwner === requestedUserId && phase5WasCompleted);
+      setInvoicesCloudActive(shouldUseCloudInvoices);
+
+      let nextProfile = localData.profile;
+      let nextClients = localData.clients;
+      let nextOnboardingDismissed = localData.onboardingDismissed;
+      let nextCloudError = "";
+
+      const [settingsResult, preferencesResult, clientsResult, timesheetsResult, invoicesResult, logoResult] = await Promise.all([
+        getCurrentBusinessSettings({ ...localData.profile, businessLogoDataUrl: localData.profile.businessLogoDataUrl || "" }),
+        getCurrentUserPreferences({ onboardingDismissed: localData.onboardingDismissed, uiPreferences: {} }),
+        listClients(),
+        shouldUseCloudTimesheets ? listTimesheetsWithEntries() : Promise.resolve({ data: localData.timesheets as CrewTimesheet[], error: null }),
+        shouldUseCloudInvoices ? listInvoicesWithLinesAndPayments(localData.invoices as CrewInvoice[]) : Promise.resolve({ data: localData.invoices as CrewInvoice[], error: null }),
+        loadBusinessLogo(),
+      ]);
+      if (stale()) return;
+
+      if (settingsResult.error) nextCloudError = settingsResult.error;
+      else if (settingsResult.data?.exists) nextProfile = settingsResult.data.profile as Profile;
+
+      if (logoResult.error) {
+        setLogoCloudError(logoResult.error);
+        nextCloudError = nextCloudError || logoResult.error;
+      } else if (logoResult.data) {
+        nextProfile = { ...nextProfile, businessLogoDataUrl: logoResult.data.dataUrl };
+        setLogoCloudActive(true);
+      } else if (localData.profile.businessLogoDataUrl && !logoKeptBrowserOnlyForUser(requestedUserId)) {
+        setShowLogoMigrationNotice(true);
+      }
+
+      if (preferencesResult.error) nextCloudError = nextCloudError || preferencesResult.error;
+      else if (preferencesResult.data?.exists) nextOnboardingDismissed = preferencesResult.data.preferences.onboardingDismissed;
+
+      if (clientsResult.error) nextCloudError = nextCloudError || clientsResult.error;
+      else if (clientsResult.data && (clientsResult.data.length > 0 || migrationWasCompleted)) nextClients = clientsResult.data as Client[];
+
+      setProfile(nextProfile);
+      setClients(nextClients);
+      setOnboardingDismissed(nextOnboardingDismissed);
+
+      if (shouldUseCloudTimesheets) {
+        if (timesheetsResult.error || !timesheetsResult.data) {
+          setTimesheets([]);
+          setTimesheetsError(timesheetsResult.error || "CrewQuote could not load Timesheets from Supabase.");
+        } else {
+          try {
+            const mapped = timesheetsResult.data as Timesheet[];
+            writePhase4TimesheetMirror(requestedUserId, mapped);
+            setTimesheets(mapped);
+          } catch (err) {
+            setTimesheets([]);
+            setTimesheetsError(err instanceof Error ? err.message : "CrewQuote could not update the Timesheet compatibility mirror.");
+          }
+        }
+      } else {
+        setTimesheets(localData.timesheets);
+      }
+
+      if (shouldUseCloudInvoices) {
+        if (invoicesResult.error || !invoicesResult.data) {
+          setInvoices([]);
+          setInvoicesError(invoicesResult.error || "CrewQuote could not load Invoices and Payments from Supabase.");
+        } else {
+          try {
+            const mapped = invoicesResult.data.map(invoice => normalizeInvoice(invoice as Invoice));
+            writePhase5InvoiceMirror(requestedUserId, mapped);
+            setInvoices(mapped);
+          } catch (err) {
+            setInvoices([]);
+            setInvoicesError(err instanceof Error ? err.message : "CrewQuote could not update the Invoice compatibility mirror.");
+          }
+        }
+      } else {
+        setInvoices(localData.invoices);
+      }
+
       try {
-        const data = await loadStoredAppData();
-        setProfile(data.profile);
-        setClients(data.clients);
-        setTimesheets(data.timesheets);
-        setInvoices(data.invoices);
-        setOnboardingDismissed(data.onboardingDismissed);
-        try { Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION); } catch {}
+        Store.set(STORAGE_KEYS.dataVersion, CURRENT_DATA_VERSION);
+        if (settingsResult.data?.exists) Store.set(STORAGE_KEYS.profile, nextProfile);
+        if (clientsResult.data && (clientsResult.data.length > 0 || migrationWasCompleted)) Store.set(STORAGE_KEYS.clients, nextClients);
+        if (preferencesResult.data?.exists) Store.set(STORAGE_KEYS.onboardingDismissed, nextOnboardingDismissed);
       } catch (err) {
-        setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
-      } finally {
+        nextCloudError = nextCloudError || (err instanceof Error ? err.message : "CrewQuote could not refresh the local compatibility cache.");
+      }
+
+      setMigrationSummary(null);
+      setCloudError(nextCloudError);
+      setPhase4Preflight(null);
+      setPhase4Confirming(false);
+      setPhase5Preflight(null);
+      setPhase5Confirming(false);
+    } catch (err) {
+      if (!stale()) setStartupError(err instanceof Error ? err.message : "CrewQuote could not load saved browser data.");
+    } finally {
+      if (!stale()) {
+        setTimesheetsLoading(false);
+        setInvoicesLoading(false);
+        setLoadedOwnerUserId(requestedUserId);
         setReady(true);
       }
-    })();
-  }, []);
+    }
+  }, [user?.id]);
+
+  useEffect(() => {
+    void loadCloudAwareData();
+  }, [loadCloudAwareData]);
 
   const showToast = useCallback((msg: string, type: ToastType = "success") => {
     const id = uid();
@@ -5115,57 +6040,615 @@ function AppShell() {
     }
   }, [showToast]);
 
-  const saveProfile    = (p: Profile)     => { persistValue(STORAGE_KEYS.profile,    p, setProfile, true); };
-  const saveClients    = (c: Client[])    => { persistValue(STORAGE_KEYS.clients,    c, setClients); };
-  const saveTimesheets = (t: Timesheet[]) => { persistValue(STORAGE_KEYS.timesheets, t, setTimesheets); };
-  const saveInvoices   = (i: Invoice[])   => { persistValue(STORAGE_KEYS.invoices,   i, setInvoices); };
-  const addInvoice     = (inv: Invoice)   => {
-    const normalized = normalizeInvoice(inv);
-    const next = [...invoices, normalized];
-    saveInvoices(next);
-    saveProfile(rememberInvoiceNumber(profile, normalized.invoiceNumber));
-  };
-  const dismissOnboarding = () => {
-    persistValue(STORAGE_KEYS.onboardingDismissed, true, setOnboardingDismissed);
-  };
-  const exportBackup = () => {
+  const rememberLocalOwner = useCallback(() => {
+    if (user?.id) claimLocalDataOwner(user.id);
+  }, [user?.id]);
+
+  const saveProfile = useCallback(async (p: Profile) => {
+    setCloudSavingSettings(true);
+    setCloudError("");
     try {
-      downloadBackup(currentAppData);
+      const result = await saveCurrentBusinessSettings(p, { ...profile, businessLogoDataUrl: p.businessLogoDataUrl });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not save business settings to your account.");
+      const savedProfile = { ...(result.data as Profile), businessLogoDataUrl: p.businessLogoDataUrl };
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.profile, savedProfile, setProfile, true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "CrewQuote could not save business settings to your account.";
+      setCloudError(msg);
+      throw new Error(msg);
+    } finally {
+      setCloudSavingSettings(false);
+    }
+  }, [persistValue, profile, rememberLocalOwner]);
+
+  const uploadLogoToCloud = useCallback(async (dataUrl: string) => {
+    if (!user?.id) throw new Error("Your CrewQuote session has expired. Please sign in again.");
+    const requestOwnerId = user.id;
+    preserveBrowserLogoRecovery(requestOwnerId, profile.businessLogoDataUrl || dataUrl);
+    const result = await migrateLocalBusinessLogo(dataUrl);
+    if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not upload the business logo.");
+    if (activeUserIdRef.current !== requestOwnerId) throw new Error("The signed-in account changed before the logo upload completed.");
+    const nextProfile = { ...profile, businessLogoDataUrl: result.data.dataUrl };
+    rememberLocalOwner();
+    if (!persistValue(STORAGE_KEYS.profile, nextProfile, setProfile)) setProfile(nextProfile);
+    setLogoCloudActive(true);
+    setShowLogoMigrationNotice(false);
+    setLogoCloudError("");
+    if (result.data.cleanupWarning) showToast(result.data.cleanupWarning, "error");
+    return result.data.dataUrl;
+  }, [persistValue, profile, rememberLocalOwner, showToast, user?.id]);
+
+  const removeLogoFromCloud = useCallback(async () => {
+    if (!user?.id) throw new Error("Your CrewQuote session has expired. Please sign in again.");
+    const requestOwnerId = user.id;
+    preserveBrowserLogoRecovery(requestOwnerId, profile.businessLogoDataUrl);
+    const result = await removeBusinessLogo();
+    if (result.error) throw new Error(result.error);
+    if (activeUserIdRef.current !== requestOwnerId) throw new Error("The signed-in account changed before the logo removal completed.");
+    const nextProfile = { ...profile, businessLogoDataUrl: "" };
+    rememberLocalOwner();
+    if (!persistValue(STORAGE_KEYS.profile, nextProfile, setProfile)) setProfile(nextProfile);
+    setLogoCloudActive(false);
+    setShowLogoMigrationNotice(false);
+    setLogoCloudError("");
+  }, [persistValue, profile, rememberLocalOwner, user?.id]);
+
+  const keepLogoBrowserOnly = useCallback(() => {
+    if (!user?.id) return;
+    try {
+      preserveBrowserLogoRecovery(user.id, profile.businessLogoDataUrl);
+      markLogoKeptBrowserOnlyForUser(user.id);
+      setShowLogoMigrationNotice(false);
+      showToast("The logo will remain in this browser only. You can upload it later from Invoice settings.", "success");
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : "CrewQuote could not retain the browser-only logo choice.", "error");
+    }
+  }, [profile.businessLogoDataUrl, showToast, user?.id]);
+
+  const saveClients = useCallback(async (nextClientsInput: Client[]) => {
+    const nextClients = nextClientsInput.map(client => normalizeClient(client));
+    const previousById = new Map(clients.map(client => [client.id, client]));
+    const nextById = new Map(nextClients.map(client => [client.id, client]));
+    const removed = clients.find(client => !nextById.has(client.id));
+    const added = nextClients.find(client => !previousById.has(client.id));
+    const updated = nextClients.find(client => {
+      const previous = previousById.get(client.id);
+      return previous ? JSON.stringify(previous) !== JSON.stringify(client) : false;
+    });
+
+    if (!removed && !added && !updated) {
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.clients, nextClients, setClients);
+      return;
+    }
+
+    setCloudSavingClients(true);
+    setCloudError("");
+    try {
+      const result = removed
+        ? await deleteCloudClient(removed.id)
+        : added
+          ? await upsertCloudClient(added)
+          : await updateCloudClient(updated as Client);
+      if (result.error) throw new Error(result.error);
+
+      const refreshed = await listClients();
+      if (refreshed.error || !refreshed.data) throw new Error(refreshed.error || "CrewQuote could not refresh clients from your account.");
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.clients, refreshed.data as Client[], setClients, true);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "CrewQuote could not save clients to your account.";
+      setCloudError(msg);
+      throw new Error(msg);
+    } finally {
+      setCloudSavingClients(false);
+    }
+  }, [clients, persistValue, rememberLocalOwner]);
+
+  const saveTimesheets = useCallback(async (nextTimesheets: Timesheet[]) => {
+    if (!timesheetsCloudActive) {
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.timesheets, nextTimesheets, setTimesheets, true);
+      return;
+    }
+    if (!user?.id) throw new Error("Your CrewQuote session has expired. Please sign in again.");
+    if (timesheetsMutationActive.current) throw new Error("CrewQuote is already updating Timesheets. Please wait for it to finish.");
+
+    const requestOwnerId = user.id;
+    const assertRequestOwner = () => {
+      if (activeUserIdRef.current !== requestOwnerId) throw new Error("The signed-in account changed before the Timesheet request completed.");
+    };
+    const previousById = new Map(timesheets.map(sheet => [sheet.id, sheet]));
+    const nextById = new Map(nextTimesheets.map(sheet => [sheet.id, sheet]));
+    const removedSheets = timesheets.filter(sheet => !nextById.has(sheet.id));
+    const addedSheets = nextTimesheets.filter(sheet => !previousById.has(sheet.id));
+    const changedSheets = nextTimesheets.filter(sheet => {
+      const previous = previousById.get(sheet.id);
+      return previous ? JSON.stringify(previous) !== JSON.stringify(sheet) : false;
+    });
+    if (!removedSheets.length && !addedSheets.length && !changedSheets.length) return;
+
+    timesheetsMutationActive.current = true;
+    setTimesheetsBusy(true);
+    setTimesheetsError("");
+    try {
+      let sourceProtectionInvoices = invoices;
+      if (invoicesCloudActive && (removedSheets.length || changedSheets.some(sheet => {
+        const previous = previousById.get(sheet.id);
+        return Boolean(previous && previous.entries.some(entry => !sheet.entries.some(next => next.id === entry.id)));
+      }))) {
+        const protectedRecords = await listInvoicesWithLinesAndPayments();
+        if (protectedRecords.error || !protectedRecords.data) throw new Error(protectedRecords.error || "CrewQuote could not verify cloud Invoice source protection.");
+        sourceProtectionInvoices = protectedRecords.data as Invoice[];
+        assertRequestOwner();
+      }
+      for (const sheet of removedSheets) {
+        const linked = sourceProtectionInvoices.find(invoice => invoice.fromTimesheetId === sheet.id || invoice.id === sheet.invoiceId);
+        if (linked) throw new Error(`Timesheet ${sheet.timesheetNumber} cannot be deleted because invoice ${linked.invoiceNumber || "not numbered"} depends on it.`);
+        setTimesheetsBusyMessage("Deleting Timesheet...");
+        const result = await deleteCloudTimesheet(sheet.id);
+        if (result.error) throw new Error(result.error);
+        assertRequestOwner();
+      }
+
+      for (const sheet of addedSheets) {
+        setTimesheetsBusyMessage("Saving Timesheet...");
+        const effectiveProfile = calculationProfileForTimesheet(profile, sheet);
+        const calculatedEntries = calcSummary(sheet.entries || [], effectiveProfile);
+        const prepared = {
+          ...sheet,
+          entries: calculatedEntries.calcs.map(({ entry, c }) => withEntrySnapshots({ ...(entry as TimesheetEntry), calcSnapshot: c }, effectiveProfile)),
+          summarySnapshot: calculatedEntries,
+        };
+        const created = await createCloudTimesheet(prepared as CrewTimesheet, summaryToDatabasePayload(calculatedEntries));
+        if (created.error) throw new Error(created.error);
+        assertRequestOwner();
+        if (prepared.entries.length) {
+          const cloudId = await getTimesheetCloudId(prepared.id);
+          if (cloudId.error || !cloudId.data) throw new Error(cloudId.error || "CrewQuote could not resolve the saved Timesheet.");
+          for (let index = 0; index < prepared.entries.length; index += 1) {
+            const entry = prepared.entries[index];
+            const saved = await saveCloudEntry(entry as CrewTimesheetEntry, cloudId.data, index);
+            if (saved.error) throw new Error(saved.error);
+            const entryCloudId = await getEntryCloudId(entry.id);
+            if (entryCloudId.error || !entryCloudId.data) throw new Error(entryCloudId.error || "CrewQuote could not resolve the saved work day.");
+            const expense = await saveEntryExpense(entry, entryCloudId.data);
+            if (expense.error) throw new Error(expense.error);
+          }
+        }
+      }
+
+      for (const sheet of changedSheets) {
+        const previous = previousById.get(sheet.id)!;
+        const previousEntries = new Map((previous.entries || []).map(entry => [entry.id, entry]));
+        const nextEntries = new Map((sheet.entries || []).map(entry => [entry.id, entry]));
+        const removedEntries = (previous.entries || []).filter(entry => !nextEntries.has(entry.id));
+        const changedEntries = (sheet.entries || []).filter(entry => {
+          const prior = previousEntries.get(entry.id);
+          return !prior || JSON.stringify(prior) !== JSON.stringify(entry);
+        });
+        const { entries: _previousEntries, summarySnapshot: _previousSummary, ...previousHeader } = previous;
+        const { entries: _nextEntries, summarySnapshot: _nextSummary, ...nextHeader } = sheet;
+        const headerChanged = JSON.stringify(previousHeader) !== JSON.stringify(nextHeader);
+        void _previousEntries; void _previousSummary; void _nextEntries; void _nextSummary;
+
+        if (removedEntries.length) {
+          const linked = sourceProtectionInvoices.find(invoice => invoice.fromTimesheetId === sheet.id || invoice.id === sheet.invoiceId || removedEntries.some(entry => invoiceReferencesEntry(invoice, entry.id)));
+          if (linked) throw new Error(`A work day cannot be deleted because invoice ${linked.invoiceNumber || "not numbered"} depends on Timesheet ${sheet.timesheetNumber}.`);
+        }
+
+        const effectiveProfile = calculationProfileForTimesheet(profile, sheet);
+        const preSaveSummary = calcSummary(sheet.entries || [], effectiveProfile);
+        const calcByEntryId = new Map(preSaveSummary.calcs.map(({ entry, c }) => [entry.id, c]));
+        const timesheetCloudId = changedEntries.length
+          ? await getTimesheetCloudId(sheet.id)
+          : null;
+        if (timesheetCloudId?.error || (timesheetCloudId && !timesheetCloudId.data)) throw new Error(timesheetCloudId?.error || "CrewQuote could not resolve the Timesheet.");
+
+        for (const entry of changedEntries) {
+          setTimesheetsBusyMessage("Saving work day...");
+          const calculation = calcByEntryId.get(entry.id);
+          const preparedEntry = withEntrySnapshots({ ...entry, calcSnapshot: calculation || entry.calcSnapshot }, effectiveProfile);
+          const order = (sheet.entries || []).findIndex(candidate => candidate.id === entry.id);
+          const saved = await saveCloudEntry(preparedEntry as CrewTimesheetEntry, timesheetCloudId!.data!, Math.max(order, 0));
+          if (saved.error) throw new Error(saved.error);
+          assertRequestOwner();
+          const entryCloudId = await getEntryCloudId(entry.id);
+          if (entryCloudId.error || !entryCloudId.data) throw new Error(entryCloudId.error || "CrewQuote could not resolve the saved work day.");
+          setTimesheetsBusyMessage(num(entry.expenses) > 0 ? "Updating expense..." : "Removing expense...");
+          const expense = await saveEntryExpense(preparedEntry, entryCloudId.data);
+          if (expense.error) throw new Error(expense.error);
+          assertRequestOwner();
+        }
+
+        for (const entry of removedEntries) {
+          setTimesheetsBusyMessage("Deleting work day...");
+          const deleted = await deleteCloudEntry(entry.id);
+          if (deleted.error) throw new Error(deleted.error);
+          assertRequestOwner();
+        }
+
+        if (changedEntries.length || removedEntries.length) {
+          setTimesheetsBusyMessage("Updating Timesheet summary...");
+          const reread = await listTimesheetsWithEntries();
+          if (reread.error || !reread.data) throw new Error(reread.error || "CrewQuote could not re-read saved work days.");
+          assertRequestOwner();
+          const savedSheet = reread.data.find(candidate => candidate.id === sheet.id);
+          if (!savedSheet) throw new Error(`CrewQuote could not re-read Timesheet ${sheet.timesheetNumber}.`);
+          const completeSheet = { ...sheet, entries: savedSheet.entries, createdAt: savedSheet.createdAt } as Timesheet;
+          const savedSummary = calcSummary(completeSheet.entries || [], calculationProfileForTimesheet(profile, completeSheet));
+          const summaryUpdate = await updateCloudTimesheet({ ...completeSheet, summarySnapshot: savedSummary } as CrewTimesheet, summaryToDatabasePayload(savedSummary));
+          if (summaryUpdate.error) throw new Error(summaryUpdate.error);
+          assertRequestOwner();
+        } else if (headerChanged) {
+          setTimesheetsBusyMessage("Saving Timesheet...");
+          const updated = await updateCloudTimesheet({ ...sheet, summarySnapshot: preSaveSummary } as CrewTimesheet, summaryToDatabasePayload(preSaveSummary));
+          if (updated.error) throw new Error(updated.error);
+          assertRequestOwner();
+        }
+      }
+
+      setTimesheetsBusyMessage("Loading Timesheet details...");
+      const refreshed = await listTimesheetsWithEntries();
+      if (refreshed.error || !refreshed.data) throw new Error(refreshed.error || "CrewQuote could not refresh Timesheets from your account.");
+      assertRequestOwner();
+      const mapped = refreshed.data as Timesheet[];
+      writePhase4TimesheetMirror(requestOwnerId, mapped);
+      assertRequestOwner();
+      setTimesheets(mapped);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "CrewQuote could not update Timesheets in your account.";
+      setTimesheetsError(message);
+      throw new Error(message);
+    } finally {
+      if (activeUserIdRef.current === requestOwnerId) {
+        setTimesheetsBusy(false);
+        setTimesheetsBusyMessage("");
+      }
+      timesheetsMutationActive.current = false;
+    }
+  }, [invoices, invoicesCloudActive, persistValue, profile, rememberLocalOwner, timesheets, timesheetsCloudActive, user?.id]);
+
+  const saveInvoices = useCallback(async (nextInput: Invoice[]) => {
+    const nextInvoices = nextInput.map(normalizeInvoice);
+    if (!invoicesCloudActive) {
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.invoices, nextInvoices, setInvoices, true);
+      return;
+    }
+    if (!user?.id) throw new Error("Your CrewQuote session has expired. Please sign in again.");
+    if (invoicesMutationActive.current) throw new Error("CrewQuote is already updating Invoices. Please wait for it to finish.");
+    const requestOwnerId = user.id;
+    const assertRequestOwner = () => { if (activeUserIdRef.current !== requestOwnerId) throw new Error("The signed-in account changed before the Invoice request completed."); };
+    const previousById = new Map(invoices.map(invoice => [invoice.id, invoice]));
+    const nextById = new Map(nextInvoices.map(invoice => [invoice.id, invoice]));
+    const removed = invoices.filter(invoice => !nextById.has(invoice.id));
+    const added = nextInvoices.filter(invoice => !previousById.has(invoice.id));
+    const changed = nextInvoices.filter(invoice => { const previous = previousById.get(invoice.id); return previous ? JSON.stringify(previous) !== JSON.stringify(invoice) : false; });
+    if (!removed.length && !added.length && !changed.length) return;
+    invoicesMutationActive.current = true;
+    setInvoicesBusy(true);
+    setInvoicesError("");
+    try {
+      for (const invoice of removed) {
+        setInvoicesBusyMessage("Deleting Invoice and related records...");
+        const result = await deleteCloudInvoice(invoice.id); if (result.error) throw new Error(result.error); assertRequestOwner();
+      }
+      for (const invoice of added) {
+        setInvoicesBusyMessage("Saving Invoice, lines, and Payments...");
+        const result = await createCloudInvoice(invoice as CrewInvoice); if (result.error) throw new Error(result.error); assertRequestOwner();
+      }
+      for (const invoice of changed) {
+        setInvoicesBusyMessage("Updating Invoice, lines, and Payments...");
+        const result = await updateCloudInvoice(invoice as CrewInvoice); if (result.error) throw new Error(result.error); assertRequestOwner();
+      }
+      setInvoicesBusyMessage("Loading saved Invoices and Payments...");
+      const recovery = appDataFromRawStorage(false).invoices as CrewInvoice[];
+      const refreshed = await listInvoicesWithLinesAndPayments(recovery); if (refreshed.error || !refreshed.data) throw new Error(refreshed.error || "CrewQuote could not refresh Invoices from your account."); assertRequestOwner();
+      const mapped = refreshed.data.map(invoice => normalizeInvoice(invoice as Invoice));
+      let refreshedTimesheets: Timesheet[] | null = null;
+      if (removed.length && timesheetsCloudActive) {
+        setInvoicesBusyMessage("Reconciling source Timesheets...");
+        const timesheetResult = await listTimesheetsWithEntries();
+        if (timesheetResult.error || !timesheetResult.data) throw new Error(timesheetResult.error || "The Invoice was deleted, but CrewQuote could not re-read source Timesheets. Retry before treating the deletion as complete.");
+        assertRequestOwner();
+        refreshedTimesheets = timesheetResult.data as Timesheet[];
+      }
+      writePhase5InvoiceMirror(requestOwnerId, mapped);
+      if (refreshedTimesheets) writePhase4TimesheetMirror(requestOwnerId, refreshedTimesheets);
+      assertRequestOwner();
+      setInvoices(mapped);
+      if (refreshedTimesheets) {
+        setTimesheets(refreshedTimesheets);
+        setTimesheetsError("");
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "CrewQuote could not update Invoices in your account.";
+      setInvoicesError(message);
+      throw new Error(message);
+    } finally {
+      if (activeUserIdRef.current === requestOwnerId) { setInvoicesBusy(false); setInvoicesBusyMessage(""); }
+      invoicesMutationActive.current = false;
+    }
+  }, [invoices, invoicesCloudActive, persistValue, rememberLocalOwner, timesheetsCloudActive, user?.id]);
+
+  const addInvoice = useCallback(async (inv: Invoice) => {
+    const normalized = normalizeInvoice(inv);
+    await saveInvoices(invoices.some(existing => existing.id === normalized.id)
+      ? invoices.map(existing => existing.id === normalized.id ? normalized : existing)
+      : [...invoices, normalized]);
+    await saveProfile(rememberInvoiceNumber(profile, normalized.invoiceNumber));
+  }, [invoices, profile, saveInvoices, saveProfile]);
+  const dismissOnboarding = () => {
+    void (async () => {
+      const result = await saveCurrentUserPreferences({ onboardingDismissed: true, uiPreferences: {} });
+      if (result.error) {
+        setCloudError(result.error);
+        showToast(result.error, "error");
+        return;
+      }
+      rememberLocalOwner();
+      persistValue(STORAGE_KEYS.onboardingDismissed, true, setOnboardingDismissed);
+    })();
+  };
+  const exportBackup = async () => {
+    try {
+      const result = await buildPhase4CloudBackupData(currentAppData, timesheetsCloudActive, invoicesCloudActive);
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not assemble a complete current backup.");
+      const storedBrowserLogo = user?.id ? readBrowserLogoRecovery(user.id) : "";
+      const browserLogoRecovery = storedBrowserLogo || (!logoCloudActive ? appDataFromRawStorage(false).profile.businessLogoDataUrl : "");
+      const calculationSnapshots = user?.id
+        ? { ownerUserId: user.id, records: readCalculationSnapshots(user.id) }
+        : undefined;
+      downloadBackup(
+        result.data.appData as AppData,
+        "crewquote-backup",
+        calculationSnapshots,
+        user?.id ? {
+          localOwnerUserId: readLocalDataOwnerId(),
+          phase4MigrationFingerprint: phase4MigrationFingerprintForUser(user.id),
+          phase3MigrationCompleted: migrationCompletedForUser(user.id),
+          phase4MigrationAlreadyCompleted: phase4MigrationCompletedForUser(user.id),
+          phase5MigrationFingerprint: phase5MigrationFingerprintForUser(user.id),
+          phase5MigrationAlreadyCompleted: phase5MigrationCompletedForUser(user.id),
+          invoiceRecovery: invoicesCloudActive ? appDataFromRawStorage(false).invoices : undefined,
+          businessLogoRecovery: browserLogoRecovery ? { ownerUserId: user.id, dataUrl: browserLogoRecovery } : undefined,
+          cloudRecovery: result.data.cloudRecovery,
+        } : undefined,
+      );
       showToast("Backup exported", "success");
     } catch (err) {
       showToast(err instanceof Error ? err.message : "CrewQuote could not export a backup.", "error");
     }
   };
-  const importBackup = (data: AppData) => {
-    const previousRaw = readCrewQuoteStorageRaw();
+
+  const runPhase4Preflight = useCallback(async () => {
+    if (!user?.id) return;
+    setPhase4Busy(true);
+    setPhase4Stage("preparing");
+    setPhase4Counts({ timesheets: 0, timesheet_entries: 0, day_expenses: 0 });
+    setPhase4Error("");
+    setPhase4Success("");
+    setPhase4Confirming(false);
     try {
-      downloadBackup(currentAppData, "crewquote-emergency-backup");
+      const result = await preflightPhase4TimesheetMigration({
+        ownerUserId: readLocalDataOwnerId(),
+        authenticatedUserId: user.id,
+        localTimesheets: timesheets as CrewTimesheet[],
+        storedSnapshots: readCalculationSnapshots(user.id),
+        invoiceCount: invoices.length,
+      });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not validate the reviewed timesheets.");
+      setPhase4Preflight(result.data);
+      setPhase4Stage("validating");
     } catch (err) {
-      throw new Error(err instanceof Error ? `Import cancelled because CrewQuote could not create the emergency backup: ${err.message}` : "Import cancelled because CrewQuote could not create the emergency backup.");
+      setPhase4Preflight(null);
+      setPhase4Stage("failed");
+      setPhase4Error(err instanceof Error ? err.message : "CrewQuote could not validate the reviewed timesheets.");
+    } finally {
+      setPhase4Busy(false);
     }
+  }, [invoices.length, timesheets, user?.id]);
+
+  const runPhase4Migration = useCallback(async () => {
+    if (!user?.id || !phase4Preflight) return;
+    setPhase4Busy(true);
+    setPhase4Stage("creating-backup");
+    setPhase4Error("");
+    setPhase4Success("");
     try {
-      writeAppDataToStorage(data);
-      setProfile(data.profile);
-      setClients(data.clients);
-      setTimesheets(data.timesheets);
-      setInvoices(data.invoices);
-      setOnboardingDismissed(data.onboardingDismissed);
-      showToast("Backup imported successfully. Reloading CrewQuote...", "success");
-      setTimeout(() => window.location.reload(), 700);
+      const refreshedPreflight = await preflightPhase4TimesheetMigration({
+        ownerUserId: readLocalDataOwnerId(),
+        authenticatedUserId: user.id,
+        localTimesheets: timesheets as CrewTimesheet[],
+        storedSnapshots: readCalculationSnapshots(user.id),
+        invoiceCount: invoices.length,
+      });
+      if (refreshedPreflight.error || !refreshedPreflight.data) throw new Error(refreshedPreflight.error || "CrewQuote could not revalidate the reviewed timesheets.");
+      if (refreshedPreflight.data.fingerprint !== phase4Preflight.fingerprint) {
+        setPhase4Preflight(refreshedPreflight.data);
+        throw new Error("A local timesheet or confirmed calculation changed after readiness was checked. Review the updated record, then confirm migration again.");
+      }
+      const completeBackup = await buildPhase4CloudBackupData(currentAppData);
+      if (completeBackup.error || !completeBackup.data) throw new Error(completeBackup.error || "CrewQuote could not create the complete safety backup.");
+      const snapshots = { ownerUserId: user.id, records: readCalculationSnapshots(user.id) };
+      downloadBackup(
+        completeBackup.data.appData as AppData,
+        "crewquote-pre-phase4-timesheet-migration-backup",
+        snapshots,
+        {
+          localOwnerUserId: readLocalDataOwnerId(),
+          phase4MigrationFingerprint: phase4Preflight.fingerprint,
+          phase3MigrationCompleted: migrationCompletedForUser(user.id),
+          phase4MigrationAlreadyCompleted: phase4MigrationCompletedForUser(user.id),
+          cloudRecovery: completeBackup.data.cloudRecovery,
+        },
+      );
+      const result = await migratePreparedTimesheets(
+        refreshedPreflight.data.records,
+        APP_VERSION,
+        CURRENT_DATA_VERSION,
+        (stage: Phase4MigrationStage, counts) => { setPhase4Stage(stage); setPhase4Counts(counts); },
+      );
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not migrate the reviewed timesheets.");
+      setPhase4Confirming(false);
+      setPhase4Success(result.data.alreadyCompleted
+        ? "Already migrated. CrewQuote verified the reviewed cloud records and refreshed the local compatibility data."
+        : `Migration complete. Copied ${result.data.counts.timesheets} timesheet${result.data.counts.timesheets === 1 ? "" : "s"}, ${result.data.counts.timesheet_entries} work day${result.data.counts.timesheet_entries === 1 ? "" : "s"}, and ${result.data.counts.day_expenses} day expense${result.data.counts.day_expenses === 1 ? "" : "s"}.`);
+      await loadCloudAwareData();
     } catch (err) {
-      try { restoreCrewQuoteStorageRaw(previousRaw); } catch {}
-      throw new Error(err instanceof Error ? `Import failed and your previous data was restored: ${err.message}` : "Import failed and your previous data was restored.");
+      setPhase4Stage("failed");
+      setPhase4Error(err instanceof Error ? err.message : "CrewQuote could not migrate the reviewed timesheets.");
+    } finally {
+      setPhase4Busy(false);
     }
+  }, [currentAppData, invoices.length, loadCloudAwareData, phase4Preflight, timesheets, user?.id]);
+
+  const runPhase5Preflight = useCallback(async () => {
+    if (!user?.id) return;
+    setPhase5Busy(true); setPhase5Stage("preparing"); setPhase5Counts({ invoices: 0, invoice_lines: 0, payments: 0 }); setPhase5Error(""); setPhase5Success(""); setPhase5Confirming(false);
+    try {
+      const localInvoices = appDataFromRawStorage(false).invoices;
+      const result = await preflightPhase5InvoiceMigration({ ownerUserId: readLocalDataOwnerId(), authenticatedUserId: user.id, localInvoices: localInvoices as CrewInvoice[] });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not validate browser-local Invoices.");
+      setPhase5Preflight(result.data); setPhase5Stage("validating");
+    } catch (err) {
+      setPhase5Preflight(null); setPhase5Stage("failed"); setPhase5Error(err instanceof Error ? err.message : "CrewQuote could not validate browser-local Invoices.");
+    } finally { setPhase5Busy(false); }
+  }, [user?.id]);
+
+  const runPhase5Migration = useCallback(async () => {
+    if (!user?.id || !phase5Preflight) return;
+    setPhase5Busy(true); setPhase5Stage("creating-backup"); setPhase5Error(""); setPhase5Success("");
+    try {
+      const localInvoices = appDataFromRawStorage(false).invoices;
+      const refreshed = await preflightPhase5InvoiceMigration({ ownerUserId: readLocalDataOwnerId(), authenticatedUserId: user.id, localInvoices: localInvoices as CrewInvoice[] });
+      if (refreshed.error || !refreshed.data) throw new Error(refreshed.error || "CrewQuote could not revalidate browser-local Invoices.");
+      if (refreshed.data.fingerprint !== phase5Preflight.fingerprint) { setPhase5Preflight(refreshed.data); throw new Error("A browser-local Invoice or Payment changed after readiness was checked. Review the updated records, then confirm migration again."); }
+      const completeBackup = await buildPhase4CloudBackupData({ ...currentAppData, invoices: localInvoices }, timesheetsCloudActive, false);
+      if (completeBackup.error || !completeBackup.data) throw new Error(completeBackup.error || "CrewQuote could not create the complete pre-migration backup.");
+      downloadBackup(completeBackup.data.appData as AppData, "crewquote-pre-phase5-invoice-migration-backup", { ownerUserId: user.id, records: readCalculationSnapshots(user.id) }, {
+        localOwnerUserId: readLocalDataOwnerId(),
+        phase4MigrationFingerprint: phase4MigrationFingerprintForUser(user.id),
+        phase3MigrationCompleted: migrationCompletedForUser(user.id),
+        phase4MigrationAlreadyCompleted: phase4MigrationCompletedForUser(user.id),
+        phase5MigrationFingerprint: phase5Preflight.fingerprint,
+        phase5MigrationAlreadyCompleted: phase5MigrationCompletedForUser(user.id),
+        cloudRecovery: completeBackup.data.cloudRecovery,
+      });
+      const result = await migratePreparedInvoices(refreshed.data.invoices, APP_VERSION, CURRENT_DATA_VERSION, (stage: Phase5MigrationStage, counts) => { setPhase5Stage(stage); setPhase5Counts({ ...counts }); });
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not migrate Invoices and Payments.");
+      setPhase5Confirming(false);
+      setPhase5Success(result.data.alreadyCompleted ? "Already migrated. CrewQuote verified every Invoice, line, Payment, snapshot, and financial value." : `Migration complete. Copied ${result.data.counts.invoices} Invoice${result.data.counts.invoices === 1 ? "" : "s"}, ${result.data.counts.invoice_lines} line${result.data.counts.invoice_lines === 1 ? "" : "s"}, and ${result.data.counts.payments} Payment${result.data.counts.payments === 1 ? "" : "s"}.`);
+      await loadCloudAwareData();
+    } catch (err) {
+      setPhase5Stage("failed"); setPhase5Error(err instanceof Error ? err.message : "CrewQuote could not migrate Invoices and Payments.");
+    } finally { setPhase5Busy(false); }
+  }, [currentAppData, loadCloudAwareData, phase5Preflight, timesheetsCloudActive, user?.id]);
+  const importBackup = () => {
+    throw new Error(PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE);
   };
+
+  const runPhase3Migration = useCallback(async () => {
+    if (!migrationSummary) return;
+    setMigrationError("");
+    setMigrationSuccess("");
+    const ok = confirm("CrewQuote will first download a safety backup, then copy browser settings and clients into your account. Timesheets and invoices will remain in this browser and be associated with this account for temporary user-switch protection. Continue?");
+    if (!ok) return;
+    try {
+      downloadBackup(currentAppData, "crewquote-pre-cloud-import-backup");
+    } catch (err) {
+      setMigrationError(err instanceof Error ? `Import cancelled because CrewQuote could not create the safety backup: ${err.message}` : "Import cancelled because CrewQuote could not create the safety backup.");
+      return;
+    }
+
+    setMigrationBusy(true);
+    try {
+      const result = await migrateBrowserDataToCloud(currentAppData, APP_VERSION);
+      if (result.error || !result.data) throw new Error(result.error || "CrewQuote could not import browser data into your account.");
+      setMigrationSuccess(result.data.alreadyCompleted
+        ? "This browser data was already imported. CrewQuote refreshed your account data."
+        : `Imported settings, preferences, and ${result.data.counts.clients} client${result.data.counts.clients === 1 ? "" : "s"} into your account.`);
+      setMigrationSummary(null);
+      await loadCloudAwareData();
+    } catch (err) {
+      setMigrationError(err instanceof Error ? err.message : "CrewQuote could not import browser data into your account.");
+    } finally {
+      setMigrationBusy(false);
+    }
+  }, [currentAppData, loadCloudAwareData, migrationSummary]);
+
+  const topMigrationPanel = migrationSummary && !migrationDismissed ? (
+    <Phase3MigrationPanel
+      summary={migrationSummary}
+      busy={migrationBusy}
+      error={migrationError}
+      success={migrationSuccess}
+      onImport={() => void runPhase3Migration()}
+      onDismiss={() => setMigrationDismissed(true)}
+    />
+  ) : null;
+
+  const settingsMigrationPanel = migrationSummary ? (
+    <Phase3MigrationPanel
+      summary={migrationSummary}
+      busy={migrationBusy}
+      error={migrationError}
+      success={migrationSuccess}
+      onImport={() => void runPhase3Migration()}
+    />
+  ) : null;
+
+  const phase4MigrationPanel = user?.id && (hasLocalTimesheetMigrationSource || phase4MigrationCompletedForUser(user.id)) ? (
+    <Phase4MigrationPanel
+      preflight={phase4Preflight}
+      invoiceCount={invoices.length}
+      paymentCount={invoices.filter(invoice => Number(invoice.paidAmount) > 0 || Boolean(invoice.paidDate)).length}
+      busy={phase4Busy}
+      stage={phase4Stage}
+      counts={phase4Counts}
+      error={phase4Error}
+      success={phase4Success}
+      completed={phase4MigrationCompletedForUser(user.id)}
+      confirming={phase4Confirming}
+      onValidate={() => void runPhase4Preflight()}
+      onOpenConfirmation={() => { setPhase4Error(""); setPhase4Confirming(true); }}
+      onCancelConfirmation={() => setPhase4Confirming(false)}
+      onStart={() => void runPhase4Migration()}
+    />
+  ) : null;
+
+  const phase5MigrationPanel = user?.id && (hasLocalInvoiceMigrationSource || phase5MigrationCompletedForUser(user.id)) ? (
+    <Phase5MigrationPanel
+      preflight={phase5Preflight}
+      busy={phase5Busy}
+      stage={phase5Stage}
+      counts={phase5Counts}
+      error={phase5Error}
+      success={phase5Success}
+      completed={phase5MigrationCompletedForUser(user.id)}
+      confirming={phase5Confirming}
+      onValidate={() => void runPhase5Preflight()}
+      onOpenConfirmation={() => { setPhase5Error(""); setPhase5Confirming(true); }}
+      onCancelConfirmation={() => setPhase5Confirming(false)}
+      onStart={() => void runPhase5Migration()}
+    />
+  ) : null;
+
+  const saveProfileFromLocalWorkflow = useCallback((nextProfile: Profile) => {
+    void saveProfile(nextProfile).catch(err => {
+      showToast(err instanceof Error ? err.message : "CrewQuote could not save settings to your account.", "error");
+    });
+  }, [saveProfile, showToast]);
+
   const showOnboarding = !onboardingDismissed && !hasMeaningfulCrewQuoteData(currentAppData);
 
-  if (forceTestError) throw new Error("CrewQuote recovery screen test error.");
-
-  if (!ready) return (
+  if (!ready || loadedOwnerUserId !== user?.id) return (
     <div className="h-screen flex items-center justify-center bg-slate-900">
       <div className="text-center">
         <div className="w-12 h-12 bg-blue-600 rounded-xl flex items-center justify-center mx-auto mb-3 animate-pulse"><Film size={20} className="text-white"/></div>
-        <p className="text-slate-400 text-sm">Loading…</p>
+        <p className="text-slate-400 text-sm">Loading Timesheets...</p>
       </div>
     </div>
   );
@@ -5191,13 +6674,65 @@ function AppShell() {
     </div>
   );
 
+  if (ownershipClaimRequired) return (
+    <div className="min-h-screen bg-slate-50 px-4 py-10">
+      <div className="mx-auto max-w-2xl">
+        <Card className="p-6 sm:p-8">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-700"><Info size={22}/></div>
+            <div>
+              <p className="text-xl font-bold text-slate-950">Use this account for browser-local CrewQuote records?</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                This browser contains local CrewQuote settings, a logo, Timesheets, or Invoices. To protect them from other sign-ins in this browser profile, associate the remaining local records with the current account before continuing.
+              </p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">
+                This does not upload timesheets or invoices. They remain in this browser until a later migration phase.
+              </p>
+            </div>
+          </div>
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Btn onClick={() => { if (user?.id) claimLocalDataOwner(user.id); setOwnershipClaimRequired(false); void loadCloudAwareData(); }}>Use This Account</Btn>
+            <Btn variant="secondary" onClick={() => void signOut()}>Sign Out</Btn>
+            <Btn variant="secondary" onClick={() => downloadBackup(appDataFromRawStorage(false), "crewquote-browser-ownership-backup")}><FileText size={14}/> Export Browser Backup</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
+  if (ownerMismatch) return (
+    <div className="min-h-screen bg-slate-50 px-4 py-10">
+      <div className="mx-auto max-w-2xl">
+        <Card className="p-6 sm:p-8">
+          <div className="flex items-start gap-4">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-700"><AlertTriangle size={22}/></div>
+            <div>
+              <p className="text-xl font-bold text-slate-950">CrewQuote browser data belongs to another account</p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-600">
+                This browser contains CrewQuote records associated with another account. Sign in with the account that owns these records or use a separate browser profile.
+              </p>
+              <p className="mt-2 text-sm leading-relaxed text-slate-500">
+                CrewQuote has stopped before loading any saved records on this screen.
+              </p>
+            </div>
+          </div>
+          <div className="mt-6 flex flex-wrap gap-2">
+            <Btn onClick={() => void signOut()}>Sign Out</Btn>
+          </div>
+        </Card>
+      </div>
+    </div>
+  );
+
   return (
     <Layout page={page} setPage={setPage} profile={profile}>
       <ToastContainer toasts={toasts} />
-      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} showOnboarding={showOnboarding} onDismissOnboarding={dismissOnboarding} onNavigate={setPage} />}
-      {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} />}
-      {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveTimesheets={saveTimesheets} onSaveClients={saveClients} onSaveProfile={saveProfile} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} />}
-      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onTestError={() => setForceTestError(true)} />}
+      {topMigrationPanel && page !== "settings" && <div className="mb-5">{topMigrationPanel}</div>}
+      {page === "timesheets" && <TimesheetsPage timesheets={timesheets} profile={profile} clients={clients} onSave={saveTimesheets} onSaveClients={saveClients} invoices={invoices} invoiceLinksLoading={invoicesLoading} invoiceLinksError={invoicesError} onAddInvoice={addInvoice} onSaveInvoices={saveInvoices} onShowToast={showToast} showOnboarding={showOnboarding} onDismissOnboarding={dismissOnboarding} onNavigate={setPage} loading={timesheetsLoading} loadError={timesheetsError} onRetry={() => void loadCloudAwareData()} cloudActive={timesheetsCloudActive} busy={timesheetsBusy} busyMessage={timesheetsBusyMessage} />}
+      {page === "clients"    && <ClientsPage    clients={clients} timesheets={timesheets} invoices={invoices} onSave={saveClients} onShowToast={showToast} loadError={cloudError} saving={cloudSavingClients} onRetry={() => void loadCloudAwareData()} />}
+      {page === "invoices"   && <InvoicesPage   invoices={invoices} timesheets={timesheets} clients={clients} profile={profile} onSave={saveInvoices} onSaveClients={saveClients} onSaveProfile={saveProfileFromLocalWorkflow} onShowToast={showToast} onViewTimesheets={() => setPage("timesheets")} loading={invoicesLoading} loadError={invoicesError} busy={invoicesBusy} busyMessage={invoicesBusyMessage} onRetry={() => void loadCloudAwareData()} cloudActive={invoicesCloudActive} />}
+      {page === "settings"   && <SettingsPage   profile={profile} appData={currentAppData} onSave={saveProfile} onExportBackup={exportBackup} onImportBackup={importBackup} onUploadLogo={uploadLogoToCloud} onRemoveLogo={removeLogoFromCloud} onKeepLogoBrowserOnly={keepLogoBrowserOnly} logoCloudActive={logoCloudActive} showLogoMigrationNotice={showLogoMigrationNotice} logoCloudError={logoCloudError} cloudSaving={cloudSavingSettings} cloudError={cloudError} migrationPanel={settingsMigrationPanel} phase4MigrationPanel={phase4MigrationPanel} phase5MigrationPanel={phase5MigrationPanel} backupImportDisabledMessage={PHASE3_BACKUP_IMPORT_DISABLED_MESSAGE} calculationOwnerUserId={user?.id} phase4Completed={timesheetsCloudActive} phase5Completed={invoicesCloudActive} />}
+      {page === "account"    && <AccountPage />}
     </Layout>
   );
 }
